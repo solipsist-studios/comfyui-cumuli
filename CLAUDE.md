@@ -33,6 +33,21 @@ ruff check .
 `tests/`, because the pack root carries an `__init__.py` (ComfyUI imports the
 whole directory as a package) that pytest would otherwise try to collect.
 
+Dependency install (idempotent; `--dry-run` prints the commands, `--force`
+rebuilds after a torch bump). `scripts/install.py` holds the logic; the two
+wrappers only locate ComfyUI's interpreter:
+
+```bash
+./install.sh --verify-only   # what is present
+./install.sh                 # core,bake,sfm,trainer -- see README Requirements
+```
+
+Its version list has one source of truth per fact: the OMG4 path comes from
+`settings.load_settings().trainer_root`, the cupy/cuml wheel suffix from
+torch's own CUDA major, the arch list from `nvidia-smi`. When the README's
+Requirements section changes, `GROUPS`/`build_groups` in `scripts/install.py`
+changes with it.
+
 Headless run of the dataset half, using the same library code the nodes use:
 
 ```bash

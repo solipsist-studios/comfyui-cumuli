@@ -40,8 +40,29 @@ ring that a 10-camera rig cannot capture.
 - About 32 GB of VRAM for a 24-view ring.
 
 Everything runs in ComfyUI's environment. On top of a stock ComfyUI install it
-needs, all additive — no downgrade of torch, numpy, transformers, timm or
-ultralytics:
+needs the packages below, all additive — no downgrade of torch, numpy,
+transformers, timm or ultralytics.
+
+**`install.sh` / `install.bat` do all of it**, into ComfyUI's own interpreter:
+
+```bash
+./install.sh                    # everything; install.bat on Windows
+./install.sh --dry-run          # print every command, change nothing
+./install.sh --verify-only      # report what is already present
+./install.sh --groups sfm       # one group: core, bake, sfm, trainer
+./install.sh --python /path/to/ComfyUI/venv/bin/python
+```
+
+It is idempotent (already-installed packages are skipped), auto-detects the
+CUDA toolkit and GPU arch for the extension builds, takes the OMG4 path from
+your bridge config, and records the five pinned packages before and after —
+if pip moves one, the run fails loudly instead of leaving a broken ComfyUI to
+discover an hour later. `--force` reinstalls and rebuilds, which is what you
+want after a torch upgrade. The interpreter is the one thing it cannot guess
+reliably: it prefers `--python`, then `$COMFYUI_PYTHON`, then an activated
+venv/conda env, and refuses outright if the interpreter it picked has no torch.
+
+The rest of this section is what the script does, for anyone doing it by hand:
 
 ```bash
 # 4DAnyone + vendored GVHMR
