@@ -8,3 +8,5 @@ config.json
 
 # ComfyUI writes these next to a loaded workflow.
 *.json.bak
+
+CLAUDE.md
