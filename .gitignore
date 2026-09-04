@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local machine configuration; config.example.json is the template.
+config.json
+
+# ComfyUI writes these next to a loaded workflow.
+*.json.bak

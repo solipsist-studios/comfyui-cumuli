@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Copy to config.json beside this file, or point CUMULI_CONFIG at it.",
+    "Every key can also be set by an environment variable; see cumuli_bridge/settings.py.",
+    "",
+    "Defaults run everything in ComfyUI's own environment: conda_env and python_exe are",
+    "empty, so child processes are started with this interpreter. Set conda_env to launch",
+    "4DAnyone from a different environment instead (the pre-merge arrangement).",
+    "",
+    "data_dir, model_dir and gvhmr_root are resolved against fdanyone_root when relative.",
+    "The FDANYONE_* entries in subprocess_env are read by 4DAnyone itself, not by this pack."
+  ],
+
+  "fdanyone_root": "~/Dev/github/4DAnyone",
+  "conda_env": "",
+  "conda_exe": "",
+  "python_exe": "",
+
+  "data_dir": "data",
+  "model_dir": "models",
+  "gvhmr_root": "third_party/GVHMR",
+
+  "trainer_root": "~/Dev/github/cumuli/deps/OMG4",
+  "trainer_script": "train_scratch.py",
+
+  "work_root": "",
+  "dataset_roots": [],
+  "flipbook_roots": [],
+
+  "device": "cuda:0",
+  "min_free_vram_gb": 30.0,
+
+  "subprocess_env": {
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "FDANYONE_PERSISTENT_PARAMS": "1e9",
+    "FDANYONE_ATTENTION_BACKEND": "sdpa"
+  },
+  "trainer_env": {}
+}

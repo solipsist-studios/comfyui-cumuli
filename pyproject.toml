@@ -1,0 +1,21 @@
+[project]
+name = "comfyui-cumuli"
+description = "Cumuli nodes for ComfyUI: take one monocular clip to a streamable .sogst 4D Gaussian splat, via a generated novel-view ring or a real multi-camera capture."
+version = "0.1.0"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/solipsist-studios/comfyui-cumuli"
+
+[tool.comfy]
+PublisherId = "solipsist-studios"
+DisplayName = "Cumuli"
+Icon = ""
+
+[tool.ruff]
+# Mirrors the ComfyUI checkout this pack installs into, so `ruff check .` at the
+# ComfyUI root and here agree. T bans print: use logging.
+lint.select = ["N805", "S307", "S102", "E", "T", "W", "F"]
+lint.ignore = ["E501", "E722", "E731", "E712", "E402", "E741"]
