@@ -176,6 +176,7 @@ def _staging_root(explicit: str, run_name: str, settings=None) -> Path:
 # --------------------------------------------------------------------------
 _NO_DATASETS = "(none found -- add dataset_roots to the bridge config)"
 _NO_FLIPBOOKS = "(none found -- add flipbook_roots to the bridge config)"
+_NO_RINGS = "(none found -- generate a ring, or add ring_roots to the bridge config)"
 
 
 def _discovered(kind: str) -> list[str]:
@@ -185,6 +186,8 @@ def _discovered(kind: str) -> list[str]:
         return []
     if kind == "datasets":
         return runner.discover_datasets(settings)
+    if kind == "rings":
+        return runner.discover_rings(settings)
     return runner.discover_flipbooks(settings)
 
 
@@ -211,6 +214,10 @@ def _register_option_routes() -> None:
     @routes.get("/cumuli/options/flipbooks")
     async def _flipbooks(request):
         return web.json_response(_discovered("flipbooks") or [_NO_FLIPBOOKS])
+
+    @routes.get("/cumuli/options/rings")
+    async def _rings(request):
+        return web.json_response(_discovered("rings") or [_NO_RINGS])
 
 
 _register_option_routes()
@@ -301,6 +308,16 @@ class CumuliGenerateRing(IO.ComfyNode):
                 IO.Boolean.Input("dry_run", default=False,
                                  tooltip="Validate everything and report the command line without running it.",
                                  advanced=True),
+                # Appended last on purpose: a saved workflow stores widget values
+                # positionally, so inserting anywhere earlier shifts every value
+                # after it.
+                IO.Boolean.Input("enable_turbo", default=True,
+                                 tooltip="Use 4DAnyone-Turbo (a distilled LoRA over the same base "
+                                         "checkpoint) for accelerated denoising. Off runs the base "
+                                         "model: slower, and the configuration the pack's empirical "
+                                         "settings were measured against. Part of the ring "
+                                         "fingerprint, so switching regenerates.",
+                                 advanced=True),
             ],
             outputs=[
                 Ring.Output(display_name="ring"),
@@ -330,6 +347,7 @@ class CumuliGenerateRing(IO.ComfyNode):
         prompt="",
         min_free_vram_gb=-1.0,
         dry_run=False,
+        enable_turbo=True,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         try:
@@ -350,6 +368,7 @@ class CumuliGenerateRing(IO.ComfyNode):
                 target_fps=target_fps,
                 seed=seed,
                 device=device,
+                enable_turbo=enable_turbo,
             )
             lora_note = None
             if model is not None and getattr(model, "patches", None):
@@ -458,8 +477,14 @@ class CumuliLoadRing(IO.ComfyNode):
             category=CATEGORY,
             description="Load a published 4DAnyone result directory (the one holding cameras.json).",
             inputs=[
-                IO.String.Input("result_dir", default="",
-                                tooltip="Path to <data_dir>/fdanyone/<run_name>, or just the run name."),
+                IO.Combo.Input(
+                    "result_dir",
+                    options=_discovered("rings") or [_NO_RINGS],
+                    remote=IO.RemoteOptions(route="/cumuli/options/rings", refresh_button=True),
+                    tooltip="Finished rings discovered under <data_dir>/fdanyone and the bridge "
+                            "config's ring_roots (directories holding cameras.json and videos/). "
+                            "The config is re-read on refresh.",
+                ),
             ],
             outputs=[
                 Ring.Output(display_name="ring"),
@@ -468,11 +493,16 @@ class CumuliLoadRing(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, result_dir) -> IO.NodeOutput:
+    def execute(cls, result_dir="") -> IO.NodeOutput:
         text = (result_dir or "").strip()
-        if not text:
-            raise RuntimeError("Cumuli: result_dir is empty.")
+        if not text or text.startswith("(none found"):
+            raise RuntimeError(
+                "Cumuli: no ring selected. Generate one, or add its parent directory to "
+                "ring_roots in the bridge config and refresh the widget."
+            )
         path = Path(text).expanduser()
+        # A bare run name still resolves, so a typed value or a workflow saved
+        # before this was a combo keeps working.
         if not path.is_absolute() and not path.exists():
             try:
                 path = load_settings().result_dir(text)
@@ -486,9 +516,15 @@ class CumuliLoadRing(IO.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, result_dir):
-        path = Path((result_dir or "").strip()).expanduser() / "metadata.json"
+        text = (result_dir or "").strip()
+        path = Path(text).expanduser()
+        if not path.is_absolute() and not path.exists():
+            try:
+                path = load_settings().result_dir(text)
+            except SettingsError:
+                return float("nan")
         try:
-            return os.path.getmtime(path)
+            return os.path.getmtime(path / "metadata.json")
         except OSError:
             return float("nan")
 

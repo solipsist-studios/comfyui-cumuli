@@ -26,6 +26,7 @@
   "work_root": "",
   "dataset_roots": [],
   "flipbook_roots": [],
+  "ring_roots": [],
 
   "device": "cuda:0",
   "min_free_vram_gb": 30.0,

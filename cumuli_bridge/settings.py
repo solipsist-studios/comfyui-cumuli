@@ -88,6 +88,7 @@ DEFAULTS: dict[str, object] = {
     # trees are found.
     "dataset_roots": [],
     "flipbook_roots": [],
+    "ring_roots": [],
     "trainer_script": "train_scratch.py",
     "subprocess_env": dict(DEFAULT_SUBPROCESS_ENV),
     "trainer_env": {},
@@ -210,6 +211,7 @@ class BridgeSettings:
     work_root: str = ""
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
+    ring_roots: tuple[str, ...] = ()
     trainer_root: Path = Path("~/Dev/github/cumuli/deps/OMG4").expanduser()
     trainer_script: str = "train_scratch.py"
     subprocess_env: dict[str, str] = field(default_factory=dict)
@@ -261,6 +263,7 @@ class BridgeSettings:
             work_root=str(values.get("work_root") or ""),
             dataset_roots=_roots(values.get("dataset_roots")),
             flipbook_roots=_roots(values.get("flipbook_roots")),
+            ring_roots=_roots(values.get("ring_roots")),
             trainer_root=Path(str(values["trainer_root"])).expanduser(),
             trainer_script=str(values["trainer_script"]),
             subprocess_env={str(k): str(v) for k, v in (values.get("subprocess_env") or {}).items()},

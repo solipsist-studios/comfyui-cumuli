@@ -30,6 +30,13 @@ const SETTINGS = [
     tooltip: "Extra directories the Load Flipbook dropdown scans, on top of the work root.",
   },
   {
+    id: "cumuli.ring_roots",
+    name: "Ring roots (comma separated)",
+    type: "text",
+    defaultValue: "",
+    tooltip: "Extra directories the Load Ring dropdown scans. The 4DAnyone data dir is always scanned.",
+  },
+  {
     id: "cumuli.min_free_vram_gb",
     name: "Minimum free VRAM to start a ring (GB)",
     type: "number",
