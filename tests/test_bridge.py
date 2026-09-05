@@ -102,6 +102,80 @@ def test_argv_is_the_known_good_command_line(settings, tmp_path):
     assert flags["--layer_pitches"] == "[15]"
     assert flags["--seed"] == "42"
     assert flags["--data_dir"] == str(settings.data_dir)
+    # inference() takes gpu_ids, not device: it dropped the latter when it
+    # gained multi-GPU view stages. fire binds what it knows, runs the job,
+    # and only then chokes on the leftover -- so a stale flag costs 90 minutes.
+    assert flags["--gpu_ids"] == "[0]"
+    assert "--device" not in flags
+    assert flags["--enable_turbo"] == "True"
+
+
+def test_turbo_changes_the_fingerprint(tmp_path):
+    """Turbo is a distilled LoRA over the same base, so it changes the ring."""
+
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    common = dict(video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0,
+                  yaw_span=360, views_per_group=4, enable_rcp=True, enable_tcr=True,
+                  start_time=0.0, target_fps="auto", seed=42, device="cuda:0")
+    turbo = runner.build_request(**common, enable_turbo=True)
+    base = runner.build_request(**common, enable_turbo=False)
+    # The ring fingerprint is what gates the disk cache, not to_dict().
+    assert runner.ring_fingerprint(turbo)[0] != runner.ring_fingerprint(base)[0]
+    # ...but the motion cache does not depend on the denoiser, so it survives.
+    assert runner.ring_fingerprint(turbo)[1] == runner.ring_fingerprint(base)[1]
+
+
+
+@pytest.mark.parametrize("device,expected", [
+    ("cuda:0", [0]),
+    ("cuda:1", [1]),
+    ("cuda", None),
+    ("cpu", None),
+])
+def test_gpu_ids_translate_the_device_string(device, expected):
+    assert runner.gpu_ids_for(device) == expected
+
+
+def test_gpu_ids_rejects_a_malformed_device():
+    with pytest.raises(runner.ValidationError):
+        runner.gpu_ids_for("cuda:x")
+
+
+def _fake_checkout(tmp_path, params):
+    """A stand-in inference.py carrying just the signature we want to test."""
+
+    script = tmp_path / "inference.py"
+    script.write_text(f"def inference({', '.join(params)}):\n    return {{}}\n")
+    return script
+
+
+def test_argv_is_checked_against_the_checkouts_signature(settings, tmp_path):
+    """A checkout that dropped a parameter fails before the GPU job, not after."""
+
+    script = _fake_checkout(tmp_path, ["video_path", "seed"])
+    stale = BridgeSettings(**{**settings.__dict__, "fdanyone_root": tmp_path})
+    with pytest.raises(runner.ValidationError) as exc:
+        runner.check_argv_against_checkout(
+            stale, [sys.executable, str(script), "--video_path=x", "--gpu_ids=[0]"]
+        )
+    assert "--gpu_ids" in str(exc.value)
+
+
+def test_argv_check_passes_when_every_flag_is_declared(settings, tmp_path):
+    _fake_checkout(tmp_path, ["video_path", "gpu_ids"])
+    ok = BridgeSettings(**{**settings.__dict__, "fdanyone_root": tmp_path})
+    runner.check_argv_against_checkout(
+        ok, [sys.executable, "inference.py", "--video_path=x", "--gpu_ids=[0]"]
+    )
+
+
+def test_argv_check_is_silent_when_the_signature_cannot_be_read(settings, tmp_path):
+    """An unreadable checkout degrades to the old behaviour, it does not block."""
+
+    (tmp_path / "inference.py").write_text("def inference(:\n")  # syntax error
+    broken = BridgeSettings(**{**settings.__dict__, "fdanyone_root": tmp_path})
+    runner.check_argv_against_checkout(broken, ["--anything=1"])
 
 
 def test_argv_uses_conda_run_when_no_python_is_pinned(settings, tmp_path, monkeypatch):
@@ -1050,3 +1124,29 @@ def test_toolchain_respects_existing_cuda_home(tmp_path):
 def test_toolchain_empty_when_nothing_found(tmp_path):
     from cumuli_bridge.train import cuda_toolchain_env
     assert cuda_toolchain_env(base=tmp_path, environ={}) == {}
+
+
+def test_discover_rings_finds_published_results(settings, tmp_path):
+    """A ring is a directory with cameras.json and videos/ -- nothing else counts."""
+
+    root = tmp_path / "fdanyone"
+    good = root / "run_a"
+    (good / "videos").mkdir(parents=True)
+    (good / "cameras.json").write_text("{}")
+    half = root / "run_b"          # cameras.json but no videos/
+    half.mkdir(parents=True)
+    (half / "cameras.json").write_text("{}")
+    (root / "run_c").mkdir()       # neither
+
+    scoped = BridgeSettings(**{**settings.__dict__, "data_dir": tmp_path})
+    found = runner.discover_rings(scoped)
+    assert found == [str(good)]
+
+
+def test_discover_rings_includes_configured_ring_roots(settings, tmp_path):
+    extra = tmp_path / "elsewhere" / "copied_run"
+    (extra / "videos").mkdir(parents=True)
+    (extra / "cameras.json").write_text("{}")
+    scoped = BridgeSettings(**{**settings.__dict__, "data_dir": tmp_path,
+                               "ring_roots": (str(tmp_path / "elsewhere"),)})
+    assert str(extra) in runner.discover_rings(scoped)

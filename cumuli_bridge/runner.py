@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -258,6 +259,7 @@ class RunRequest:
     prompt: str = ""
     seed: int = 42
     device: str = "cuda:0"
+    enable_turbo: bool = True
 
     @property
     def run_name(self) -> str:
@@ -281,6 +283,7 @@ class RunRequest:
             "target_fps": self.target_fps,
             "seed": self.seed,
             "device": self.device,
+            "enable_turbo": self.enable_turbo,
         }
 
 
@@ -298,6 +301,7 @@ def build_request(
     target_fps: str,
     seed: int,
     device: str,
+    enable_turbo: bool = True,
 ) -> RunRequest:
     """Validate every knob and produce a :class:`RunRequest`."""
 
@@ -344,7 +348,29 @@ def build_request(
         target_fps=fps,
         seed=int(seed),
         device=str(device),
+        enable_turbo=bool(enable_turbo),
     )
+
+
+def gpu_ids_for(device: str) -> list[int] | None:
+    """Turn a torch device string into 4DAnyone's ``gpu_ids`` list.
+
+    ``inference()`` takes ``gpu_ids: list[int] | None`` -- it dropped ``device``
+    when it gained multi-GPU view stages. A bare ``cuda`` (no index) means "use
+    all visible GPUs", which is ``None``, and so does ``cpu``: there is no GPU
+    to name, and the script decides what to do about it.
+    """
+
+    text = (device or "").strip()
+    if ":" not in text:
+        return None
+    index = text.rsplit(":", 1)[1]
+    try:
+        return [int(index)]
+    except ValueError:
+        raise ValidationError(
+            f"device must be 'cuda' or 'cuda:<index>', got {device!r}."
+        ) from None
 
 
 def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
@@ -353,6 +379,11 @@ def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
     ``fire`` literal-evaluates ``--flag=value``, so lists and booleans are
     written in Python syntax and passed as single argv entries. Nothing goes
     through a shell.
+
+    Only flags ``inference()`` actually declares may appear. fire binds the
+    ones it recognises, calls the function, and then treats anything left over
+    as an index into the *returned* value -- so a stale flag surfaces as
+    "Cannot find key" after the full run has already completed.
     """
 
     pitches = "[" + ",".join(str(pitch) for pitch in request.layer_pitches) + "]"
@@ -367,14 +398,17 @@ def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
         f"--views_per_group={request.views_per_group}",
         f"--enable_rcp={bool(request.enable_rcp)}",
         f"--enable_tcr={bool(request.enable_tcr)}",
+        f"--enable_turbo={bool(request.enable_turbo)}",
         f"--data_dir={settings.data_dir}",
         f"--model_dir={settings.model_dir}",
         f"--gvhmr_root={settings.gvhmr_root}",
-        f"--device={request.device}",
         f"--target_fps={request.target_fps}",
         f"--start_time={request.start_time}",
         f"--seed={request.seed}",
     ]
+    gpu_ids = gpu_ids_for(request.device)
+    if gpu_ids is not None:
+        argv.append(f"--gpu_ids={gpu_ids}".replace(" ", ""))
     return argv
 
 
@@ -474,6 +508,53 @@ class RunOutcome:
     log_tail: list[str] = field(default_factory=list)
 
 
+def inference_parameters(settings: BridgeSettings) -> set[str] | None:
+    """Parameter names ``inference()`` declares, read without importing it.
+
+    Parsed with ``ast`` rather than imported: ``inference.py`` pulls in torch
+    and the whole model stack, which must not happen inside ComfyUI's process.
+    Returns ``None`` when the signature cannot be read, so an unparseable
+    checkout degrades to the old behaviour instead of blocking the run.
+    """
+
+    try:
+        tree = ast.parse(settings.inference_script.read_text())
+    except (OSError, SyntaxError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "inference":
+            args = node.args
+            names = [a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+            return set(names)
+    return None
+
+
+def check_argv_against_checkout(settings: BridgeSettings, argv: Sequence[str]) -> None:
+    """Refuse to launch with a flag this 4DAnyone checkout does not declare.
+
+    fire binds what it recognises, runs the function, and only then treats the
+    leftovers as an index into the result -- so a flag the checkout has dropped
+    fails *after* the full generation, with "Cannot find key". Ninety minutes
+    of GPU time is too much to spend discovering a renamed parameter.
+    """
+
+    declared = inference_parameters(settings)
+    if declared is None:
+        return
+    unknown = [
+        flag.split("=", 1)[0]
+        for flag in argv
+        if flag.startswith("--") and flag.split("=", 1)[0][2:] not in declared
+    ]
+    if unknown:
+        raise ValidationError(
+            f"This 4DAnyone checkout's inference() does not accept "
+            f"{', '.join(unknown)}. The checkout at {settings.fdanyone_root} is a "
+            f"different version than this pack expects; it declares: "
+            f"{', '.join(sorted(declared))}."
+        )
+
+
 def execute(
     settings: BridgeSettings,
     request: RunRequest,
@@ -491,6 +572,7 @@ def execute(
     check_video(settings, request)
     result_dir = settings.result_dir(request.run_name)
     argv = build_argv(settings, request)
+    check_argv_against_checkout(settings, argv)
     state = ProgressState(expected_views=request.num_target_views)
 
     def handle(line: str) -> None:
@@ -696,6 +778,7 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         "views_per_group": str(request.views_per_group),
         "enable_rcp": request.enable_rcp,
         "enable_tcr": request.enable_tcr,
+        "enable_turbo": request.enable_turbo,
         "seed": request.seed,
         "prompt": request.prompt,
         "lora": lora,
@@ -764,6 +847,22 @@ def _candidate_dirs(roots) -> list[Path]:
                 if nested.is_dir():
                     seen.append(nested)
     return seen
+
+
+def discover_rings(settings: BridgeSettings) -> list[str]:
+    """Finished result directories, by the file that defines one: cameras.json.
+
+    Unlike flipbooks and datasets, rings have a canonical home -- 4DAnyone
+    writes them under ``<data_dir>/fdanyone/`` -- so that root is always
+    scanned, with ``ring_roots`` for results copied elsewhere.
+    """
+
+    roots = [str(settings.results_root)] + list(settings.ring_roots)
+    found = [
+        str(path) for path in _candidate_dirs(roots)
+        if (path / "cameras.json").is_file() and (path / "videos").is_dir()
+    ]
+    return sorted(set(found))
 
 
 def discover_datasets(settings: BridgeSettings) -> list[str]:
