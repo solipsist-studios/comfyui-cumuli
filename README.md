@@ -11,7 +11,7 @@ gaussian splat**, entirely inside ComfyUI.
 ```
 Load Video ──VIDEO──┐        Model Loader ─▶ LoRA loaders (stock) ──MODEL─┐
                     ▼                                                     ▼
-  Generate Ring      4DAnyone: 24 synchronized novel views, RCP on  (~90 min)
+  Generate Ring      4DAnyone: 24 synchronized novel views, RCP on  (~25 min)
       └─ Stage Ring         transpose to one directory per frame
           └─ Ring Masks         BiRefNet mattes, via ComfyUI's own model
               └─ Build 4DGS Dataset   visual-hull init cloud + RGBA training frames
@@ -29,6 +29,98 @@ re-entry and for external data.
 Why this exists: reconstruction quality on subject captures is limited by **view
 sparsity**, not by the trainer or the container. 4DAnyone synthesizes the dense
 ring that a 10-camera rig cannot capture.
+
+## Quickstart
+
+From nothing to a `.sogst`. You need a working ComfyUI, an NVIDIA card with
+about 32 GB of VRAM, a CUDA toolkit new enough to target it, and `git`.
+
+**1. Get the three external checkouts.** The pack drives them in place; it
+never vendors them.
+
+```bash
+git clone https://github.com/solipsist-studios/4DAnyone.git   ~/Dev/github/4DAnyone
+git clone https://github.com/solipsist-studios/OMG4.git       ~/Dev/github/OMG4
+```
+
+Clone OMG4 **standalone** rather than relying on cumuli's `deps/OMG4`
+submodule: the submodule pointer can lag OMG4's own `main`, and an older OMG4
+silently ignores `GS4D_T_INIT_DIV`, which makes Train 4DGS's `t_init_div`
+widget do nothing at all.
+
+Bake SOGST and Solve Rig drive three of cumuli's scripts in place, so its
+checkout is needed too. Clone it non-recursively — the other submodules
+(sapiens, BiRefNet, Diffuman4D…) belong to the wider pipeline and are not used
+here:
+
+```bash
+git clone https://github.com/solipsist-studios/cumuli.git ~/Dev/github/cumuli
+```
+
+**2. Install the pack** into ComfyUI:
+
+```bash
+git clone https://github.com/solipsist-studios/comfyui-cumuli.git \
+    <ComfyUI>/custom_nodes/comfyui-cumuli
+```
+
+**3. Install the dependencies** into ComfyUI's own interpreter — see
+[Requirements](#requirements) for what and why:
+
+```bash
+cd ~/Dev/github/comfyui-cumuli
+./install.sh --python <ComfyUI's python>   # install.bat on Windows
+./install.sh --verify-only                 # confirm it took
+```
+
+**4. Point the pack at the checkouts.** Restart ComfyUI, then open its Settings
+dialog and search **Cumuli**. Set **work root** to a large drive —
+intermediates run about 20 GB per run — and set the three checkout paths to
+wherever you cloned them in step 1. Two of the defaults already match the paths
+above; the **OMG4 trainer checkout** does not, because it defaults to cumuli's
+`deps/OMG4` submodule, so point it at your standalone clone.
+[Configuration](#configuration) covers the other layers.
+
+**5. Get the models.**
+
+- **Background removal:** `birefnet.safetensors` in
+  `<ComfyUI>/models/background_removal/` — it ships with ComfyUI.
+- **4DAnyone weights:** its own downloader fetches them on first run, or
+  ahead of time with `python -c "from fdanyone.download import ensure_models;
+  ensure_models()"` from the 4DAnyone checkout.
+- **SMPL-X body models:** the one manual step. Register at
+  [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), accept the licence,
+  download, and install with 4DAnyone's `install_smplx`. Nothing can automate
+  this for you.
+
+**6. Run it.** Load `workflows/cumuli_video_to_sogst.json`, point the Load Video
+node at a clip of **at least 121 frames after `start_time`** (~5 s at 24 fps) at
+720p or better, and queue. Generate Ring checks the clip up front rather than
+failing an hour in.
+
+### What to expect
+
+Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
+`enable_turbo`, from one 121-frame clip:
+
+| stage | time | peak VRAM |
+|---|---|---|
+| Generate Ring | ~23 min | 29.5 GiB reserved |
+| Stage + Masks + Dataset | a few minutes | modest |
+| Train 4DGS | ~1 h (30000 iterations) | whole card |
+| Bake SOGST | ~1 min | — |
+
+`enable_turbo` is on by default and does the ring in 4 denoising steps. Turning
+it off runs the base model — substantially slower, and the configuration the
+figures elsewhere in this README were originally measured against.
+
+The `.sogst` and its interchange PLY land in ComfyUI's output gallery under
+`cumuli/`. Everything heavier lives under `<work_root>/<run_name>/`.
+
+Nothing is thrown away between stages, so you can re-enter anywhere: **Load
+Ring** picks up a finished ring, **Load Flipbook** a staged tree, **Load 4DGS
+Dataset** a finished dataset. All three are discovery dropdowns with a refresh
+button. See [Caching](#caching) for when a stage re-runs.
 
 ## Requirements
 
@@ -101,15 +193,6 @@ distro CUDA that cannot target Blackwell); pass `--no-deps`, or pip will
 extensions' requirements; and the builds are ABI-bound to the torch version,
 so redo them if torch changes.
 
-## Install
-
-Develop out of tree and symlink, so `custom_nodes/` stays runtime data:
-
-```bash
-git clone <this repo> ~/Dev/github/comfyui-cumuli
-ln -s ~/Dev/github/comfyui-cumuli <ComfyUI>/custom_nodes/comfyui-cumuli
-```
-
 ## Configuration
 
 The idiomatic place is **ComfyUI's own Settings dialog** (search "Cumuli"):
@@ -118,12 +201,18 @@ registered there and stored as `cumuli.*` keys in the per-user
 `comfy.settings.json`, exactly like other packs' settings. For headless or
 per-checkout overrides, `config.json` next to `config.example.json` (or a file
 named by `CUMULI_CONFIG`) beats the UI values, and environment variables
-(`CUMULI_FDANYONE_ROOT`, `CUMULI_WORK_ROOT`, ...) beat everything. All layers
-are re-read on every node run, so edits need no restart.
+(`CUMULI_FDANYONE_ROOT`, `CUMULI_TRAINER_ROOT`, `CUMULI_PIPELINE_ROOT`,
+`CUMULI_WORK_ROOT`, ...) beat everything. All layers are re-read on every node
+run, so edits need no restart.
 
-Set **`dataset_roots`** / **`flipbook_roots`** to the directories where your
-external captures live; the loader nodes scan them (plus `work_root`) into
-their dropdowns, model-loader style, and re-scan on the widget's refresh
+The three checkout paths are **`fdanyone_root`** (ring generation),
+**`trainer_root`** (the OMG4 entry point) and **`cumuli_root`** (the scripts
+Bake SOGST and Solve Rig drive in place). They are independent: OMG4 does not
+have to be cumuli's submodule.
+
+Set **`dataset_roots`** / **`flipbook_roots`** / **`ring_roots`** to the
+directories where your external captures live; the loader nodes scan them (plus
+`work_root`, and the 4DAnyone data dir for rings) into their dropdowns, model-loader style, and re-scan on the widget's refresh
 button and at every queue. This works over remote connections, where a native
 server-side file dialog cannot.
 
@@ -152,7 +241,7 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | node | what it does |
 |---|---|
 | **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
-| **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. |
+| **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other two loaders. |
 | **Ring Contact Sheet** | One frame from every view, tiled. The fastest way to spot cross-view identity drift. |
 | **Select View** | One view as VIDEO + IMAGE + its camera JSON. |
 | **Stage Ring** | Transposes 24 videos x 121 frames into 121 frame directories, with a per-frame `transforms.json`. |

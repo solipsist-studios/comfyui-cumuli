@@ -28,7 +28,7 @@ from cumuli_bridge.flipbook import camera_label, label_width  # noqa: E402
 from cumuli_bridge.process import SubprocessCancelled, SubprocessError, run_streaming  # noqa: E402
 from cumuli_bridge.progress import ProgressState  # noqa: E402
 from cumuli_bridge.ring import RingCamera  # noqa: E402
-from cumuli_bridge.settings import BridgeSettings  # noqa: E402
+from cumuli_bridge.settings import BridgeSettings, SettingsError  # noqa: E402
 from cumuli_bridge.train import (  # noqa: E402
     BakeOptions,
     BakeProgress,
@@ -1150,3 +1150,35 @@ def test_discover_rings_includes_configured_ring_roots(settings, tmp_path):
     scoped = BridgeSettings(**{**settings.__dict__, "data_dir": tmp_path,
                                "ring_roots": (str(tmp_path / "elsewhere"),)})
     assert str(extra) in runner.discover_rings(scoped)
+
+
+def test_pipeline_script_prefers_cumuli_root(settings, tmp_path):
+    """cumuli_root is authoritative; the deps/OMG4 guess is only a fallback."""
+
+    real = tmp_path / "cumuli" / "scripts"
+    real.mkdir(parents=True)
+    (real / "bake_sogst.py").write_text("")
+    scoped = BridgeSettings(**{**settings.__dict__, "cumuli_root": tmp_path / "cumuli"})
+    assert scoped.pipeline_script("bake_sogst.py") == (real / "bake_sogst.py").resolve()
+
+
+def test_pipeline_script_falls_back_to_the_submodule_layout(settings, tmp_path):
+    """A checkout using cumuli's deps/OMG4 submodule keeps working unchanged."""
+
+    scripts = tmp_path / "cumuli" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "multiframe_sfm.py").write_text("")
+    scoped = BridgeSettings(**{**settings.__dict__,
+                               "cumuli_root": tmp_path / "nonexistent",
+                               "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
+    assert scoped.pipeline_script("multiframe_sfm.py") == (scripts / "multiframe_sfm.py").resolve()
+
+
+def test_pipeline_script_error_names_the_setting(settings, tmp_path):
+    scoped = BridgeSettings(**{**settings.__dict__,
+                               "cumuli_root": tmp_path / "nope",
+                               "trainer_root": tmp_path / "also" / "nope" / "OMG4"})
+    with pytest.raises(SettingsError) as exc:
+        scoped.pipeline_script("bake_sogst.py")
+    assert "cumuli_root" in str(exc.value)
+    assert "CUMULI_PIPELINE_ROOT" in str(exc.value)

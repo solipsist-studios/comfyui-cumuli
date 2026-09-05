@@ -58,6 +58,14 @@ const SETTINGS = [
     defaultValue: "",
     tooltip: "Path to the OMG4 rotor-4DGS trainer. Empty keeps the built-in default.",
   },
+  {
+    id: "cumuli.cumuli_root",
+    name: "cumuli pipeline checkout",
+    type: "text",
+    defaultValue: "",
+    tooltip: "Path to the cumuli checkout. Bake SOGST and Solve Rig drive its scripts " +
+             "in place. Empty keeps the built-in default.",
+  },
 ];
 
 app.registerExtension({

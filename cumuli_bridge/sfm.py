@@ -42,6 +42,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .process import run_streaming
+from .settings import SettingsError
 from .videoio import VideoError, probe
 
 LOGGER = logging.getLogger("comfyui-cumuli")
@@ -253,23 +254,14 @@ def pair_count(num_cameras: int, num_timestamps: int) -> int:
 def find_sfm_script(settings) -> Path:
     """cumuli's ``multiframe_sfm.py``, driven in place.
 
-    ``trainer_root`` points at ``<cumuli>/deps/OMG4``, so the scripts directory
-    is two levels up; the explicit path is the fallback for a checkout laid out
-    some other way.
+    Located by ``cumuli_root``; see ``BridgeSettings.pipeline_script`` for the
+    legacy fallbacks it still accepts.
     """
 
-    candidates = [
-        Path(settings.trainer_root).parent.parent / "scripts" / "multiframe_sfm.py",
-        Path("~/Dev/github/cumuli/scripts/multiframe_sfm.py").expanduser(),
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise SfmError(
-        "Could not find cumuli's multiframe_sfm.py. Looked in: "
-        + ", ".join(str(c) for c in candidates)
-        + ". Set 'trainer_root' to the cumuli checkout's deps/OMG4 directory."
-    )
+    try:
+        return settings.pipeline_script("multiframe_sfm.py")
+    except SettingsError as exc:
+        raise SfmError(str(exc)) from None
 
 
 def discover_cameras(

@@ -368,16 +368,10 @@ def find_bake_script(settings: BridgeSettings) -> Path:
     a thousand lines that track the ``.sogst`` spec, and a stale copy here would
     silently emit a non-conforming container."""
 
-    candidates = [
-        settings.trainer_root.parent.parent / "scripts" / "bake_sogst.py",
-        Path("~/Dev/github/cumuli/scripts/bake_sogst.py").expanduser(),
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise TrainingError(
-        "Could not find bake_sogst.py. Looked in: " + ", ".join(str(c) for c in candidates) + "."
-    )
+    try:
+        return settings.pipeline_script("bake_sogst.py")
+    except SettingsError as exc:
+        raise TrainingError(str(exc)) from None
 
 
 def build_bake_argv(settings: BridgeSettings, options: BakeOptions) -> list[str]:

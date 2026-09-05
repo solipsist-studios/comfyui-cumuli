@@ -876,12 +876,3 @@ def discover_datasets(settings: BridgeSettings) -> list[str]:
     return sorted(set(found))
 
 
-def discover_flipbooks(settings: BridgeSettings) -> list[str]:
-    """Existing staged flipbook trees under work_root and flipbook_roots."""
-
-    roots = ([settings.work_root] if settings.work_root else []) + list(settings.flipbook_roots)
-    found = [
-        str(path) for path in _candidate_dirs(roots)
-        if (path / "frame_0000" / "transforms.json").is_file()
-    ]
-    return sorted(set(found))

@@ -23,6 +23,8 @@
   "trainer_root": "~/Dev/github/cumuli/deps/OMG4",
   "trainer_script": "train_scratch.py",
 
+  "cumuli_root": "~/Dev/github/cumuli",
+
   "work_root": "",
   "dataset_roots": [],
   "flipbook_roots": [],
