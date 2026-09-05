@@ -81,4 +81,14 @@ if not exist "%PYTHON%" (
 )
 
 "%PYTHON%" "%ROOT%\scripts\install.py"!ARGS!
-exit /b %errorlevel%
+set "RC=%errorlevel%"
+
+REM Double-clicked from Explorer there is no parent console, so the window would
+REM close the instant this returns -- taking the SMPL-X instructions and any
+REM error with it. cmdcmdline carries /c only when it was launched that way.
+echo %cmdcmdline% | find /i "/c" >nul
+if not errorlevel 1 (
+    echo.
+    pause
+)
+exit /b %RC%

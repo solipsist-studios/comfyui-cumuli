@@ -32,71 +32,38 @@ ring that a 10-camera rig cannot capture.
 
 ## Quickstart
 
-From nothing to a `.sogst`. You need a working ComfyUI, an NVIDIA card with
-about 32 GB of VRAM, a CUDA toolkit new enough to target it, and `git`.
+You need ComfyUI, an NVIDIA card with about 32 GB of VRAM, and a CUDA toolkit
+new enough to target it.
 
-**1. Get the three external checkouts.** The pack drives them in place; it
-never vendors them.
+1. **Extract the zip** into `<ComfyUI>/custom_nodes/`, so you have
+   `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
+2. **Run the installer** in that folder — double-click `install.bat` on Windows,
+   or `./install.sh` on Linux. It clones the three checkouts it drives
+   (4DAnyone, OMG4, cumuli), installs the Python dependencies into ComfyUI's own
+   environment, downloads the model weights, and writes `config.json` pointing
+   at all of it. Expect it to take a while and around 30 GB.
+3. **Restart ComfyUI** if it was running — custom nodes load at startup.
+4. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
+   clip into the Load Video node.
+5. **Hit Run.**
 
-```bash
-git clone https://github.com/solipsist-studios/4DAnyone.git   ~/Dev/github/4DAnyone
-git clone https://github.com/solipsist-studios/OMG4.git       ~/Dev/github/OMG4
-```
+### One licence-gated download
 
-Clone OMG4 **standalone** rather than relying on cumuli's `deps/OMG4`
-submodule: the submodule pointer can lag OMG4's own `main`, and an older OMG4
-silently ignores `GS4D_T_INIT_DIV`, which makes Train 4DGS's `t_init_div`
-widget do nothing at all.
+The installer fetches everything it legally can, but **SMPL-X body models** are
+gated behind registration and cannot be downloaded for you. GVHMR needs them for
+the motion solve, so Generate Ring fails without them. The installer prints this
+at the end and names the exact path; the short version is: register at
+[smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), download
+`models_smplx_v1_1.zip`, and put `SMPLX_NEUTRAL.npz` under
+`deps/4DAnyone/models/body_models/smplx/`.
 
-Bake SOGST and Solve Rig drive three of cumuli's scripts in place, so its
-checkout is needed too. Clone it non-recursively — the other submodules
-(sapiens, BiRefNet, Diffuman4D…) belong to the wider pipeline and are not used
-here:
+If ComfyUI does not ship `birefnet.safetensors` in
+`models/background_removal/`, add it too — Ring Masks needs it.
 
-```bash
-git clone https://github.com/solipsist-studios/cumuli.git ~/Dev/github/cumuli
-```
+### About your clip
 
-**2. Install the pack** into ComfyUI:
-
-```bash
-git clone https://github.com/solipsist-studios/comfyui-cumuli.git \
-    <ComfyUI>/custom_nodes/comfyui-cumuli
-```
-
-**3. Install the dependencies** into ComfyUI's own interpreter — see
-[Requirements](#requirements) for what and why:
-
-```bash
-cd ~/Dev/github/comfyui-cumuli
-./install.sh --python <ComfyUI's python>   # install.bat on Windows
-./install.sh --verify-only                 # confirm it took
-```
-
-**4. Point the pack at the checkouts.** Restart ComfyUI, then open its Settings
-dialog and search **Cumuli**. Set **work root** to a large drive —
-intermediates run about 20 GB per run — and set the three checkout paths to
-wherever you cloned them in step 1. Two of the defaults already match the paths
-above; the **OMG4 trainer checkout** does not, because it defaults to cumuli's
-`deps/OMG4` submodule, so point it at your standalone clone.
-[Configuration](#configuration) covers the other layers.
-
-**5. Get the models.**
-
-- **Background removal:** `birefnet.safetensors` in
-  `<ComfyUI>/models/background_removal/` — it ships with ComfyUI.
-- **4DAnyone weights:** its own downloader fetches them on first run, or
-  ahead of time with `python -c "from fdanyone.download import ensure_models;
-  ensure_models()"` from the 4DAnyone checkout.
-- **SMPL-X body models:** the one manual step. Register at
-  [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), accept the licence,
-  download, and install with 4DAnyone's `install_smplx`. Nothing can automate
-  this for you.
-
-**6. Run it.** Load `workflows/cumuli_video_to_sogst.json`, point the Load Video
-node at a clip of **at least 121 frames after `start_time`** (~5 s at 24 fps) at
-720p or better, and queue. Generate Ring checks the clip up front rather than
-failing an hour in.
+At least **121 frames after `start_time`** (~5 s at 24 fps) at 720p or better.
+Generate Ring checks this up front rather than failing an hour in.
 
 ### What to expect
 
@@ -112,7 +79,7 @@ Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
 
 `enable_turbo` is on by default and does the ring in 4 denoising steps. Turning
 it off runs the base model — substantially slower, and the configuration the
-figures elsewhere in this README were originally measured against.
+older figures in this README were measured against.
 
 The `.sogst` and its interchange PLY land in ComfyUI's output gallery under
 `cumuli/`. Everything heavier lives under `<work_root>/<run_name>/`.
@@ -121,6 +88,14 @@ Nothing is thrown away between stages, so you can re-enter anywhere: **Load
 Ring** picks up a finished ring, **Load Flipbook** a staged tree, **Load 4DGS
 Dataset** a finished dataset. All three are discovery dropdowns with a refresh
 button. See [Caching](#caching) for when a stage re-runs.
+
+### If you would rather do it by hand
+
+`./install.sh --help` breaks the run into parts: `--no-fetch` keeps checkouts
+you already have, `--no-models` and `--no-configure` skip those stages,
+`--deps-dir` moves the clones, `--work-root` sets the scratch drive, and
+`--dry-run` prints every command without running any of it. The sections below
+document what each stage does and why.
 
 ## Requirements
 
@@ -135,24 +110,15 @@ Everything runs in ComfyUI's environment. On top of a stock ComfyUI install it
 needs the packages below, all additive — no downgrade of torch, numpy,
 transformers, timm or ultralytics.
 
-**`install.sh` / `install.bat` do all of it**, into ComfyUI's own interpreter:
-
-```bash
-./install.sh                    # everything; install.bat on Windows
-./install.sh --dry-run          # print every command, change nothing
-./install.sh --verify-only      # report what is already present
-./install.sh --groups sfm       # one group: core, bake, sfm, trainer
-./install.sh --python /path/to/ComfyUI/venv/bin/python
-```
-
-It is idempotent (already-installed packages are skipped), auto-detects the
-CUDA toolkit and GPU arch for the extension builds, takes the OMG4 path from
-your bridge config, and records the five pinned packages before and after —
-if pip moves one, the run fails loudly instead of leaving a broken ComfyUI to
-discover an hour later. `--force` reinstalls and rebuilds, which is what you
-want after a torch upgrade. The interpreter is the one thing it cannot guess
-reliably: it prefers `--python`, then `$COMFYUI_PYTHON`, then an activated
-venv/conda env, and refuses outright if the interpreter it picked has no torch.
+**`install.sh` / `install.bat` do all of it** — see [Quickstart](#quickstart).
+It is idempotent (already-installed packages are skipped), auto-detects the CUDA
+toolkit and GPU arch for the extension builds, and records the five pinned
+packages before and after: if pip moves one, the run fails loudly instead of
+leaving a broken ComfyUI to discover an hour later. `--force` reinstalls and
+rebuilds, which is what you want after a torch upgrade. The interpreter is the
+one thing it cannot guess reliably: it prefers `--python`, then
+`$COMFYUI_PYTHON`, then an activated venv/conda env, and refuses outright if the
+interpreter it picked has no torch.
 
 The rest of this section is what the script does, for anyone doing it by hand:
 

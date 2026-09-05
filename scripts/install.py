@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata as metadata
+import json
 import logging
 import os
 import platform
@@ -273,6 +274,126 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
     }
 
 
+# -- checkouts -------------------------------------------------------------
+#: The three checkouts the pack drives. Cloned rather than bundled: OMG4's
+#: upstream carries no licence at all, and hloc's SuperGlue submodule is
+#: non-commercial research only, so the user fetches each from its own origin
+#: under its own terms. Shallow, and never recursive -- cumuli's other
+#: submodules belong to the wider pipeline, not to this pack.
+CHECKOUTS = {
+    "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git"),
+    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git"),
+    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git"),
+}
+
+CONFIG_FILE = PACKAGE_ROOT / "config.json"
+
+
+def fetch_checkouts(deps_dir: Path, *, ref: str = "main", dry_run: bool = False) -> dict[str, Path]:
+    """Clone (or fast-forward) the three checkouts under ``deps_dir``."""
+
+    git = shutil.which("git")
+    if not git:
+        raise InstallError(
+            "git is required to fetch the checkouts but was not found on PATH. "
+            "Install git, or clone them yourself and pass --no-fetch."
+        )
+    resolved: dict[str, Path] = {}
+    for key, (name, url) in CHECKOUTS.items():
+        target = deps_dir / name
+        resolved[key] = target
+        if (target / ".git").is_dir():
+            LOGGER.info("  present  %-24s %s", name, target)
+            continue
+        if target.exists() and any(target.iterdir()):
+            raise InstallError(
+                f"{target} exists and is not a git clone. Move it aside, or pass "
+                "--deps-dir to put the checkouts somewhere else."
+            )
+        deps_dir.mkdir(parents=True, exist_ok=True)
+        _run([git, "clone", "--depth", "1", "--branch", ref, url, str(target)], dry_run=dry_run)
+    return resolved
+
+
+def checkout_revisions(paths: dict[str, Path]) -> dict[str, str]:
+    """Record what was actually fetched, so a report can name exact commits."""
+
+    git = shutil.which("git")
+    out = {}
+    for key, path in paths.items():
+        if not git or not (path / ".git").is_dir():
+            continue
+        try:
+            result = subprocess.run(  # noqa: S603
+                [git, "-C", str(path), "rev-parse", "--short=10", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                out[key] = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return out
+
+
+def write_config(paths: dict[str, Path], work_root: str | None, *, dry_run: bool = False) -> None:
+    """Write config.json so the nodes find the checkouts with no UI fiddling.
+
+    Merges into an existing file rather than replacing it: someone who has
+    already tuned settings should not lose them to a re-run.
+    """
+
+    payload: dict[str, object] = {}
+    if CONFIG_FILE.is_file():
+        try:
+            existing = json.loads(CONFIG_FILE.read_text())
+            if isinstance(existing, dict):
+                payload = existing
+        except (OSError, ValueError):
+            LOGGER.warning("  %s is not readable JSON; writing a fresh one", CONFIG_FILE)
+    payload.update({key: str(path) for key, path in paths.items()})
+    # OMG4 is cloned standalone here, so trainer_root is the clone itself.
+    if work_root:
+        payload["work_root"] = work_root
+    LOGGER.info("  writing %s", CONFIG_FILE)
+    for key in ("fdanyone_root", "trainer_root", "cumuli_root", "work_root"):
+        if key in payload:
+            LOGGER.info("    %-16s %s", key, payload[key])
+    if dry_run:
+        return
+    CONFIG_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
+    """Pull 4DAnyone's published weights using its own downloader."""
+
+    root = paths.get("fdanyone_root")
+    if root is None or not (root / "fdanyone" / "download.py").is_file():
+        LOGGER.info("  skipped (no 4DAnyone checkout)")
+        return
+    argv = [sys.executable, "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); "
+            "from fdanyone.download import ensure_models; "
+            "ensure_models(model_dir=sys.argv[2], gvhmr_root=sys.argv[3])",
+            str(root), str(root / "models"), str(root / "third_party" / "GVHMR")]
+    _run(argv, cwd=root, dry_run=dry_run)
+
+
+def missing_manual_assets(paths: dict[str, Path]) -> list[str]:
+    """What no installer may fetch: licence-gated downloads.
+
+    SMPL-X is not in 4DAnyone's published model list. It is gated behind
+    registration at smpl-x.is.tue.mpg.de, and GVHMR needs it for the motion
+    solve -- so Generate Ring fails without it, however complete everything
+    else looks.
+    """
+
+    root = paths.get("fdanyone_root")
+    if root is None:
+        return []
+    smplx = root / "models" / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
+    return [] if smplx.is_file() else [str(smplx)]
+
+
 # -- steps -----------------------------------------------------------------
 def install_requirements(group: Group, *, force: bool, dry_run: bool) -> None:
     pending = [req for req, dist in group.requirements
@@ -458,6 +579,17 @@ def main() -> int:
                         help="CUDA toolkit for the extension builds. Default: auto-detected to match torch.")
     parser.add_argument("--arch", default=None,
                         help="TORCH_CUDA_ARCH_LIST value. Default: read from nvidia-smi.")
+    parser.add_argument("--deps-dir", type=Path, default=None,
+                        help=f"Where to clone the three checkouts. Default: {PACKAGE_ROOT / 'deps'}")
+    parser.add_argument("--ref", default="main", help="Branch or tag to clone. Default: main.")
+    parser.add_argument("--work-root", default=None,
+                        help="Large drive for per-run intermediates (~20 GB/run). Written to config.json.")
+    parser.add_argument("--no-fetch", action="store_true",
+                        help="Do not clone the checkouts; use whatever the config already points at.")
+    parser.add_argument("--no-models", action="store_true",
+                        help="Do not download 4DAnyone's published weights.")
+    parser.add_argument("--no-configure", action="store_true",
+                        help="Do not write config.json.")
     parser.add_argument("--verbose", action="store_true", help="Debug logging.")
     args = parser.parse_args()
 
@@ -497,8 +629,25 @@ def main() -> int:
         return 0
 
     before = snapshot_pinned()
+    deps_dir = (args.deps_dir or (PACKAGE_ROOT / "deps")).expanduser()
+    checkouts: dict[str, Path] = {}
+
+    try:
+        if not args.no_fetch:
+            LOGGER.info("checkouts -- 4DAnyone, OMG4, cumuli")
+            checkouts = fetch_checkouts(deps_dir, ref=args.ref, dry_run=args.dry_run)
+            LOGGER.info("")
+        if not args.no_configure and checkouts:
+            LOGGER.info("configuration")
+            write_config(checkouts, args.work_root, dry_run=args.dry_run)
+            LOGGER.info("")
+    except InstallError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+
     hloc_dir = (args.hloc_dir or default_hloc_dir()).expanduser()
-    omg4 = (args.omg4 or default_omg4() or Path("OMG4")).expanduser()
+    # A freshly fetched OMG4 wins over the config: it is what was just cloned.
+    omg4 = (args.omg4 or checkouts.get("trainer_root") or default_omg4() or Path("OMG4")).expanduser()
     cuda_home = args.cuda_home or find_cuda_home(cuda_major)
     arch = args.arch or gpu_arch_list()
 
@@ -530,12 +679,42 @@ def main() -> int:
         LOGGER.error("Reinstall the original versions before starting ComfyUI.")
         return 1
 
+    if not args.no_models and checkouts:
+        LOGGER.info("models -- 4DAnyone's published weights")
+        try:
+            fetch_models(checkouts, dry_run=args.dry_run)
+        except InstallError as exc:
+            LOGGER.error("%s", exc)
+            LOGGER.error("The weights can be fetched later; everything else is installed.")
+        LOGGER.info("")
+
     missing = verify(groups, selected)
+    revisions = checkout_revisions(checkouts)
+    if revisions:
+        LOGGER.info("")
+        LOGGER.info("checkouts")
+        for key, sha in revisions.items():
+            LOGGER.info("  %-16s %s @ %s", key, checkouts[key], sha)
     LOGGER.info("")
     if missing:
         LOGGER.error("still missing after the run: %s", ", ".join(missing))
         return 1
+
     LOGGER.info("done -- %s installed, torch untouched", ", ".join(selected))
+
+    # The one thing no installer may do for you.
+    manual = missing_manual_assets(checkouts)
+    if manual:
+        LOGGER.info("")
+        LOGGER.info("ONE STEP LEFT -- SMPL-X body models are licence-gated and cannot be")
+        LOGGER.info("downloaded automatically. Generate Ring needs them for the motion solve.")
+        LOGGER.info("  1. register and accept the licence at https://smpl-x.is.tue.mpg.de/")
+        LOGGER.info("  2. download models_smplx_v1_1.zip")
+        LOGGER.info("  3. place SMPLX_NEUTRAL.npz at:")
+        for path in manual:
+            LOGGER.info("       %s", path)
+    LOGGER.info("")
+    LOGGER.info("Restart ComfyUI to pick up the nodes.")
     return 0
 
 
