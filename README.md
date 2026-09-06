@@ -20,16 +20,6 @@ Load Video ──VIDEO──┐        Model Loader ─▶ LoRA loaders (stock) 
                           └─ Preview SOGST        → SPLAT → stock Render Splat
 ```
 
-Three opaque types travel between nodes — `CUMULI_RING`, `CUMULI_FLIPBOOK`,
-`CUMULI_DATASET` — each a handle to a directory tree the producer already
-wrote. There are therefore no Save nodes (the producers are the save nodes) and
-one Load node per type (`Load Ring`, `Load Flipbook`, `Load 4DGS Dataset`) for
-re-entry and for external data.
-
-Why this exists: reconstruction quality on subject captures is limited by **view
-sparsity**, not by the trainer or the container. 4DAnyone synthesizes the dense
-ring that a 10-camera rig cannot capture.
-
 ## Quickstart
 
 You need ComfyUI, an NVIDIA card with about 32 GB of VRAM, and a CUDA toolkit
@@ -42,28 +32,20 @@ new enough to target it.
    pinned to `v0.0.1`, installs the Python dependencies into ComfyUI's own
    environment, downloads the model weights, and writes `config.json` pointing
    at all of it. Expect it to take a while and around 30 GB.
-3. **Restart ComfyUI** if it was running — custom nodes load at startup.
-4. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
+3. **Download SMPL-X** models that require manual registration at
+   [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), download
+   `models_smplx_v1_1.zip`, and extract `SMPLX_NEUTRAL.npz` under
+   `deps/4DAnyone/models/body_models/smplx/`.
+4. **Restart ComfyUI** if it was running — custom nodes load at startup.
+5. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.
-5. **Hit Run.**
-
-### One licence-gated download
-
-The installer fetches everything it legally can, but **SMPL-X body models** are
-gated behind registration and cannot be downloaded for you. GVHMR needs them for
-the motion solve, so Generate Ring fails without them. The installer prints this
-at the end and names the exact path; the short version is: register at
-[smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), download
-`models_smplx_v1_1.zip`, and put `SMPLX_NEUTRAL.npz` under
-`deps/4DAnyone/models/body_models/smplx/`.
-
-If ComfyUI does not ship `birefnet.safetensors` in
-`models/background_removal/`, add it too — Ring Masks needs it.
+6. **Hit Run.**
 
 ### About your clip
 
-At least **121 frames after `start_time`** (~5 s at 24 fps) at 720p or better.
-Generate Ring checks this up front rather than failing an hour in.
+Exactly **121 frames** are used by 4DAnyone, so at least that many frames after 
+`start_time` (~5 s at 24 fps) at 720p are required. Generate Ring checks this up 
+front rather than failing an hour in.
 
 ### What to expect
 
