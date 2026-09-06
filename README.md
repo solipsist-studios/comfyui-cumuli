@@ -298,11 +298,41 @@ error instead, because one dataset cannot hold two image sizes.
 
 ### Viewing the result
 
-ComfyUI has no `.sogst` viewer, and the format's own player is a browser build,
-so rather than ship a viewer this pack meets ComfyUI's existing one. **Preview
-SOGST** evaluates every gaussian at a chosen clip time — centre moved along its
-velocity, opacity scaled by its temporal window — and hands the result to the
-stock `SPLAT` type:
+Two ways, for two different jobs: **SuperSplat Viewer** plays the `.sogst` back
+properly, and **Preview SOGST** checks a single instant without leaving the
+graph.
+
+#### Playing it back — SuperSplat Viewer
+
+`.sogst` is a streamable container, so playing one back means a browser. Our
+fork of PlayCanvas's viewer reads the format natively:
+
+**<https://github.com/solipsist-studios/supersplat-viewer>**
+
+It is a self-contained static site that takes the scene as a URL parameter, so
+pointing it at a bake is one link:
+
+```
+index.html?content=/path/to/splat_4d.sogst
+```
+
+To run it locally (Node 18+):
+
+```bash
+git clone https://github.com/solipsist-studios/supersplat-viewer.git
+cd supersplat-viewer && npm install && npm run develop
+# then open http://localhost:3000?content=<url of your .sogst>
+```
+
+`noui` hides the overlay, `noanim` starts paused, and `ministats` shows CPU/GPU
+graphs; the fork's own README documents the rest. Upstream PlayCanvas does not
+read `.sogst` — use the fork.
+
+#### Checking one instant — Preview SOGST
+
+For a quick look without leaving ComfyUI, **Preview SOGST** evaluates every
+gaussian at a chosen clip time — centre moved along its velocity, opacity scaled
+by its temporal window — and hands the result to the stock `SPLAT` type:
 
 ```
 Bake SOGST ──ply_path──> Preview SOGST ──splat──> Render Splat ──> Preview Image
