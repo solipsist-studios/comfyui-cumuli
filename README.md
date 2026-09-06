@@ -38,11 +38,10 @@ new enough to target it.
 1. **Extract the zip** into `<ComfyUI>/custom_nodes/`, so you have
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
-   or `./install.sh` on Linux. It clones the three checkouts it drives at pinned
-   versions (4DAnyone `v0.0.1`, OMG4 `v0.0.1`, cumuli `main`), installs the
-   Python dependencies into ComfyUI's own environment, downloads the model
-   weights, and writes `config.json` pointing at all of it. Expect it to take a
-   while and around 30 GB.
+   or `./install.sh` on Linux. It clones the three checkouts it drives, all
+   pinned to `v0.0.1`, installs the Python dependencies into ComfyUI's own
+   environment, downloads the model weights, and writes `config.json` pointing
+   at all of it. Expect it to take a while and around 30 GB.
 3. **Restart ComfyUI** if it was running — custom nodes load at startup.
 4. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.
