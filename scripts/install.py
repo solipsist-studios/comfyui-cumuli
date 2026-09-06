@@ -280,17 +280,24 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
 #: non-commercial research only, so the user fetches each from its own origin
 #: under its own terms. Shallow, and never recursive -- cumuli's other
 #: submodules belong to the wider pipeline, not to this pack.
+#: ``(directory, url, ref)``. The ref is pinned per repository so an archive
+#: shipped today installs the same code next year, and so one checkout can move
+#: without dragging the others. ``--ref`` overrides all three at once.
 CHECKOUTS = {
-    "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git"),
-    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git"),
-    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git"),
+    "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git", "v0.0.1"),
+    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.1"),
+    # cumuli carries no tag yet; pin it here the moment one exists.
+    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "main"),
 }
 
 CONFIG_FILE = PACKAGE_ROOT / "config.json"
 
 
-def fetch_checkouts(deps_dir: Path, *, ref: str = "main", dry_run: bool = False) -> dict[str, Path]:
-    """Clone (or fast-forward) the three checkouts under ``deps_dir``."""
+def fetch_checkouts(deps_dir: Path, *, ref: str | None = None, dry_run: bool = False) -> dict[str, Path]:
+    """Clone the three checkouts under ``deps_dir``, each at its pinned ref.
+
+    ``ref`` overrides every pin, for testing an unreleased branch.
+    """
 
     git = shutil.which("git")
     if not git:
@@ -299,7 +306,7 @@ def fetch_checkouts(deps_dir: Path, *, ref: str = "main", dry_run: bool = False)
             "Install git, or clone them yourself and pass --no-fetch."
         )
     resolved: dict[str, Path] = {}
-    for key, (name, url) in CHECKOUTS.items():
+    for key, (name, url, pinned) in CHECKOUTS.items():
         target = deps_dir / name
         resolved[key] = target
         if (target / ".git").is_dir():
@@ -311,7 +318,10 @@ def fetch_checkouts(deps_dir: Path, *, ref: str = "main", dry_run: bool = False)
                 "--deps-dir to put the checkouts somewhere else."
             )
         deps_dir.mkdir(parents=True, exist_ok=True)
-        _run([git, "clone", "--depth", "1", "--branch", ref, url, str(target)], dry_run=dry_run)
+        wanted = ref or pinned
+        # --branch takes a tag as happily as a branch, and --depth 1 against a
+        # tag fetches exactly that commit.
+        _run([git, "clone", "--depth", "1", "--branch", wanted, url, str(target)], dry_run=dry_run)
     return resolved
 
 
@@ -581,7 +591,9 @@ def main() -> int:
                         help="TORCH_CUDA_ARCH_LIST value. Default: read from nvidia-smi.")
     parser.add_argument("--deps-dir", type=Path, default=None,
                         help=f"Where to clone the three checkouts. Default: {PACKAGE_ROOT / 'deps'}")
-    parser.add_argument("--ref", default="main", help="Branch or tag to clone. Default: main.")
+    parser.add_argument("--ref", default=None,
+                        help="Override the pinned ref for every checkout (default: each repo's own pin, "
+                             + ", ".join(f"{n}@{r}" for n, _, r in CHECKOUTS.values()) + ").")
     parser.add_argument("--work-root", default=None,
                         help="Large drive for per-run intermediates (~20 GB/run). Written to config.json.")
     parser.add_argument("--no-fetch", action="store_true",

@@ -38,10 +38,11 @@ new enough to target it.
 1. **Extract the zip** into `<ComfyUI>/custom_nodes/`, so you have
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
-   or `./install.sh` on Linux. It clones the three checkouts it drives
-   (4DAnyone, OMG4, cumuli), installs the Python dependencies into ComfyUI's own
-   environment, downloads the model weights, and writes `config.json` pointing
-   at all of it. Expect it to take a while and around 30 GB.
+   or `./install.sh` on Linux. It clones the three checkouts it drives at pinned
+   versions (4DAnyone `v0.0.1`, OMG4 `v0.0.1`, cumuli `main`), installs the
+   Python dependencies into ComfyUI's own environment, downloads the model
+   weights, and writes `config.json` pointing at all of it. Expect it to take a
+   while and around 30 GB.
 3. **Restart ComfyUI** if it was running — custom nodes load at startup.
 4. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.
@@ -93,8 +94,9 @@ button. See [Caching](#caching) for when a stage re-runs.
 
 `./install.sh --help` breaks the run into parts: `--no-fetch` keeps checkouts
 you already have, `--no-models` and `--no-configure` skip those stages,
-`--deps-dir` moves the clones, `--work-root` sets the scratch drive, and
-`--dry-run` prints every command without running any of it. The sections below
+`--deps-dir` moves the clones, `--work-root` sets the scratch drive, `--ref`
+overrides the pinned versions, and `--dry-run` prints every command without
+running any of it. The sections below
 document what each stage does and why.
 
 ## Requirements

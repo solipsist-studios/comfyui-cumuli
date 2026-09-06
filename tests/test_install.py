@@ -38,9 +38,11 @@ def _repo(root: Path, name: str) -> str:
 @pytest.fixture
 def origins(tmp_path, monkeypatch):
     remotes = tmp_path / "remotes"
+    # Local stand-ins keep the same shape, including each repo's pinned ref;
+    # the throwaway repos are created on "main".
     monkeypatch.setattr(install, "CHECKOUTS", {
-        key: (name, _repo(remotes, name))
-        for key, (name, _) in install.CHECKOUTS.items()
+        key: (name, _repo(remotes, name), "main")
+        for key, (name, _url, _ref) in install.CHECKOUTS.items()
     })
     return tmp_path / "deps"
 
@@ -115,6 +117,39 @@ def test_smplx_is_reported_missing_until_it_is_placed(tmp_path):
     smplx.parent.mkdir(parents=True)
     smplx.write_text("")
     assert install.missing_manual_assets({"fdanyone_root": root}) == []
+
+
+def test_each_checkout_is_cloned_at_its_own_pinned_ref(tmp_path, monkeypatch):
+    """The pin is per repository, so one can move without dragging the others."""
+
+    remotes = tmp_path / "remotes"
+    url = _repo(remotes, "pinned")
+    repo = remotes / "pinned"
+    # A second commit on main, with the tag left behind on the first.
+    subprocess.run(["git", "-C", str(repo), "tag", "v0.0.1"], check=True, capture_output=True)
+    (repo / "README").write_text("moved on")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "second"], check=True, capture_output=True)
+
+    monkeypatch.setattr(install, "CHECKOUTS", {"cumuli_root": ("pinned", url, "v0.0.1")})
+    paths = install.fetch_checkouts(tmp_path / "deps")
+    assert (paths["cumuli_root"] / "README").read_text() == "pinned"
+
+
+def test_ref_override_beats_the_pin(tmp_path, monkeypatch):
+    remotes = tmp_path / "remotes"
+    url = _repo(remotes, "pinned")
+    repo = remotes / "pinned"
+    subprocess.run(["git", "-C", str(repo), "tag", "v0.0.1"], check=True, capture_output=True)
+    (repo / "README").write_text("moved on")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "second"], check=True, capture_output=True)
+
+    monkeypatch.setattr(install, "CHECKOUTS", {"cumuli_root": ("pinned", url, "v0.0.1")})
+    paths = install.fetch_checkouts(tmp_path / "deps", ref="main")
+    assert (paths["cumuli_root"] / "README").read_text() == "moved on"
 
 
 def test_dry_run_clones_nothing(origins):
