@@ -108,6 +108,19 @@ def test_write_config_survives_an_unreadable_existing_file(tmp_path, monkeypatch
     assert json.loads(config.read_text())["cumuli_root"] == str(tmp_path)
 
 
+@pytest.mark.parametrize("before,after,expected", [
+    # The failure this guard exists for: something moved under ComfyUI.
+    ({"torch": "2.13.0"}, {"torch": "2.4.0"}, ["torch: 2.13.0 -> 2.4.0"]),
+    ({"torch": "2.13.0"}, {"torch": None}, ["torch: 2.13.0 -> removed"]),
+    # Not failures: unchanged, or pulled in fresh as a dependency.
+    ({"torch": "2.13.0"}, {"torch": "2.13.0"}, []),
+    ({"numpy": None}, {"numpy": "2.5.3"}, []),
+    ({"numpy": None}, {"numpy": None}, []),
+])
+def test_only_real_drift_fails_the_run(before, after, expected):
+    assert install.compare_pinned(before, after) == expected
+
+
 def test_smplx_is_reported_missing_until_it_is_placed(tmp_path):
     """The one asset no installer may fetch, so it must be named explicitly."""
 

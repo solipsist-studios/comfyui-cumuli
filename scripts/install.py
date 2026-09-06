@@ -135,13 +135,20 @@ def snapshot_pinned() -> dict[str, str | None]:
 
 
 def compare_pinned(before: dict[str, str | None], after: dict[str, str | None]) -> list[str]:
-    """Return human-readable descriptions of any version that moved."""
+    """Describe any guarded package that changed version or disappeared.
+
+    A package that was absent and is now present was pulled in as a dependency
+    -- numpy arrives with smplx, for instance -- which is an install, not a
+    downgrade. Only a version moving under ComfyUI, or a package vanishing from
+    beneath it, is the failure this guard exists to catch.
+    """
 
     moved = []
     for name, was in before.items():
         now = after.get(name)
-        if was != now:
-            moved.append(f"{name}: {was or 'absent'} -> {now or 'absent'}")
+        if was is None or was == now:
+            continue
+        moved.append(f"{name}: {was} -> {now or 'removed'}")
     return moved
 
 
