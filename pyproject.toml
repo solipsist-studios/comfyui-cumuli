@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-cumuli"
 description = "Cumuli nodes for ComfyUI: take one monocular clip to a streamable .sogst 4D Gaussian splat, via a generated novel-view ring or a real multi-camera capture."
-version = "0.1.0"
+version = "0.0.1"
 license = { file = "LICENSE.md" }
 requires-python = ">=3.10"
 dependencies = []
