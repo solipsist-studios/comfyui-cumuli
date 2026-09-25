@@ -34,6 +34,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import re
 import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -44,6 +45,12 @@ import numpy as np
 from .flipbook import IMAGES_SUBDIR, Flipbook, MASKS_SUBDIR
 
 LOGGER = logging.getLogger("comfyui-cumuli")
+
+#: Binary layout written by ``write_ply_with_time`` -- kept as one constant so
+#: the window slicer's reader and the writer can never silently drift apart.
+_PLY_RECORD_DTYPE = np.dtype(
+    [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1"), ("time", "<f4")]
+)
 
 
 class DatasetError(RuntimeError):
@@ -109,14 +116,21 @@ def convert_image(src_img, src_mask, dst, downscale):
     return dst
 
 
-def flatten_gt(rgba_path, dst):
-    """RGBA -> RGB composited over black, which is what a masked trainer renders."""
+def flatten_gt(rgba_path, dst, background="black"):
+    """RGBA -> RGB composited over ``background``, matching what the trainer
+    renders: OMG4's own ``white_background`` flag composites onto pure black
+    or pure white and nothing else (see ``TrainOptions.white_background``), so
+    this must agree with whichever the model actually trained against or the
+    held-out PSNR/LPIPS score reverts to comparing against the wrong backdrop.
+    """
 
     from PIL import Image
 
     with Image.open(rgba_path) as im:
         rgba = np.asarray(im.convert("RGBA"), dtype=np.float32)
-    rgb = rgba[..., :3] * (rgba[..., 3:4] / 255.0)
+    bg = 255.0 if background == "white" else 0.0
+    alpha = rgba[..., 3:4] / 255.0
+    rgb = rgba[..., :3] * alpha + bg * (1.0 - alpha)
     Image.fromarray(rgb.astype(np.uint8)).save(dst, optimize=False, compress_level=1)
 
 
@@ -224,6 +238,12 @@ class DatasetOptions:
     hull_points: int = 300_000
     hull_min_views: int = 9
     jobs: int = 8
+    #: OMG4's own ``white_background`` flag is a hard binary (see
+    #: ``TrainOptions.white_background``); this must match whatever the
+    #: model trained against, or held-out scoring composites onto the wrong
+    #: backdrop. "black" matches every dataset built before this option
+    #: existed.
+    background: str = "black"
 
     def validate(self) -> None:
         if self.downscale < 1:
@@ -236,6 +256,8 @@ class DatasetOptions:
             raise DatasetError(f"hull_min_views must be at least 1, got {self.hull_min_views}.")
         if self.jobs < 1:
             raise DatasetError(f"jobs must be at least 1, got {self.jobs}.")
+        if self.background not in ("black", "white"):
+            raise DatasetError(f"background must be 'black' or 'white', got {self.background!r}.")
 
 
 @dataclass
@@ -450,9 +472,9 @@ def build_dataset(
             for i in frame_idx
         ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
-            for future in [pool.submit(flatten_gt, s, d) for s, d in gt_jobs]:
+            for future in [pool.submit(flatten_gt, s, d, options.background) for s, d in gt_jobs]:
                 future.result()
-        LOGGER.info("eval_gt_flat: %d black-composited GT frames", len(frame_dirs))
+        LOGGER.info("eval_gt_flat: %d %s-composited GT frames", len(frame_dirs), options.background)
 
     report(1.0, "dataset complete")
     LOGGER.info(
@@ -462,6 +484,101 @@ def build_dataset(
         out,
     )
     return summary
+
+
+# --------------------------------------------------------------------------
+# Windowing: slice an already-built dataset, not rebuild it
+# --------------------------------------------------------------------------
+def _filter_transforms(src: Path, dst: Path, frame_start: int, frame_count: int, fps: float) -> int:
+    """Copy one transforms JSON, keeping only frames in the window and
+    rewriting their ``time`` to be local (0-based) to the window.
+
+    ``file_path`` entries are left untouched: they stay relative to
+    ``realcams/...``, which the caller symlinks in unchanged, so no image
+    bytes are copied or renumbered for a window.
+    """
+
+    payload = json.loads(src.read_text())
+    kept = []
+    for frame in payload.get("frames", []):
+        index = round(float(frame["time"]) * fps)
+        if frame_start <= index < frame_start + frame_count:
+            frame = dict(frame)
+            frame["time"] = round((index - frame_start) / fps, 7)
+            kept.append(frame)
+    dst.write_text(json.dumps({**payload, "frames": kept}, indent=1))
+    return len(kept)
+
+
+def _slice_points3d(src: Path, dst: Path, frame_start: int, frame_count: int, fps: float) -> int:
+    """Filter ``points3d.ply`` by the same per-point ``time`` window, rebasing
+    it to local time exactly as ``_filter_transforms`` does for the frames."""
+
+    data = src.read_bytes()
+    marker = b"end_header\n"
+    header_end = data.index(marker) + len(marker)
+    header = data[:header_end].decode("ascii")
+    match = re.search(r"element vertex (\d+)", header)
+    if not match:
+        raise DatasetError(f"{src} has no 'element vertex' line; not a recognised points3d.ply.")
+    count = int(match.group(1))
+    records = np.frombuffer(data, dtype=_PLY_RECORD_DTYPE, count=count, offset=header_end)
+
+    index = np.rint(records["time"] * fps).astype(np.int64)
+    mask = (index >= frame_start) & (index < frame_start + frame_count)
+    kept = records[mask]
+    if len(kept) == 0:
+        raise DatasetError(
+            f"Window frames [{frame_start}, {frame_start + frame_count}) carve zero init points "
+            f"from {src}. The window is too short relative to hull_points, or misaligned with the "
+            "dataset's own frame timestamps."
+        )
+    local_time = ((index[mask] - frame_start).astype(np.float32) / np.float32(fps))
+    pts = np.stack([kept["x"], kept["y"], kept["z"]], axis=1)
+    rgb = np.stack([kept["r"], kept["g"], kept["b"]], axis=1)
+    write_ply_with_time(dst, pts, rgb, local_time)
+    return len(kept)
+
+
+def slice_dataset_window(dataset_dir: Path, out_dir: Path, frame_start: int, frame_count: int, fps: float) -> None:
+    """Point a training window at its slice of an already-built dataset.
+
+    Nothing expensive is redone: the visual hull and RGBA frames are the
+    costly part of ``build_dataset`` and a window reuses them verbatim via one
+    directory symlink, filtering only the two small artifacts that carry a
+    ``time`` field (``transforms_{train,test}.json``, ``points3d.ply``) and
+    rebasing that field to be local to the window -- exactly the local time
+    origin ``train.TrainOptions.duration_seconds`` expects for a standalone
+    training run, and what ``bake.BakeOptions``/``merge_windows`` need to shift
+    back into global time afterwards via each window's own offset.
+    """
+
+    dataset_dir = Path(dataset_dir).expanduser().resolve()
+    out_dir = Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    realcams_link = out_dir / "realcams"
+    if realcams_link.is_symlink():
+        realcams_link.unlink()
+    elif realcams_link.exists():
+        raise DatasetError(f"{realcams_link} exists and is not a symlink; refusing to overwrite it.")
+    realcams_link.symlink_to(dataset_dir / "realcams")
+
+    for name in ("transforms_train.json", "transforms_test.json"):
+        src = dataset_dir / name
+        if not src.is_file():
+            continue
+        kept = _filter_transforms(src, out_dir / name, frame_start, frame_count, fps)
+        if kept == 0:
+            raise DatasetError(
+                f"Window frames [{frame_start}, {frame_start + frame_count}) keep zero entries from "
+                f"{src}."
+            )
+
+    _slice_points3d(dataset_dir / "points3d.ply", out_dir / "points3d.ply", frame_start, frame_count, fps)
+    LOGGER.info(
+        "sliced window [%d, %d) of %s -> %s", frame_start, frame_start + frame_count, dataset_dir, out_dir
+    )
 
 
 @dataclass(frozen=True)

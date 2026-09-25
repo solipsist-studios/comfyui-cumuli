@@ -32,14 +32,21 @@ from cumuli_bridge.settings import BridgeSettings, SettingsError  # noqa: E402
 from cumuli_bridge.train import (  # noqa: E402
     BakeOptions,
     BakeProgress,
+    MergeOptions,
     TrainingError,
     TrainOptions,
     TrainProgress,
+    WindowTrainSpec,
     build_bake_argv,
+    build_merge_argv,
     build_train_argv,
     build_train_env,
+    clamp_parallel_windows,
+    write_config,
 )
 from cumuli_bridge.validate import ValidationError, validate_dataset  # noqa: E402
+from cumuli_bridge.dataset4d import DatasetError, flatten_gt, slice_dataset_window, write_ply_with_time  # noqa: E402
+from cumuli_bridge.windowing import Window, WindowingError, even_windows  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -1182,3 +1189,256 @@ def test_pipeline_script_error_names_the_setting(settings, tmp_path):
         scoped.pipeline_script("bake_sogst.py")
     assert "cumuli_root" in str(exc.value)
     assert "CUMULI_PIPELINE_ROOT" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# windowed training: even split, dataset slicing, config/merge plumbing
+# --------------------------------------------------------------------------
+def test_even_windows_matches_the_measured_best_uniform_split():
+    """121 frames at max 31 -> 31/30/30/30, the arm that measured LPIPS 0.00778
+    against 0.00899 for a single wide fit."""
+
+    windows = even_windows(121, 31)
+    assert [w.frame_count for w in windows] == [31, 30, 30, 30]
+    assert [w.frame_start for w in windows] == [0, 31, 61, 91]
+    assert [w.frame_end for w in windows] == [31, 61, 91, 121]
+
+
+def test_even_windows_is_a_single_window_when_the_clip_already_fits():
+    for total in (31, 10, 1):
+        windows = even_windows(total, 31)
+        assert len(windows) == 1
+        assert windows[0].frame_start == 0
+        assert windows[0].frame_count == total
+
+
+def test_even_windows_spreads_the_remainder_over_the_earliest_windows():
+    windows = even_windows(10, 3)  # ceil(10/3)=4 windows, base=2, remainder=2
+    assert [w.frame_count for w in windows] == [3, 3, 2, 2]
+    assert sum(w.frame_count for w in windows) == 10
+    assert [w.frame_start for w in windows] == [0, 3, 6, 8]
+
+
+def test_even_windows_rejects_nonpositive_input():
+    with pytest.raises(WindowingError):
+        even_windows(0, 10)
+    with pytest.raises(WindowingError):
+        even_windows(10, 0)
+
+
+def test_window_offset_seconds():
+    assert Window(index=2, frame_start=61, frame_count=30).offset_seconds(24.0) == pytest.approx(61 / 24.0)
+
+
+def test_flatten_gt_composites_onto_the_requested_background(tmp_path):
+    from PIL import Image
+    import numpy as np
+
+    rgba_arr = np.array([[[200, 100, 50, 128]]], dtype=np.uint8)
+    src = tmp_path / "in.png"
+    Image.fromarray(rgba_arr, mode="RGBA").save(src)
+
+    for background, bg_value in (("black", 0.0), ("white", 255.0)):
+        out = tmp_path / f"{background}.png"
+        flatten_gt(src, out, background)
+        actual = np.asarray(Image.open(out).convert("RGB"))[0, 0]
+        alpha = rgba_arr[0, 0, 3] / 255.0
+        expected = (rgba_arr[0, 0, :3].astype(np.float32) * alpha + bg_value * (1 - alpha)).astype(np.uint8)
+        assert tuple(int(c) for c in actual) == tuple(int(c) for c in expected)
+
+
+def test_dataset_options_rejects_an_unknown_background(tmp_path):
+    from cumuli_bridge.dataset4d import DatasetOptions
+
+    with pytest.raises(DatasetError, match="background"):
+        DatasetOptions(out_dir=tmp_path, background="purple").validate()
+
+
+def _write_windowable_dataset(root: Path, num_frames: int, fps: float = 24.0) -> Path:
+    """A dataset with real per-frame timestamps but no image bytes:
+    slice_dataset_window never opens an image, it only symlinks 'realcams'
+    and filters the two artifacts that carry a 'time' field."""
+
+    import numpy as np
+
+    (root / "realcams" / "cam00").mkdir(parents=True)
+    frames = [
+        {
+            "file_path": f"realcams/cam00/frame_{i + 1:05d}",
+            "camera_label": "00",
+            "time": i / fps,
+            "fl_x": 832.0, "fl_y": 832.0, "cx": 4.0, "cy": 4.0, "w": 8, "h": 8,
+            "transform_matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+        }
+        for i in range(num_frames)
+    ]
+    for name in ("transforms_train.json", "transforms_test.json"):
+        (root / name).write_text(json.dumps({"camera_model": "OPENCV", "frames": frames}))
+
+    # Two init points per frame, x carrying the global frame index so a test
+    # can check which frames survived a slice.
+    pts = np.array([[float(i), 0.0, 0.0] for i in range(num_frames) for _ in range(2)], dtype=np.float32)
+    rgb = np.zeros((num_frames * 2, 3), dtype=np.uint8)
+    times = np.array([i / fps for i in range(num_frames) for _ in range(2)], dtype=np.float32)
+    write_ply_with_time(root / "points3d.ply", pts, rgb, times)
+    return root
+
+
+def _read_ply_records(path: Path):
+    import re
+
+    import numpy as np
+
+    from cumuli_bridge.dataset4d import _PLY_RECORD_DTYPE
+
+    data = path.read_bytes()
+    header_end = data.index(b"end_header\n") + len(b"end_header\n")
+    count = int(re.search(r"element vertex (\d+)", data[:header_end].decode("ascii")).group(1))
+    return np.frombuffer(data, dtype=_PLY_RECORD_DTYPE, count=count, offset=header_end)
+
+
+def test_slice_dataset_window_rebases_time_and_filters_frames(tmp_path):
+    dataset = _write_windowable_dataset(tmp_path / "full", num_frames=10, fps=24.0)
+    out_dir = tmp_path / "window"
+    slice_dataset_window(dataset, out_dir, frame_start=3, frame_count=4, fps=24.0)
+
+    assert (out_dir / "realcams").is_symlink()
+    assert (out_dir / "realcams").resolve() == (dataset / "realcams").resolve()
+
+    for name in ("transforms_train.json", "transforms_test.json"):
+        payload = json.loads((out_dir / name).read_text())
+        times = sorted(f["time"] for f in payload["frames"])
+        assert times == pytest.approx([0.0, 1 / 24.0, 2 / 24.0, 3 / 24.0])
+        # file_path is untouched: it still resolves through the shared symlink.
+        assert all(f["file_path"].startswith("realcams/cam00/") for f in payload["frames"])
+
+    records = _read_ply_records(out_dir / "points3d.ply")
+    assert len(records) == 8  # 2 points/frame x 4 kept frames
+    assert sorted({round(float(t), 5) for t in records["time"]}) == [
+        round(n / 24.0, 5) for n in range(4)
+    ]
+    # x carried the ORIGINAL global frame index; window [3, 7) was kept.
+    assert sorted({int(x) for x in records["x"]}) == [3, 4, 5, 6]
+
+
+def test_slice_dataset_window_rejects_a_window_with_no_frames(tmp_path):
+    dataset = _write_windowable_dataset(tmp_path / "full", num_frames=5, fps=24.0)
+    with pytest.raises(DatasetError, match="zero"):
+        slice_dataset_window(dataset, tmp_path / "window", frame_start=100, frame_count=4, fps=24.0)
+
+
+def test_slice_dataset_window_refuses_a_foreign_realcams_directory(tmp_path):
+    dataset = _write_windowable_dataset(tmp_path / "full", num_frames=5, fps=24.0)
+    out_dir = tmp_path / "window"
+    (out_dir / "realcams").mkdir(parents=True)  # a real directory, not our own symlink
+    with pytest.raises(DatasetError, match="symlink"):
+        slice_dataset_window(dataset, out_dir, frame_start=0, frame_count=2, fps=24.0)
+
+
+def test_write_config_patches_white_background_when_requested(settings, tmp_path):
+    configs = tmp_path / "cumuli" / "configs"
+    configs.mkdir(parents=True)
+    (configs / "gs4d_pretrain_template.yaml").write_text(
+        "time_max: {time_max}\nnum_pts: {num_pts}\nbatch_size: {batch_size}\n"
+        "source_path: {source_path}\nmodel_path: {model_path}\niterations: {iterations}\n"
+        "densify_until_iter: {densify_until_iter}\n"
+        "densify_until_num_points: {densify_until_num_points}\n"
+        "sh_degree: 3\nwhite_background: False\n"
+    )
+    scoped = BridgeSettings(**{**settings.__dict__, "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
+
+    options = _train_options(tmp_path / "black_run", tmp_path / "ds")
+    text = write_config(scoped, options).read_text()
+    assert "white_background: False" in text
+
+    options = _train_options(tmp_path / "white_run", tmp_path / "ds")
+    options.white_background = True
+    text = write_config(scoped, options).read_text()
+    assert "white_background: True" in text
+    assert "white_background: False" not in text
+
+
+def test_write_config_inserts_lambda_opa_mask_when_nonzero(settings, tmp_path):
+    configs = tmp_path / "cumuli" / "configs"
+    configs.mkdir(parents=True)
+    (configs / "gs4d_pretrain_template.yaml").write_text(
+        "time_max: {time_max}\nnum_pts: {num_pts}\nbatch_size: {batch_size}\n"
+        "source_path: {source_path}\nmodel_path: {model_path}\niterations: {iterations}\n"
+        "densify_until_iter: {densify_until_iter}\n"
+        "densify_until_num_points: {densify_until_num_points}\n"
+        "sh_degree: 3\nwhite_background: False\n"
+        "  OptimizationParams:\n    lambda_dssim: 0.2\n    thresh_opa_prune: 0.005\n"
+    )
+    scoped = BridgeSettings(**{**settings.__dict__, "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
+
+    options = _train_options(tmp_path / "off_run", tmp_path / "ds")
+    options.lambda_opa_mask = 0.0
+    text = write_config(scoped, options).read_text()
+    assert "lambda_opa_mask" not in text
+
+    options = _train_options(tmp_path / "on_run", tmp_path / "ds")
+    options.lambda_opa_mask = 0.005
+    text = write_config(scoped, options).read_text()
+    assert "lambda_dssim: 0.2\n    lambda_opa_mask: 0.005" in text
+
+
+def test_build_merge_argv_passes_segments_and_fade_settings(settings, tmp_path, monkeypatch):
+    script = tmp_path / "merge_sogst_segments.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_merge_script", lambda _s: script)
+    argv = build_merge_argv(settings, MergeOptions(
+        segments=[(tmp_path / "win_00.sogst", 0.0), (tmp_path / "win_01.sogst", 1.291667)],
+        output=tmp_path / "out.sogst",
+        mode="fade",
+        fade_seconds=0.35,
+    ))
+    flags = argv[argv.index(str(script)) + 1:]
+    assert flags[flags.index("--out") + 1] == str(tmp_path / "out.sogst")
+    assert flags[flags.index("--mode") + 1] == "fade"
+    assert flags[flags.index("--fade") + 1] == "0.35"
+    segment_positions = [i for i, f in enumerate(flags) if f == "--segment"]
+    assert len(segment_positions) == 2
+    assert flags[segment_positions[0] + 1] == str(tmp_path / "win_00.sogst")
+    assert flags[segment_positions[0] + 2] == "0.000000"
+    assert flags[segment_positions[1] + 2] == "1.291667"
+
+
+def test_build_merge_argv_omits_fade_for_hard_mode(settings, tmp_path, monkeypatch):
+    script = tmp_path / "merge_sogst_segments.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_merge_script", lambda _s: script)
+    argv = build_merge_argv(settings, MergeOptions(
+        segments=[(tmp_path / "a.sogst", 0.0), (tmp_path / "b.sogst", 1.0)],
+        output=tmp_path / "out.sogst",
+        mode="hard",
+    ))
+    assert "--fade" not in argv
+
+
+def test_clamp_parallel_windows_caps_to_hardware_capacity(monkeypatch):
+    monkeypatch.setattr("cumuli_bridge.train.free_bytes", lambda device: (0, 32 * 1024**3))
+    effective, note = clamp_parallel_windows("cuda:0", 30.0, requested=4)
+    assert effective == 1  # floor(32/30) == 1: the reference card fits exactly one window
+    assert "capped" in note
+
+    effective, note = clamp_parallel_windows("cuda:0", 12.0, requested=4)
+    assert effective == 2  # floor(32/12) == 2
+    assert "capped" in note
+
+    effective, note = clamp_parallel_windows("cuda:0", 12.0, requested=2)
+    assert effective == 2  # requested already fits; not clamped
+    assert "capped" not in note
+
+
+def test_clamp_parallel_windows_does_not_clamp_when_the_floor_is_disabled(monkeypatch):
+    monkeypatch.setattr("cumuli_bridge.train.free_bytes", lambda device: (0, 32 * 1024**3))
+    effective, note = clamp_parallel_windows("cuda:0", 0.0, requested=8)
+    assert effective == 8
+    assert "disabled" in note
+
+
+def test_clamp_parallel_windows_does_not_clamp_when_memory_is_unknown(monkeypatch):
+    monkeypatch.setattr("cumuli_bridge.train.free_bytes", lambda device: (0, 0))
+    effective, note = clamp_parallel_windows("cuda:0", 30.0, requested=3)
+    assert effective == 3
+    assert "could not query" in note
