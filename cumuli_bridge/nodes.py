@@ -318,6 +318,15 @@ class CumuliGenerateRing(IO.ComfyNode):
                                          "settings were measured against. Part of the ring "
                                          "fingerprint, so switching regenerates.",
                                  advanced=True),
+                # Also appended last, for the same reason as enable_turbo above.
+                IO.String.Input("motion_source", default="", optional=True,
+                                tooltip="A directory holding motion.safetensors + motion.json "
+                                        "(fit_rig_motion.py's output) to condition this run on, "
+                                        "in place of running GVHMR on 'video'. For the rig-gap-fill "
+                                        "pipeline: every generation run for one capture shares the "
+                                        "same fit, since it comes from the real rig's own pose, not "
+                                        "from any one camera's footage. Empty runs GVHMR as normal.",
+                                advanced=True),
             ],
             outputs=[
                 Ring.Output(display_name="ring"),
@@ -348,6 +357,7 @@ class CumuliGenerateRing(IO.ComfyNode):
         min_free_vram_gb=-1.0,
         dry_run=False,
         enable_turbo=True,
+        motion_source="",
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         try:
@@ -369,6 +379,7 @@ class CumuliGenerateRing(IO.ComfyNode):
                 seed=seed,
                 device=device,
                 enable_turbo=enable_turbo,
+                motion_source=(motion_source or "").strip() or None,
             )
             lora_note = None
             if model is not None and getattr(model, "patches", None):
@@ -392,6 +403,7 @@ class CumuliGenerateRing(IO.ComfyNode):
                 request = dataclasses.replace(request, prompt=prompt.strip())
             requirements = runner.check_video(settings, request)
             result_dir = settings.result_dir(request.run_name)
+            motion_injected = runner.inject_motion(settings, request)
             fingerprint, motion_key = runner.ring_fingerprint(request)
             previous_stamp = runner.read_stamp(result_dir)
             decision = runner.prepare_artifact_dir(result_dir, fingerprint)
@@ -413,6 +425,8 @@ class CumuliGenerateRing(IO.ComfyNode):
             f"({settings.motion_dir(request.run_name)})",
             "command: " + " ".join(argv),
         ]
+        if motion_injected:
+            header.append(f"motion: injected from {request.motion_source} (GVHMR skipped)")
         if lora_note:
             header.append(lora_note)
         if request.prompt:

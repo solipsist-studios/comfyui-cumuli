@@ -260,6 +260,12 @@ class RunRequest:
     seed: int = 42
     device: str = "cuda:0"
     enable_turbo: bool = True
+    #: A pre-fitted GVHMR-shaped motion directory (motion.safetensors +
+    #: motion.json) to use in place of running GVHMR on video_path. See
+    #: inject_motion(): rig-gap-fill runs condition every generation on one
+    #: motion fit_rig_motion.py produced from the real rig's own pose, not
+    #: from this particular video.
+    motion_source: Path | None = None
 
     @property
     def run_name(self) -> str:
@@ -302,6 +308,7 @@ def build_request(
     seed: int,
     device: str,
     enable_turbo: bool = True,
+    motion_source: str | Path | None = None,
 ) -> RunRequest:
     """Validate every knob and produce a :class:`RunRequest`."""
 
@@ -349,6 +356,8 @@ def build_request(
         seed=int(seed),
         device=str(device),
         enable_turbo=bool(enable_turbo),
+        motion_source=Path(os.path.abspath(os.path.expanduser(str(motion_source))))
+        if motion_source else None,
     )
 
 
@@ -816,6 +825,57 @@ def clear_stale_motion(settings: BridgeSettings, request: RunRequest, motion_key
     shutil.rmtree(motion_dir)
     return True
 
+
+def inject_motion(settings: BridgeSettings, request: RunRequest) -> bool:
+    """Seed request.run_name's motion cache from request.motion_source
+    instead of leaving it to run GVHMR, and pre-seed the ring's stamp so
+    ``clear_stale_motion`` does not immediately delete what was just copied
+    in. Returns False (does nothing) when ``request.motion_source`` is unset.
+
+    WHY THE STAMP, NOT JUST THE FILES
+    ----------------------------------
+    ``clear_stale_motion`` only trusts an injected motion when it can prove
+    the motion still matches the CURRENT request. Its two ways of proving
+    that are: (1) a previous ring-generation stamp in ``result_dir`` whose
+    ``motion_key`` matches, or (2) ``motion.json``'s own
+    ``source_size_bytes``/``source_mtime_ns`` matching ``video_path``'s
+    current stat(). Path (2) does not apply here: a rig-gap-fill run's
+    injected motion was fit from the REAL RIG's triangulated pose, not from
+    this particular anchor camera's video, so its recorded source identity
+    (inherited from whatever reference GVHMR run seeded the fit) will not
+    match this request's video_path. Path (1) is therefore the only way in
+    -- this function computes the SAME fingerprint/motion_key
+    ``CumuliGenerateRing.execute()`` will compute for this exact request
+    (``ring_fingerprint``) and writes it into ``result_dir`` ahead of time,
+    so the stamp comparison passes and the injected motion survives.
+
+    This does not fabricate a cached RESULT: ``execute()``'s cache
+    short-circuit additionally requires ``result_dir/metadata.json`` to
+    exist, which a freshly-seeded stamp never has, so generation still runs
+    for real -- only the motion solve is skipped.
+    """
+
+    if request.motion_source is None:
+        return False
+    source = Path(request.motion_source)
+    safetensors = source / "motion.safetensors"
+    metadata = source / "motion.json"
+    if not safetensors.is_file() or not metadata.is_file():
+        raise ValidationError(
+            f"motion_source {source} needs both motion.safetensors and motion.json "
+            "(the output of fit_rig_motion.py)."
+        )
+
+    motion_dir = settings.motion_dir(request.run_name)
+    motion_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(safetensors, motion_dir / "motion.safetensors")
+    shutil.copy2(metadata, motion_dir / "motion.json")
+
+    fingerprint, motion_key = ring_fingerprint(request)
+    result_dir = settings.result_dir(request.run_name)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    write_stamp(result_dir, fingerprint, motion_key=motion_key)
+    return True
 
 
 def discover_flipbooks(settings: BridgeSettings) -> list[str]:

@@ -317,6 +317,102 @@ def test_ring_fingerprint_tracks_seed_but_motion_key_does_not(tmp_path):
     assert ma == mb, "seed must not invalidate the motion cache"
 
 
+def _write_motion_source(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "motion.safetensors").write_bytes(b"fake-tensors")
+    (root / "motion.json").write_text(json.dumps({"source_frame_indices": [0, 1, 2]}))
+    return root
+
+
+def test_inject_motion_does_nothing_without_a_motion_source(settings, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    request = known_good_request(video)
+    assert runner.inject_motion(settings, request) is False
+    assert not settings.motion_dir(request.run_name).exists()
+
+
+def test_inject_motion_copies_the_motion_files(settings, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    source = _write_motion_source(tmp_path / "fit_out")
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
+        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        target_fps="auto", seed=42, device="cuda:0", motion_source=source)
+    assert runner.inject_motion(settings, request) is True
+    motion_dir = settings.motion_dir(request.run_name)
+    assert (motion_dir / "motion.safetensors").read_bytes() == b"fake-tensors"
+    assert json.loads((motion_dir / "motion.json").read_text())["source_frame_indices"] == [0, 1, 2]
+
+
+def test_inject_motion_requires_both_files(settings, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    (incomplete / "motion.safetensors").write_bytes(b"x")  # motion.json missing
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
+        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        target_fps="auto", seed=42, device="cuda:0", motion_source=incomplete)
+    with pytest.raises(runner.ValidationError, match="motion.safetensors and motion.json"):
+        runner.inject_motion(settings, request)
+
+
+def test_injected_motion_survives_clear_stale_motion(settings, tmp_path):
+    """The whole point: inject_motion pre-seeds result_dir's stamp so that,
+    when CumuliGenerateRing.execute()'s own sequence runs right after,
+    clear_stale_motion sees a matching motion_key and does NOT wipe what was
+    just injected -- the exact hazard this function exists to avoid."""
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    source = _write_motion_source(tmp_path / "fit_out")
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
+        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        target_fps="auto", seed=42, device="cuda:0", motion_source=source)
+
+    assert runner.inject_motion(settings, request) is True
+
+    # Reproduce CumuliGenerateRing.execute()'s exact sequence after inject_motion.
+    result_dir = settings.result_dir(request.run_name)
+    fingerprint, motion_key = runner.ring_fingerprint(request)
+    previous_stamp = runner.read_stamp(result_dir)
+    cleared = runner.clear_stale_motion(settings, request, motion_key, previous_stamp)
+
+    assert cleared is False
+    motion_dir = settings.motion_dir(request.run_name)
+    assert (motion_dir / "motion.safetensors").is_file()
+    assert runner.prepare_artifact_dir(result_dir, fingerprint) == "reuse"
+    # But NOT a fake cache hit: no metadata.json means real generation still runs.
+    assert not (result_dir / "metadata.json").exists()
+
+
+def test_injected_motion_is_dropped_if_the_request_changes_before_generation(settings, tmp_path):
+    """If something about the request changes between injection and the
+    node's own fingerprint computation (shouldn't happen in practice, since
+    both run in the same execute() call, but the mechanism should fail safe
+    if it ever did), clear_stale_motion must still protect a real, different
+    motion cache from being silently reused under the new fingerprint."""
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    source = _write_motion_source(tmp_path / "fit_out")
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
+        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        target_fps="auto", seed=42, device="cuda:0", motion_source=source)
+    runner.inject_motion(settings, request)
+
+    import dataclasses
+    changed = dataclasses.replace(request, start_time=5.0)  # changes the motion_key
+    result_dir = settings.result_dir(changed.run_name)
+    _, motion_key = runner.ring_fingerprint(changed)
+    previous_stamp = runner.read_stamp(result_dir)
+    cleared = runner.clear_stale_motion(settings, changed, motion_key, previous_stamp)
+    assert cleared is True
+
+
 def test_run_name_symlinks_the_source_so_the_motion_cache_key_changes(settings, tmp_path):
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"data")
