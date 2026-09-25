@@ -174,7 +174,7 @@
       "properties": {
         "Node name for S&R": "CumuliRingMasks",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.0.2",
         "ue_properties": {
           "widget_ue_connectable": {},
           "version": "7.8",
@@ -270,7 +270,7 @@
       "properties": {
         "Node name for S&R": "CumuliPreviewSogst",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.0.2",
         "ue_properties": {
           "widget_ue_connectable": {
             "path": true
@@ -583,7 +583,7 @@
       "properties": {
         "Node name for S&R": "CumuliRingContactSheet",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.0.2",
         "ue_properties": {
           "widget_ue_connectable": {},
           "version": "7.8",

@@ -292,8 +292,8 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
 #: without dragging the others. ``--ref`` overrides all three at once.
 CHECKOUTS = {
     "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git", "v0.0.1"),
-    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.1"),
-    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.1"),
+    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
+    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
 }
 
 CONFIG_FILE = PACKAGE_ROOT / "config.json"
