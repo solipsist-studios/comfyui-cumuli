@@ -33,7 +33,7 @@ from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, InputImpl, IO
 
 from . import runner
-from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset
+from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset, slice_dataset_window
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
 from .masks import MaskError, mask_coverage, matte_flipbook
 from .process import SubprocessCancelled, SubprocessError
@@ -41,10 +41,22 @@ from .ring import RingError, RingResult
 from . import sfm
 from .settings import SettingsError, load_settings
 from .sogst import SogstError, frame_count, frame_time, load_interchange_ply, to_splat
-from .train import BakeOptions, TrainOptions, TrainingError, bake, train, unpack_sogst_to_ply
+from .train import (
+    BakeOptions,
+    MergeOptions,
+    TrainOptions,
+    TrainingError,
+    WindowTrainSpec,
+    bake,
+    merge_windows,
+    train,
+    train_windows,
+    unpack_sogst_to_ply,
+)
 from .validate import ValidationError, validate_dataset
 from .videoio import read_frames
 from .vram import InsufficientVRAM, require_free_vram
+from .windowing import WindowingError, even_windows
 
 LOGGER = logging.getLogger("comfyui-cumuli")
 
@@ -1219,6 +1231,13 @@ class CumuliBuildDataset(IO.ComfyNode):
                              tooltip="How many camera masks a hull point must fall inside. Lower it if the "
                                      "hull collapses on an inconsistent ring.", advanced=True),
                 IO.Int.Input("jobs", default=8, min=1, max=32, step=1, advanced=True),
+                IO.Color.Input("background", default="#000000",
+                               tooltip="Pick the colour of wherever the .sogst will be embedded. Held-out "
+                                       "eval frames composite onto it, and Train 4DGS's background (which "
+                                       "reads it back from here automatically) optimises against it too. "
+                                       "OMG4 itself only supports pure black or white, so this snaps to "
+                                       "whichever is closer by luminance -- the picker is for matching your "
+                                       "destination by eye, not for a literal colour reaching the trainer."),
                 IO.Boolean.Input("validate", default=True,
                                  tooltip="Check the finished dataset against the trainer's contract."),
             ],
@@ -1242,8 +1261,10 @@ class CumuliBuildDataset(IO.ComfyNode):
         hull_points=300000,
         hull_min_views=9,
         jobs=8,
+        background="#000000",
         validate=True,
     ) -> IO.NodeOutput:
+        resolved_background = _snap_background_hex(background)
         if flipbook is None:
             raise RuntimeError("Cumuli: no staged flipbook connected. Add 'Stage Ring' and 'Ring Masks' first.")
         node_id = cls.hidden.unique_id
@@ -1280,6 +1301,7 @@ class CumuliBuildDataset(IO.ComfyNode):
             "holdout_cameras": holdout_cameras or "",
             "hull_points": int(hull_points),
             "hull_min_views": int(hull_min_views),
+            "background": resolved_background,
             "validate": bool(validate),
         })
         try:
@@ -1308,6 +1330,7 @@ class CumuliBuildDataset(IO.ComfyNode):
             hull_points=int(hull_points),
             hull_min_views=int(hull_min_views),
             jobs=int(jobs),
+            background=resolved_background,
         )
         try:
             summary = build_dataset(flipbook, options, on_progress=report, should_cancel=_cancelled)
@@ -1329,6 +1352,8 @@ class CumuliBuildDataset(IO.ComfyNode):
             "camera_labels": list(flipbook.labels),
             "fps": options.fps,
             "downscale": options.downscale,
+            "background": options.background,
+            "background_picked": background,
             "world": (
                 "4DAnyone canonical human world: normalized scale (the subject is roughly 1.2 units tall, "
                 "not metres) and yawed so the subject faces +Z. Self-consistent for standalone training; "
@@ -1341,15 +1366,18 @@ class CumuliBuildDataset(IO.ComfyNode):
         (summary.out_dir / "cumuli_export.json").write_text(json.dumps(provenance, indent=1))
 
         bar.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
-        report_text = _dataset_report(summary, options, checked)
+        report_text = _dataset_report(summary, options, checked, picked_hex=background)
         runner.write_stamp(summary.out_dir, ds_fingerprint, report=report_text)
         _send_text(node_id, f"{summary.init_points:,} init points")
         handle = DatasetHandle(root=summary.out_dir, fingerprint=ds_fingerprint, source="built")
         return IO.NodeOutput(str(summary.out_dir), report_text, handle)
 
 
-def _dataset_report(summary, options, checked) -> str:
+def _dataset_report(summary, options, checked, picked_hex: str = "") -> str:
     duration = summary.duration_seconds
+    background_line = f"background: {options.background}"
+    if picked_hex:
+        background_line = f"background: {picked_hex} -> {options.background} (nearest of black/white)"
     lines = [
         f"dataset_dir: {summary.out_dir}",
         f"train cameras: {len(summary.train_cameras)} ({', '.join(summary.train_cameras)})",
@@ -1357,6 +1385,7 @@ def _dataset_report(summary, options, checked) -> str:
         f"frames: {summary.num_frames} @ {options.fps:.3f} fps ({duration:.3f}s)",
         f"images: {summary.images_written} RGBA, downscale {options.downscale}",
         f"init cloud: {summary.init_points:,} points with per-point time",
+        background_line,
     ]
     if checked:
         lines.append(f"validated: {checked['train_entries']} train entries, probe image is RGBA")
@@ -1497,6 +1526,33 @@ class CumuliTrain4DGS(IO.ComfyNode):
                              tooltip="Initial temporal sigma is sqrt(duration/div). 0 keeps the "
                                      "trainer's own default of 5, which smears short clips.",
                              advanced=True),
+                IO.Combo.Input("background", options=["auto", "black", "white"], default="auto",
+                               tooltip="Photometric background OMG4 optimises against. 'auto' reads back "
+                                       "whatever Build 4DGS Dataset composited its held-out eval GT onto, "
+                                       "so this never has to be set twice; override only for a Load 4DGS "
+                                       "Dataset input with no provenance, or a deliberate mismatch test. "
+                                       "Binary only -- OMG4's own background is [1,1,1] or [0,0,0] and "
+                                       "nothing else."),
+                IO.Float.Input("lambda_opa_mask", default=0.005, min=0.0, max=0.1, step=0.001,
+                               tooltip="Charges rendered opacity wherever the silhouette says background, "
+                                       "regardless of colour, so it prunes floaters of any shade -- unlike "
+                                       "background matching, which only changes what colour they are. "
+                                       "Measured +2.91 dB held-out PSNR and floater coverage down from "
+                                       "39.9% to near zero. 0 disables (pre-existing behaviour); 0.005 is "
+                                       "the measured production value."),
+                IO.Int.Input("max_window_frames", default=31, min=8, max=100000, step=1,
+                             tooltip="Clips longer than this train as several short, independently "
+                                     "trained windows stitched together instead of one wide fit -- "
+                                     "measured LPIPS 0.00778 vs 0.00899 on a 121-frame clip split at "
+                                     "this default (31 -> windows of 31/30/30/30). A clip with this many "
+                                     "frames or fewer trains exactly as before, as one model."),
+                IO.Int.Input("max_parallel_windows", default=1, min=1, max=16, step=1, advanced=True,
+                             tooltip="Upper bound on windows trained at once. The reference single-GPU "
+                                     "workstation already uses the whole card for one window "
+                                     "(min_free_vram_gb), so this clamps itself down to 1 there regardless "
+                                     "of what you set here -- it only raises real concurrency on multiple "
+                                     "GPUs, or a min_free_vram_gb/num_pts small enough to leave headroom "
+                                     "for more than one window at once."),
                 IO.Float.Input("min_free_vram_gb", default=-1.0, min=-1.0, max=200.0, step=0.5,
                                advanced=True),
                 IO.Boolean.Input("dry_run", default=False,
@@ -1507,6 +1563,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 IO.String.Output(display_name="checkpoint"),
                 IO.Float.Output(display_name="duration_seconds"),
                 IO.String.Output(display_name="report"),
+                IO.String.Output(display_name="window_manifest"),
             ],
             hidden=[IO.Hidden.unique_id],
         )
@@ -1525,6 +1582,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
         densify_until_iter=25000,
         densify_until_num_points=3000000,
         t_init_div=100,
+        background="auto",
+        lambda_opa_mask=0.005,
+        max_window_frames=31,
+        max_parallel_windows=1,
         min_free_vram_gb=-1.0,
         dry_run=False,
     ) -> IO.NodeOutput:
@@ -1542,100 +1603,262 @@ class CumuliTrain4DGS(IO.ComfyNode):
         duration = float(duration_seconds) or duration
         rate = float(fps) or dataset_fps
 
+        resolved_background = _dataset_background(dataset) if background == "auto" else background
+        white_bg = resolved_background == "white"
+
         try:
             settings = load_settings()
             settings.validate_trainer()
         except SettingsError as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
 
-        options = TrainOptions(
-            out_dir=Path((out_dir or "").strip()).expanduser() if out_dir.strip() else dataset.parent,
-            dataset_dir=dataset,
-            duration_seconds=duration,
-            fps=rate,
-            iterations=int(iterations),
-            num_pts=int(num_pts),
-            batch_size=int(batch_size),
-            densify_until_iter=int(densify_until_iter),
-            densify_until_num_points=int(densify_until_num_points),
-            t_init_div=int(t_init_div),
-            sh_degree=int(sh_degree),
-        )
-        train_fingerprint = runner.compute_fingerprint({
-            "dataset": handle.fingerprint
-            if handle.fingerprint
-            else runner.file_identity(dataset / "transforms_train.json"),
-            "duration": duration, "fps": rate,
-            "iterations": int(iterations), "num_pts": int(num_pts),
-            "batch_size": int(batch_size), "sh_degree": int(sh_degree),
-            "densify_until_iter": int(densify_until_iter),
-            "densify_until_num_points": int(densify_until_num_points),
-            "t_init_div": int(t_init_div),
-        })
+        base_out_dir = Path((out_dir or "").strip()).expanduser() if out_dir.strip() else dataset.parent
+        try:
+            windows = even_windows(frames, int(max_window_frames))
+        except WindowingError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+
+        if len(windows) == 1:
+            options = TrainOptions(
+                out_dir=base_out_dir,
+                dataset_dir=dataset,
+                duration_seconds=duration,
+                fps=rate,
+                iterations=int(iterations),
+                num_pts=int(num_pts),
+                batch_size=int(batch_size),
+                densify_until_iter=int(densify_until_iter),
+                densify_until_num_points=int(densify_until_num_points),
+                t_init_div=int(t_init_div),
+                sh_degree=int(sh_degree),
+                white_background=white_bg,
+                lambda_opa_mask=float(lambda_opa_mask),
+            )
+            train_fingerprint = runner.compute_fingerprint({
+                "dataset": handle.fingerprint
+                if handle.fingerprint
+                else runner.file_identity(dataset / "transforms_train.json"),
+                "duration": duration, "fps": rate,
+                "iterations": int(iterations), "num_pts": int(num_pts),
+                "batch_size": int(batch_size), "sh_degree": int(sh_degree),
+                "densify_until_iter": int(densify_until_iter),
+                "densify_until_num_points": int(densify_until_num_points),
+                "t_init_div": int(t_init_div), "white_background": white_bg,
+                "lambda_opa_mask": float(lambda_opa_mask),
+            })
+            header = [
+                f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {rate:.3f} fps)",
+                f"model_dir: {options.model_dir}",
+                f"iterations: {options.iterations}  num_pts: {options.num_pts}  "
+                f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}  "
+                f"background: {resolved_background}  lambda_opa_mask: {options.lambda_opa_mask}",
+                f"checkpoint: {options.checkpoint}",
+            ]
+
+            if dry_run:
+                try:
+                    from .train import build_train_argv, write_config
+
+                    config = write_config(settings, options)
+                    argv = build_train_argv(settings, options, config)
+                except TrainingError as exc:
+                    raise RuntimeError(f"Cumuli: {exc}") from None
+                return IO.NodeOutput(str(options.checkpoint), duration,
+                                     "DRY RUN\n" + "\n".join(header + ["command: " + " ".join(argv)]), "")
+
+            try:
+                decision = runner.prepare_artifact_dir(options.model_dir, train_fingerprint)
+            except runner.ValidationError as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+            if decision == "reuse" and options.checkpoint.is_file():
+                header.append("cached checkpoint (inputs unchanged)")
+                _send_text(node_id, "cached checkpoint")
+                return IO.NodeOutput(str(options.checkpoint), duration, "\n".join(header), "")
+            if decision == "reuse":
+                # Our stamp, no checkpoint: a crashed run. Rebuilding our own
+                # incomplete artifact is safe; foreign dirs still error above.
+                shutil.rmtree(options.model_dir, ignore_errors=True)
+                header.append("previous training crashed before finishing; retraining")
+
+            minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+            try:
+                free_gb, total_gb = require_free_vram(settings.device, minimum)
+            except InsufficientVRAM as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+            header.append(f"vram: {free_gb:.1f} GB free of {total_gb:.1f} GB")
+
+            options.model_dir.mkdir(parents=True, exist_ok=True)
+            runner.write_stamp(options.model_dir, train_fingerprint)  # pre-stamp: ours even if we crash
+
+            progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
+
+            def on_progress(state) -> None:
+                progress.update_absolute(int(state.fraction * _PROGRESS_STEPS), _PROGRESS_STEPS)
+                _send_text(node_id, f"{state.fraction * 100:.0f}% {state.message}")
+
+            try:
+                outcome = train(settings, options, on_progress=on_progress, should_cancel=_cancelled)
+            except SubprocessCancelled:
+                raise InterruptProcessingException() from None
+            except (TrainingError, SubprocessError) as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+
+            progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
+            elapsed = outcome.result.elapsed if outcome.result else 0.0
+            header.append(f"elapsed: {elapsed / 60.0:.1f} min")
+            if outcome.final_psnr is not None:
+                header.append(f"final training PSNR: {outcome.final_psnr:.2f} dB")
+            runner.write_stamp(options.model_dir, train_fingerprint)
+            _send_text(node_id, "training complete")
+            return IO.NodeOutput(str(outcome.checkpoint), duration, "\n".join(header), "")
+
+        # -- windowed: several short models trained and later stitched -------
+        # Window boundaries and every dataset slice always use the dataset's
+        # OWN native fps, never a caller override: slice_dataset_window
+        # recovers each frame's index from the time values build_dataset
+        # actually wrote (at dataset_fps), and a mismatched fps here would
+        # silently misalign which frames land in which window.
+        window_out_dirs = [base_out_dir / "windows" / f"win_{w.index:02d}" for w in windows]
         header = [
-            f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {rate:.3f} fps)",
-            f"model_dir: {options.model_dir}",
-            f"iterations: {options.iterations}  num_pts: {options.num_pts}  "
-            f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}",
-            f"checkpoint: {options.checkpoint}",
+            f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {dataset_fps:.3f} fps)",
+            f"windowed: {len(windows)} windows of "
+            f"{[w.frame_count for w in windows]} frames (max_window_frames={int(max_window_frames)})",
+            f"background: {resolved_background}  lambda_opa_mask: {float(lambda_opa_mask)}",
         ]
 
         if dry_run:
+            preview = TrainOptions(
+                out_dir=window_out_dirs[0],
+                dataset_dir=window_out_dirs[0] / "dataset",
+                duration_seconds=(windows[0].frame_count - 1) / dataset_fps,
+                fps=dataset_fps,
+                iterations=int(iterations), num_pts=int(num_pts), batch_size=int(batch_size),
+                densify_until_iter=int(densify_until_iter),
+                densify_until_num_points=int(densify_until_num_points),
+                t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
+                lambda_opa_mask=float(lambda_opa_mask),
+            )
             try:
                 from .train import build_train_argv, write_config
 
-                config = write_config(settings, options)
-                argv = build_train_argv(settings, options, config)
+                config = write_config(settings, preview)
+                argv = build_train_argv(settings, preview, config)
             except TrainingError as exc:
                 raise RuntimeError(f"Cumuli: {exc}") from None
-            return IO.NodeOutput(str(options.checkpoint), duration,
-                                 "DRY RUN\n" + "\n".join(header + ["command: " + " ".join(argv)]))
+            header.append(
+                f"command (window 0 of {len(windows)}, illustrative -- every window uses the same "
+                f"knobs with its own dataset slice/out_dir/duration_seconds): " + " ".join(argv)
+            )
+            return IO.NodeOutput(str(preview.checkpoint), duration, "DRY RUN\n" + "\n".join(header), "")
 
-        try:
-            decision = runner.prepare_artifact_dir(options.model_dir, train_fingerprint)
-        except runner.ValidationError as exc:
-            raise RuntimeError(f"Cumuli: {exc}") from None
-        if decision == "reuse" and options.checkpoint.is_file():
-            header.append("cached checkpoint (inputs unchanged)")
-            _send_text(node_id, "cached checkpoint")
-            return IO.NodeOutput(str(options.checkpoint), duration, "\n".join(header))
-        if decision == "reuse":
-            # Our stamp, no checkpoint: a crashed run. Rebuilding our own
-            # incomplete artifact is safe; foreign dirs still error above.
-            shutil.rmtree(options.model_dir, ignore_errors=True)
-            header.append("previous training crashed before finishing; retraining")
+        dataset_identity = (
+            handle.fingerprint if handle.fingerprint else runner.file_identity(dataset / "transforms_train.json")
+        )
+        specs: list[WindowTrainSpec] = []
+        fingerprints: dict[int, str] = {}
+        outcomes: dict[int, dict] = {}
+        for window, window_out_dir in zip(windows, window_out_dirs):
+            window_dataset_dir = window_out_dir / "dataset"
+            slice_dataset_window(dataset, window_dataset_dir, window.frame_start, window.frame_count, dataset_fps)
+            window_duration = (window.frame_count - 1) / dataset_fps
+            window_options = TrainOptions(
+                out_dir=window_out_dir,
+                dataset_dir=window_dataset_dir,
+                duration_seconds=window_duration,
+                fps=dataset_fps,
+                iterations=int(iterations), num_pts=int(num_pts), batch_size=int(batch_size),
+                densify_until_iter=int(densify_until_iter),
+                densify_until_num_points=int(densify_until_num_points),
+                t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
+                lambda_opa_mask=float(lambda_opa_mask),
+            )
+            window_fingerprint = runner.compute_fingerprint({
+                "dataset": dataset_identity,
+                "window_index": window.index, "frame_start": window.frame_start,
+                "frame_count": window.frame_count, "dataset_fps": dataset_fps,
+                "iterations": int(iterations), "num_pts": int(num_pts),
+                "batch_size": int(batch_size), "sh_degree": int(sh_degree),
+                "densify_until_iter": int(densify_until_iter),
+                "densify_until_num_points": int(densify_until_num_points),
+                "t_init_div": int(t_init_div), "white_background": white_bg,
+                "lambda_opa_mask": float(lambda_opa_mask),
+            })
+            try:
+                decision = runner.prepare_artifact_dir(window_options.model_dir, window_fingerprint)
+            except runner.ValidationError as exc:
+                raise RuntimeError(f"Cumuli: window {window.index}: {exc}") from None
+            offset_seconds = window.offset_seconds(dataset_fps)
+            if decision == "reuse" and window_options.checkpoint.is_file():
+                outcomes[window.index] = {
+                    "checkpoint": window_options.checkpoint, "duration_seconds": window_duration,
+                    "fps": dataset_fps, "offset_seconds": offset_seconds,
+                    "dataset_dir": window_dataset_dir, "final_psnr": None, "cached": True,
+                }
+                continue
+            if decision == "reuse":
+                shutil.rmtree(window_options.model_dir, ignore_errors=True)
+            window_options.model_dir.mkdir(parents=True, exist_ok=True)
+            runner.write_stamp(window_options.model_dir, window_fingerprint)  # ours even if we crash
+            fingerprints[window.index] = window_fingerprint
+            specs.append(WindowTrainSpec(
+                index=window.index, options=window_options, offset_seconds=offset_seconds,
+                dataset_dir=window_dataset_dir,
+            ))
 
-        minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
-        try:
-            free_gb, total_gb = require_free_vram(settings.device, minimum)
-        except InsufficientVRAM as exc:
-            raise RuntimeError(f"Cumuli: {exc}") from None
-        header.append(f"vram: {free_gb:.1f} GB free of {total_gb:.1f} GB")
+        if specs:
+            minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+            progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
+            fractions = {i: 1.0 for i in outcomes}
+            fractions.update({spec.index: 0.0 for spec in specs})
 
-        options.model_dir.mkdir(parents=True, exist_ok=True)
-        runner.write_stamp(options.model_dir, train_fingerprint)  # pre-stamp: ours even if we crash
+            def on_progress(index: int, state) -> None:
+                fractions[index] = state.fraction
+                progress.update_absolute(int(sum(fractions.values()) / len(fractions) * _PROGRESS_STEPS), _PROGRESS_STEPS)
+                _send_text(node_id, f"window {index + 1}/{len(windows)}: {state.fraction * 100:.0f}% {state.message}")
 
-        progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
+            try:
+                trained, concurrency_note = train_windows(
+                    settings, specs, min_free_vram_gb=minimum, max_parallel=int(max_parallel_windows),
+                    on_progress=on_progress, should_cancel=_cancelled,
+                )
+            except SubprocessCancelled:
+                raise InterruptProcessingException() from None
+            except (TrainingError, SubprocessError, InsufficientVRAM) as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+            header.append(f"concurrency: requested {int(max_parallel_windows)}, {concurrency_note}")
+            for spec, result in zip(specs, trained):
+                runner.write_stamp(spec.options.model_dir, fingerprints[spec.index])
+                outcomes[result.index] = {
+                    "checkpoint": result.checkpoint, "duration_seconds": result.duration_seconds,
+                    "fps": result.fps, "offset_seconds": result.offset_seconds,
+                    "dataset_dir": result.dataset_dir, "final_psnr": result.final_psnr, "cached": False,
+                }
+            progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
+        else:
+            header.append("all windows cached (inputs unchanged)")
 
-        def on_progress(state) -> None:
-            progress.update_absolute(int(state.fraction * _PROGRESS_STEPS), _PROGRESS_STEPS)
-            _send_text(node_id, f"{state.fraction * 100:.0f}% {state.message}")
-
-        try:
-            outcome = train(settings, options, on_progress=on_progress, should_cancel=_cancelled)
-        except SubprocessCancelled:
-            raise InterruptProcessingException() from None
-        except (TrainingError, SubprocessError) as exc:
-            raise RuntimeError(f"Cumuli: {exc}") from None
-
-        progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
-        elapsed = outcome.result.elapsed if outcome.result else 0.0
-        header.append(f"elapsed: {elapsed / 60.0:.1f} min")
-        if outcome.final_psnr is not None:
-            header.append(f"final training PSNR: {outcome.final_psnr:.2f} dB")
-        runner.write_stamp(options.model_dir, train_fingerprint)
-        _send_text(node_id, "training complete")
-        return IO.NodeOutput(str(outcome.checkpoint), duration, "\n".join(header))
+        manifest = [
+            {
+                "index": i,
+                "checkpoint": str(outcomes[i]["checkpoint"]),
+                "duration_seconds": outcomes[i]["duration_seconds"],
+                "fps": outcomes[i]["fps"],
+                "offset_seconds": outcomes[i]["offset_seconds"],
+                "dataset_dir": str(outcomes[i]["dataset_dir"]),
+            }
+            for i in range(len(windows))
+        ]
+        for i, entry in enumerate(manifest):
+            status = "cached" if outcomes[i]["cached"] else "trained"
+            psnr = outcomes[i]["final_psnr"]
+            psnr_text = f", PSNR {psnr:.2f} dB" if psnr is not None else ""
+            header.append(
+                f"  window {i}: frames [{windows[i].frame_start}, {windows[i].frame_end}) "
+                f"offset {entry['offset_seconds']:.3f}s ({status}{psnr_text})"
+            )
+        _send_text(node_id, f"{len(windows)} windows complete")
+        first = manifest[0]
+        return IO.NodeOutput(first["checkpoint"], first["duration_seconds"], "\n".join(header), json.dumps(manifest))
 
 
 class CumuliBakeSogst(IO.ComfyNode):
@@ -1665,7 +1888,10 @@ class CumuliBakeSogst(IO.ComfyNode):
                 IO.String.Input("mask_filter_root", default="",
                                 tooltip="Dataset directory. Enables the lifetime mask-consistency "
                                         "filter, which drops silhouette-escaping splats. Slow but "
-                                        "worth it; empty disables it.", optional=True),
+                                        "worth it; empty disables it. With window_manifest set, any "
+                                        "non-empty value enables it using each window's OWN dataset "
+                                        "directory from the manifest instead of this path.",
+                                optional=True),
                 IO.Float.Input("sh_clamp", default=3.0, min=0.0, max=10.0, step=0.1,
                                tooltip="Attenuate higher SH bands above this bare DC. 1.5 is the "
                                        "upstream default and is too aggressive for explicit-SH "
@@ -1680,6 +1906,19 @@ class CumuliBakeSogst(IO.ComfyNode):
                 IO.Boolean.Input("emit_ply", default=True,
                                  tooltip="Also write the 4D interchange PLY beside the .sogst. It comes "
                                          "from the same arrays, and the Preview node reads it."),
+                IO.String.Input("window_manifest", default="",
+                                tooltip="From Train 4DGS's window_manifest output, when that run was "
+                                        "windowed. Non-empty bakes every window and stitches them into "
+                                        "one archive instead of baking 'checkpoint' alone; 'checkpoint'/"
+                                        "'duration_seconds'/'fps' are then ignored.", optional=True,
+                                advanced=True),
+                IO.Combo.Input("merge_mode", options=["fade", "hard"], default="fade",
+                               tooltip="How adjacent windows blend at a seam (window_manifest only). "
+                                       "'fade' measured better than a hard cut on both PSNR and LPIPS."),
+                IO.Float.Input("merge_fade_seconds", default=0.35, min=0.0, max=5.0, step=0.01,
+                               tooltip="Fade-zone width at each seam (merge_mode=fade only). 0.35s "
+                                       "measured LPIPS-best; PSNR keeps improving out to 1.00s, which "
+                                       "is a wide fade blurring across the seam."),
             ],
             outputs=[
                 IO.String.Output(display_name="sogst_path"),
@@ -1702,16 +1941,11 @@ class CumuliBakeSogst(IO.ComfyNode):
         shn_count=65536,
         segment_duration=0.1,
         emit_ply=True,
+        window_manifest="",
+        merge_mode="fade",
+        merge_fade_seconds=0.35,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
-        source = Path((checkpoint or "").strip()).expanduser()
-        if not source.is_file():
-            raise RuntimeError(f"Cumuli: checkpoint not found: {source}")
-        if float(duration_seconds) <= 0:
-            raise RuntimeError(
-                "Cumuli: duration_seconds must match the clip length the model trained with; "
-                "wire it from the Train node's duration output."
-            )
         try:
             settings = load_settings()
         except SettingsError as exc:
@@ -1722,6 +1956,25 @@ class CumuliBakeSogst(IO.ComfyNode):
         )
         name = f"{filename}_{counter:05}_.sogst"
         target = Path(full_output_folder) / name
+
+        manifest_text = (window_manifest or "").strip()
+        if manifest_text:
+            written, ply, report = cls._bake_windowed(
+                node_id, settings, target, manifest_text, mask_filter_root, sh_clamp, filter_corrupted,
+                shn_count, segment_duration, emit_ply, merge_mode, merge_fade_seconds,
+            )
+            _send_text(node_id, f"{written.stat().st_size / (1024 * 1024):.1f} MB stitched sogst")
+            results = [{"filename": name, "subfolder": subfolder, "type": "output"}]
+            return IO.NodeOutput(str(written), ply, report, ui={"3d": results})
+
+        source = Path((checkpoint or "").strip()).expanduser()
+        if not source.is_file():
+            raise RuntimeError(f"Cumuli: checkpoint not found: {source}")
+        if float(duration_seconds) <= 0:
+            raise RuntimeError(
+                "Cumuli: duration_seconds must match the clip length the model trained with; "
+                "wire it from the Train node's duration output."
+            )
 
         options = BakeOptions(
             checkpoint=source,
@@ -1765,6 +2018,95 @@ class CumuliBakeSogst(IO.ComfyNode):
         if ply:
             report += f"\ninterchange ply: {ply}"
         return IO.NodeOutput(str(written), ply, report, ui={"3d": results})
+
+    @classmethod
+    def _bake_windowed(
+        cls, node_id, settings, target, manifest_text, mask_filter_root, sh_clamp, filter_corrupted,
+        shn_count, segment_duration, emit_ply, merge_mode, merge_fade_seconds,
+    ) -> tuple[Path, str, str]:
+        """Bake every window's checkpoint, then stitch them into ``target``."""
+
+        try:
+            entries = json.loads(manifest_text)
+        except ValueError as exc:
+            raise RuntimeError(f"Cumuli: window_manifest is not valid JSON: {exc}") from None
+        if not isinstance(entries, list) or len(entries) < 2:
+            raise RuntimeError("Cumuli: window_manifest must be a JSON list of at least two windows.")
+
+        windows_dir = target.parent / f"{target.stem}.windows"
+        windows_dir.mkdir(parents=True, exist_ok=True)
+        progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
+        total_steps = len(entries) + 1  # the last step is the merge itself
+        fractions = [0.0] * len(entries)
+        filter_enabled = bool(mask_filter_root.strip())
+
+        segments: list[tuple[Path, float]] = []
+        for i, entry in enumerate(entries):
+            index = int(entry.get("index", i))
+            window_checkpoint = Path(entry["checkpoint"]).expanduser()
+            if not window_checkpoint.is_file():
+                raise RuntimeError(f"Cumuli: window {index} checkpoint not found: {window_checkpoint}")
+            window_dataset = entry.get("dataset_dir") or ""
+            window_options = BakeOptions(
+                checkpoint=window_checkpoint,
+                output=windows_dir / f"win_{index:02d}.sogst",
+                duration_seconds=float(entry["duration_seconds"]),
+                fps=float(entry["fps"]),
+                mask_filter_root=Path(window_dataset).expanduser() if filter_enabled and window_dataset else None,
+                sh_clamp=float(sh_clamp),
+                filter_corrupted=bool(filter_corrupted),
+                shn_count=int(shn_count),
+                segment_duration=float(segment_duration),
+                # The interchange PLY represents the MERGED result, not one window.
+                emit_ply=None,
+            )
+
+            def on_progress(state, i=i, index=index) -> None:
+                fractions[i] = state.fraction
+                progress.update_absolute(int(sum(fractions) / total_steps * _PROGRESS_STEPS), _PROGRESS_STEPS)
+                _send_text(node_id, f"baking window {index} ({i + 1}/{len(entries)}): "
+                                    f"{state.fraction * 100:.0f}% {state.message}")
+
+            try:
+                written = bake(settings, window_options, on_progress=on_progress, should_cancel=_cancelled)
+            except SubprocessCancelled:
+                raise InterruptProcessingException() from None
+            except (TrainingError, SubprocessError) as exc:
+                raise RuntimeError(f"Cumuli: window {index} bake: {exc}") from None
+            segments.append((written, float(entry["offset_seconds"])))
+
+        _send_text(node_id, "merging windows")
+        merge_options = MergeOptions(
+            segments=segments, output=target, mode=merge_mode, fade_seconds=float(merge_fade_seconds)
+        )
+        try:
+            written = merge_windows(settings, merge_options, should_cancel=_cancelled)
+        except SubprocessCancelled:
+            raise InterruptProcessingException() from None
+        except TrainingError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
+
+        ply = ""
+        if emit_ply:
+            try:
+                ply = str(unpack_sogst_to_ply(settings, written, target.with_suffix(".ply")))
+            except TrainingError as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+
+        megabytes = written.stat().st_size / (1024 * 1024)
+        total_duration = max(float(e["offset_seconds"]) + float(e["duration_seconds"]) for e in entries)
+        report_lines = [
+            f"sogst: {written}",
+            f"size: {megabytes:.2f} MB",
+            f"windows: {len(entries)}, merge mode {merge_mode}"
+            + (f" (fade {merge_fade_seconds:g}s)" if merge_mode == "fade" else ""),
+            f"clip: 0.000 .. {total_duration:.3f}s ({megabytes / max(total_duration, 1e-6):.2f} MB/s)",
+            f"mask filter: {'enabled, per-window dataset' if filter_enabled else 'disabled'}",
+        ]
+        if ply:
+            report_lines.append(f"interchange ply: {ply}")
+        return written, ply, "\n".join(report_lines)
 
 
 class CumuliPreviewSogst(IO.ComfyNode):
@@ -1861,6 +2203,46 @@ def _dataset_timeline(dataset: Path) -> tuple[float, float, int]:
     duration = times[-1]
     step = times[1] - times[0]
     return duration, (1.0 / step if step > 0 else 24.0), len(times)
+
+
+def _snap_background_hex(value: str) -> str:
+    """The nearer of OMG4's only two backgrounds, by perceptual (Rec. 709)
+    luminance.
+
+    Build 4DGS Dataset's background input is a real colour picker, for
+    matching an embed destination by eye, but OMG4's own background is a
+    hard binary -- every place it appears in the trainer (train.py,
+    scene/__init__.py, dataset_readers.py, the renderer's bg_color) is
+    [1,1,1] or [0,0,0] and nothing else. This is where a picked colour
+    actually becomes one of the two values the trainer can be told to
+    optimise against.
+    """
+
+    text = (value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    try:
+        r, g, b = (int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        return "black"
+    luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+    return "white" if luminance >= 0.5 else "black"
+
+
+def _dataset_background(dataset: Path) -> str:
+    """The background Build 4DGS Dataset composited eval GT against, read back
+    from its own provenance so Train never has to be told twice. Missing for
+    a dataset built before this option existed, or one from Load 4DGS
+    Dataset with no provenance -- "black" matches both correctly."""
+
+    path = dataset / "cumuli_export.json"
+    if not path.is_file():
+        return "black"
+    try:
+        value = json.loads(path.read_text()).get("background", "black")
+    except ValueError:
+        return "black"
+    return value if value in ("black", "white") else "black"
 
 
 class CumuliExtension(ComfyExtension):

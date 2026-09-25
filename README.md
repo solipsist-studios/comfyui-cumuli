@@ -200,8 +200,8 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | **Ring Masks** | Mattes every staged frame. Takes a `BACKGROUND_REMOVAL` model, so ComfyUI's stock loader (or any substitute) drives it. Reports foreground coverage, because empty masks collapse the visual hull much later and confusingly. |
 | **Build 4DGS Dataset** | Carves a time-stamped visual-hull init cloud, bakes the mattes into RGBA alpha, writes `transforms_train/test.json` with per-camera intrinsics, and checks the result against the trainer's contract. Emits a typed `DATASET`. |
 | **Load 4DGS Dataset** | Validates and describes an existing dataset directory (D-NeRF layout) — the entry point for **finished external datasets** and real-capture exports. The widget is a discovery combo (work_root + config `dataset_roots`) with a refresh button. |
-| **Train 4DGS** | Trains the rotor 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. |
-| **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. |
+| **Train 4DGS** | Trains the rotor 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. Clips longer than `max_window_frames` train as several short windows instead (see [Windowed training](#windowed-training) below); the extra `window_manifest` output feeds that into Bake SOGST. |
+| **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. Given a `window_manifest`, bakes every window and stitches them into one archive instead. |
 | **Preview SOGST** | Evaluates the baked clip at one instant and outputs ComfyUI's native `SPLAT`. |
 
 ### Caching
@@ -368,6 +368,89 @@ factor of ½.
 - **`mask_filter_root`** on Bake SOGST enables the lifetime mask-consistency
   filter, which drops silhouette-escaping splats. It is junk removal, not a
   quality regulariser.
+- **`max_window_frames`** on Train 4DGS (default 31): see
+  [Windowed training](#windowed-training) below.
+- **`background`** on Build 4DGS Dataset and Train 4DGS: black or white only
+  (not arbitrary RGB — see the note below), and must match between the two,
+  which `background: auto` on Train 4DGS does for you.
+
+### Windowed training
+
+A long clip reconstructs measurably better as several short, independently
+trained models stitched together than as one wide fit. Measured on a 5 s/
+121-frame take from a 12-camera ring: a uniform split into four ~30-frame
+windows scored **LPIPS 0.00778** against **0.00899** for one model trained on
+the whole clip — a real gain for about 1.5x the storage (splat count scales
+with window count, not clip length). A further dynamic-program search over
+non-uniform boundaries reached 0.00774, a 0.5% improvement on top of that for
+a lot of extra machinery (a motion-signal extractor, refit regression
+coefficients, a rate-distortion search) — not worth it next to the plain
+uniform split, which is what this pack implements.
+
+**Train 4DGS**'s `max_window_frames` (default **31**) caps how long a single
+window is allowed to be. A clip with this many frames or fewer trains exactly
+as it always has, as one model. A longer clip splits into
+`ceil(total_frames / max_window_frames)` windows of as-even-as-possible
+length (121 frames at the default 31 → windows of 31/30/30/30, the exact
+split measured above) and trains each independently, with its own visual
+hull slice, checkpoint, and fingerprint-based caching — changing one
+window's dataset only retrains that window. The node's `checkpoint`/
+`duration_seconds` outputs describe the *first* window only, for a quick
+preview; wire its **`window_manifest`** output into **Bake SOGST**'s input of
+the same name to bake every window and stitch them into one `.sogst` (driving
+cumuli's own `merge_sogst_segments.py`, the same script the measurements
+above came from). Left empty, Bake SOGST behaves exactly as before.
+
+`max_parallel_windows` (advanced, default 1) bounds how many windows train at
+once. **On the reference single-GPU workstation this makes no difference**:
+one window already uses the whole card (the same 30 GB floor from the timing
+table above), so the node computes `floor(total_VRAM / min_free_vram_gb)`
+once up front and silently clamps concurrency to that — windows still train
+back-to-back, safely, regardless of what this is set to. It only raises real
+concurrency on multiple GPUs, or a `min_free_vram_gb`/`num_pts` combination
+small enough to leave headroom for more than one window's training at a time.
+
+**Background and floaters.** OMG4's own photometric background is a hard
+binary — every place it appears in the trainer (`train.py`,
+`scene/__init__.py`, `dataset_readers.py`, the renderer's `bg_color`) is
+`[1,1,1]` or `[0,0,0]` and nothing else, so this pack exposes exactly that,
+not an arbitrary colour. It matters because a splat at the alpha boundary
+gets fit to blend into whichever background it trained against, and reads as
+a fringe — or the "evil cloud" `bake_sogst.py`'s own `black_floater_mask`
+docstring names — against a *different*-coloured embed destination. Set
+`background` on **Build 4DGS Dataset** to whichever is closer to where the
+`.sogst` will be embedded; **Train 4DGS**'s `background: auto` (the default)
+reads that choice back automatically, so it never needs to be set twice, and
+held-out PSNR/LPIPS stays comparable (a mismatched eval background is one of
+the ways those metrics silently stop meaning what they used to, alongside
+resolution and held-out camera choice).
+
+**`lambda_opa_mask` (Train 4DGS, default `0.005`) is what actually removes
+floaters** — matching the background colour only changes what colour they
+are. Trained against black, a black splat sitting in empty space matches the
+photometric target exactly and costs the loss nothing; measured on a held-out
+capture, 39.9% of a trained model was dark, solid junk outside the subject.
+Retraining against white cut that to 11.1%, but the optimiser just substituted
+white floaters (detached coverage on the uncovered back arc rose from 0.94%
+to 3.53%) — **whatever colour the background is, that colour is free**.
+`lambda_opa_mask` charges for rendered opacity wherever the per-view
+silhouette mask says background, which is colour-independent, so it prunes
+floaters of any shade: measured **+2.91 dB held-out PSNR** on top of the RGBA
+dataset switch alone. `0` reproduces every run trained before this option
+existed; `0.005` is the measured production value (a metric-derived `0.002`
+left junk attached to the subject's own silhouette, invisible to automated
+floater metrics — they merge it into the subject's connected component — but
+plainly visible in a viewer).
+
+This needs a trainer checkout with the opacity-mask patch (declaring
+`lambda_opa_mask` in `arguments.OptimizationParams`, and threading the
+ground-truth silhouette through `utils/data_utils.py`'s dataloader path into
+`Camera.gt_alpha_mask` — upstream's own loss code already existed but was
+unreachable with `dataloader: True`, which every config here uses). Point
+`trainer_root` at a patched fork or apply that patch yourself; on an
+unpatched checkout, setting this above `0` raises `AssertionError:
+lambda_opa_mask` at config merge, a clear and immediate failure rather than a
+silent no-op.
 
 ## Command line
 
