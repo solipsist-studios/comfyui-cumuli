@@ -32,6 +32,7 @@ from comfy.model_management import InterruptProcessingException, processing_inte
 from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, InputImpl, IO
 
+from . import riggap
 from . import runner
 from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
@@ -56,6 +57,12 @@ FlipbookIO = IO.Custom("CUMULI_FLIPBOOK")
 DatasetIO = IO.Custom("CUMULI_DATASET")
 #: A solved real-capture rig: the poses a physical rig does not ship with.
 RigIO = IO.Custom("CUMULI_RIG")
+#: A TARGET camera_rig_spec.py rig (riggap.RigSpec) -- not to be confused
+#: with RigIO above, a solved REAL rig. "Desired final camera configuration."
+RigSpecIO = IO.Custom("CUMULI_RIG_SPEC")
+#: A plan_ring_gaps.py plan (riggap.CoveragePlan): which azimuth gaps a real
+#: rig has against a target RigSpecIO, and how to fill each with 4DAnyone.
+CoveragePlanIO = IO.Custom("CUMULI_COVERAGE_PLAN")
 
 _PROGRESS_STEPS = 1000
 
@@ -907,6 +914,406 @@ class CumuliSolveRig(IO.ComfyNode):
             f"{len(solve.labels) - len(unsolved)}/{len(cameras)} cameras solved",
         )
         return IO.NodeOutput(solve, str(solve.transforms_path), text)
+
+
+# --------------------------------------------------------------------------
+# 3b. rig-gap-fill: define target -> plan gaps -> generate -> merge
+# --------------------------------------------------------------------------
+def _video_extensions() -> tuple[str, ...]:
+    return (".mp4", ".mov", ".mkv", ".avi")
+
+
+def _find_camera_video(capture_dir: Path, label: str) -> Path:
+    for ext in _video_extensions():
+        candidate = capture_dir / f"{label}{ext}"
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(
+        f"Cumuli: no video for camera {label!r} in {capture_dir} "
+        f"(tried {', '.join(_video_extensions())})"
+    )
+
+
+class CumuliRig(IO.ComfyNode):
+    """Define or load a target camera_rig_spec.py rig -- the 'desired final
+    camera configuration' Cumuli Plan Coverage compares a solved real rig
+    against.
+
+    Give EITHER spec_path (one of cumuli's own configs/rigs/*.json, e.g.
+    ring16.json) OR spec_json (a rig spec typed or pasted in directly), not
+    both. Real validation happens inside plan_ring_gaps.py the first time
+    this spec is actually used, not here -- see riggap.RigSpec.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliRig",
+            display_name="Cumuli Rig",
+            category=CATEGORY,
+            description=(
+                "Defines a target camera rig-spec (camera_rig_spec.py's format): load one of "
+                "cumuli's configs/rigs/*.json by path, or paste one in as spec_json."
+            ),
+            is_experimental=True,
+            inputs=[
+                IO.String.Input("spec_path", default="", optional=True,
+                                tooltip="Path to a camera_rig_spec.py JSON file, e.g. "
+                                        "<cumuli_root>/configs/rigs/ring16.json."),
+                IO.String.Input("spec_json", default="", optional=True,
+                                tooltip="A rig spec's JSON text directly, in place of spec_path."),
+            ],
+            outputs=[
+                RigSpecIO.Output(display_name="rig_spec"),
+                IO.String.Output(display_name="report"),
+            ],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, spec_path="", spec_json="") -> IO.NodeOutput:
+        try:
+            rig_spec = riggap.load_rig_spec(spec_path=spec_path or None, spec_json=spec_json or None)
+        except riggap.RigGapError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        rings = rig_spec.spec.get("rings") or rig_spec.spec.get("cameras") or []
+        report = (
+            f"name: {rig_spec.name}\n"
+            f"layout: {rig_spec.spec.get('layout')}\n"
+            f"source: {rig_spec.source_path or '(inline spec_json)'}\n"
+            f"groups: {len(rings) if isinstance(rings, list) else '?'}"
+        )
+        return IO.NodeOutput(rig_spec, report)
+
+
+class CumuliPlanCoverage(IO.ComfyNode):
+    """Compute which azimuth gaps a solved real rig has against a target
+    rig-spec, up front -- so 4DAnyone is only asked to generate the views
+    actually missing, anchored on the real camera bordering each gap,
+    rather than one full generic ring per run.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliPlanCoverage",
+            display_name="Cumuli Plan Coverage",
+            category=CATEGORY,
+            description=(
+                "Runs plan_ring_gaps.py: real rig + target rig-spec -> a plan of 4DAnyone "
+                "generation runs, one per disjoint gap."
+            ),
+            is_experimental=True,
+            inputs=[
+                RigIO.Input("rig", tooltip="A solved real rig from Cumuli Solve Rig."),
+                RigSpecIO.Input("rig_spec", tooltip="A target rig from Cumuli Rig."),
+                IO.Float.Input("front_azimuth_deg", default=0.0, min=-180.0, max=180.0, step=0.1,
+                               tooltip="The real rig's azimuth (toward its first camera) that the "
+                                       "rig-spec's own azimuth zero points at physically. Defaults "
+                                       "to 0.0, which is almost certainly wrong for a real capture "
+                                       "-- see plan_ring_gaps.py's own module docstring before "
+                                       "trusting the default."),
+                IO.Float.Input("min_separation_deg", default=20.0, min=0.0, max=180.0, step=0.5,
+                               tooltip="Target azimuths within this many degrees of a real camera "
+                                       "count as already covered. Matches build_hybrid_dataset.py's "
+                                       "flag of the same name -- keep them equal."),
+                IO.String.Input("run_name", default="", optional=True,
+                                tooltip="Names the working directory. Empty uses the rig-spec's own name."),
+            ],
+            outputs=[
+                CoveragePlanIO.Output(display_name="plan"),
+                IO.String.Output(display_name="report"),
+            ],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, rig, rig_spec, front_azimuth_deg=0.0, min_separation_deg=20.0,
+               run_name="") -> IO.NodeOutput:
+        node_id = cls.hidden.unique_id
+        try:
+            settings = load_settings()
+            settings.validate()
+        except SettingsError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+
+        name = (run_name or rig_spec.name or "plan").strip()
+        work = settings.work_dir(name)
+        work_dir = work if work is not None else (
+            Path(folder_paths.get_temp_directory()) / "cumuli" / name / "coverage_plan"
+        )
+
+        def on_line(line: str) -> None:
+            _send_text(node_id, line)
+
+        try:
+            plan = riggap.plan_coverage(
+                settings, rig.transforms_path, rig_spec,
+                front_azimuth_deg=front_azimuth_deg, min_separation_deg=min_separation_deg,
+                work_dir=work_dir, on_line=on_line, should_cancel=_cancelled,
+            )
+        except SubprocessCancelled:
+            raise InterruptProcessingException() from None
+        except (riggap.RigGapError, SubprocessError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+
+        report = "\n".join([
+            f"rig_spec: {rig_spec.name}",
+            f"real cameras: {rig.num_cameras}",
+            f"front_azimuth_deg: {front_azimuth_deg}  min_separation_deg: {min_separation_deg}",
+            plan.summary(),
+        ] + [
+            f"  run {i + 1}: anchor {r.anchor_camera}, {r.views_per_layer} views, "
+            f"start_yaw {r.start_yaw:+.1f}, yaw_span {r.yaw_span:.1f}"
+            for i, r in enumerate(plan.runs)
+        ])
+        _send_text(node_id, plan.summary())
+        return IO.NodeOutput(plan, report)
+
+
+class CumuliGenerateCoverageRings(IO.ComfyNode):
+    """Run 4DAnyone once per gap in a Cumuli Plan Coverage plan, all
+    conditioned on the same rig-fitted motion, and convert each finished
+    result into a dataset build_hybrid_dataset.py can merge.
+
+    Mirrors Cumuli Generate Ring's own machinery (same request-building,
+    caching, and VRAM-checking sequence) run in a loop, since ComfyUI's V3
+    node API has no fan-out primitive to drive one node N times with N
+    different geometries. A plan with N runs takes roughly N times as long
+    as one Generate Ring call -- there is no way around that; 4DAnyone only
+    ever produces one continuous partial-span ring per invocation.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliGenerateCoverageRings",
+            display_name="Cumuli Generate Coverage Rings (4DAnyone)",
+            category=CATEGORY,
+            description=(
+                "Runs 4DAnyone once per Cumuli Plan Coverage gap, conditioned on a shared "
+                "rig-fitted motion, and converts each result for Cumuli Build Hybrid Dataset."
+            ),
+            is_experimental=True,
+            inputs=[
+                CoveragePlanIO.Input("plan", tooltip="From Cumuli Plan Coverage."),
+                IO.String.Input("capture_dir",
+                                tooltip="The real rig's directory of per-camera videos (same "
+                                        "directory Cumuli Solve Rig read) -- each plan entry's "
+                                        "anchor_camera names a file stem in here."),
+                IO.String.Input("motion_source",
+                                tooltip="fit_rig_motion.py's --out_dir: the directory holding "
+                                        "motion.safetensors + motion.json, shared across every "
+                                        "run in the plan."),
+                IO.String.Input("smplx_model",
+                                tooltip="Path to SMPLX_NEUTRAL.npz, for converting each result's "
+                                        "init cloud (fdanyone_to_omg4.py)."),
+                IO.String.Input("run_name", default="capture", optional=True,
+                                tooltip="Prefixes every generation run's own name (which also "
+                                        "encodes its anchor camera and gap), so runs from "
+                                        "different captures never collide."),
+                IO.Boolean.Input("enable_rcp", default=True,
+                                 tooltip="See Cumuli Generate Ring's own enable_rcp tooltip."),
+                IO.Boolean.Input("enable_turbo", default=True, advanced=True),
+                IO.Int.Input("seed", default=42, min=0, max=0xffffffffffffffff, advanced=True),
+                IO.String.Input("device", default="cuda:0", advanced=True),
+                IO.Float.Input("min_free_vram_gb", default=-1.0, min=-1.0, max=200.0, step=0.5,
+                               tooltip="Refuse to start a run below this much free VRAM. -1 uses "
+                                       "the bridge config value.", advanced=True),
+            ],
+            outputs=[
+                IO.String.Output(display_name="gen_runs_manifest"),
+                IO.String.Output(display_name="report"),
+            ],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, plan, capture_dir, motion_source, smplx_model, run_name="capture",
+               enable_rcp=True, enable_turbo=True, seed=42, device="cuda:0",
+               min_free_vram_gb=-1.0) -> IO.NodeOutput:
+        node_id = cls.hidden.unique_id
+        try:
+            settings = load_settings()
+            settings.validate()
+        except SettingsError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+
+        if not plan.runs:
+            _send_text(node_id, "no gaps to fill")
+            return IO.NodeOutput("[]", "no gaps: the real rig already covers the target spec")
+
+        capture_dir_path = Path(capture_dir).expanduser()
+        motion_source_path = Path(motion_source).expanduser()
+        smplx_model_path = Path(smplx_model).expanduser()
+        minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+
+        gen_runs: list[tuple[str, str]] = []
+        lines = [f"{len(plan.runs)} run(s) planned"]
+        for i, entry in enumerate(plan.runs):
+            if _cancelled():
+                raise InterruptProcessingException()
+            name = entry.run_name(run_name)
+            _send_text(node_id, f"[{i + 1}/{len(plan.runs)}] {name}")
+
+            try:
+                video = _find_camera_video(capture_dir_path, entry.anchor_camera)
+                staged = runner.stage_source_video(settings, video, name)
+                request = runner.build_request(
+                    video_path=staged,
+                    views_per_layer=entry.views_per_layer,
+                    layer_pitches=list(entry.layer_pitches),
+                    start_yaw=entry.start_yaw,
+                    yaw_span=entry.yaw_span,
+                    views_per_group="4",
+                    enable_rcp=enable_rcp,
+                    enable_tcr=True,
+                    start_time=0.0,
+                    target_fps="auto",
+                    seed=seed,
+                    device=device,
+                    enable_turbo=enable_turbo,
+                    motion_source=motion_source_path,
+                )
+                runner.inject_motion(settings, request)
+                runner.check_video(settings, request)
+                result_dir = settings.result_dir(request.run_name)
+                fingerprint, motion_key = runner.ring_fingerprint(request)
+                previous_stamp = runner.read_stamp(result_dir)
+                decision = runner.prepare_artifact_dir(result_dir, fingerprint)
+
+                if decision == "reuse" and (result_dir / "metadata.json").is_file():
+                    ring = RingResult.load(result_dir)
+                    lines.append(f"  {name}: cached ({ring.num_views} views)")
+                else:
+                    runner.clear_stale_motion(settings, request, motion_key, previous_stamp)
+                    require_free_vram(request.device, minimum)
+
+                    def on_progress(state, i=i, total=len(plan.runs)) -> None:
+                        _send_text(node_id, f"[{i + 1}/{total}] {state.fraction * 100:.0f}% {state.message}")
+
+                    outcome = runner.execute(settings, request, on_progress=on_progress,
+                                             should_cancel=_cancelled)
+                    runner.write_stamp(outcome.result_dir, fingerprint, motion_key=motion_key)
+                    ring = RingResult.load(outcome.result_dir)
+                    lines.append(f"  {name}: generated ({ring.num_views} views)")
+
+                omg4_root = settings.work_dir(run_name) or (
+                    Path(folder_paths.get_temp_directory()) / "cumuli" / run_name
+                )
+                omg4_dir = omg4_root / "gen" / name
+                riggap.convert_fdanyone_to_omg4(
+                    settings, ring.root, motion_source_path, smplx_model_path, omg4_dir,
+                    on_line=lambda line: _send_text(node_id, line), should_cancel=_cancelled,
+                )
+                gen_runs.append((name, str(omg4_dir)))
+            except SubprocessCancelled:
+                raise InterruptProcessingException() from None
+            except (SubprocessError, runner.ValidationError, InsufficientVRAM,
+                    riggap.RigGapError) as exc:
+                raise RuntimeError(f"Cumuli: run {name} failed: {exc}") from None
+
+        manifest = json.dumps(gen_runs)
+        report = "\n".join(lines)
+        _send_text(node_id, f"{len(gen_runs)}/{len(plan.runs)} run(s) done")
+        return IO.NodeOutput(manifest, report)
+
+
+class CumuliBuildHybridDataset(IO.ComfyNode):
+    """Merge the real rig with every Cumuli Generate Coverage Rings result
+    into one training dataset (build_hybrid_dataset.py): reposes generated
+    cameras into the rig's world, retimes them onto the capture clock,
+    re-crops masks into the real cameras' alpha, and culls generated views
+    that duplicate a real camera's azimuth. Feed the output straight into
+    Cumuli Load Dataset.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliBuildHybridDataset",
+            display_name="Cumuli Build Hybrid Dataset",
+            category=CATEGORY,
+            description="Runs build_hybrid_dataset.py: real rig + generated coverage rings -> one dataset.",
+            is_experimental=True,
+            inputs=[
+                IO.String.Input("gen_runs_manifest",
+                                tooltip="From Cumuli Generate Coverage Rings."),
+                IO.String.Input("real_transforms",
+                                tooltip="omg4_full4d/transforms_train.json (the real rig, capture-time seconds)."),
+                IO.String.Input("real_root", tooltip="Directory holding cam01/..camNN/ real crops."),
+                IO.String.Input("masks_root", tooltip="Full-undistorted-resolution per-camera masks."),
+                IO.String.Input("undistorted_transforms",
+                                tooltip="transforms_multiframe_undistorted.json, for the full-frame principal point."),
+                IO.String.Input("motion_source", tooltip="Same directory given to Cumuli Generate Coverage Rings."),
+                IO.String.Input("transform", tooltip="fit_rig_motion.py's T_world_from_rig.json."),
+                IO.String.Input("out_dir", tooltip="Destination for the merged dataset."),
+                IO.Float.Input("gen_weight", default=0.5, min=0.0, max=1.0, step=0.01,
+                               tooltip="Photometric weight on generated views. Default equalises "
+                                       "aggregate influence against the real cameras; see "
+                                       "build_hybrid_dataset.py's own WEIGHTING note."),
+                IO.String.Input("holdout", default="", optional=True,
+                                tooltip="A real camera to hold out for testing."),
+                IO.Float.Input("min_separation_deg", default=20.0, min=0.0, max=180.0, step=0.5,
+                               tooltip="Must match Cumuli Plan Coverage's own value."),
+                IO.Boolean.Input("color_match", default=False, advanced=True,
+                                 tooltip="Measured harmful; see build_hybrid_dataset.py's own note. Off by default."),
+            ],
+            outputs=[
+                DatasetIO.Output(display_name="dataset"),
+                IO.String.Output(display_name="dataset_dir"),
+                IO.String.Output(display_name="report"),
+            ],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, gen_runs_manifest, real_transforms, real_root, masks_root,
+               undistorted_transforms, motion_source, transform, out_dir, gen_weight=0.5,
+               holdout="", min_separation_deg=20.0, color_match=False) -> IO.NodeOutput:
+        node_id = cls.hidden.unique_id
+        try:
+            settings = load_settings()
+            settings.validate()
+            gen_runs = tuple((name, Path(d)) for name, d in json.loads(gen_runs_manifest))
+        except (SettingsError, ValueError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+
+        options = riggap.HybridDatasetOptions(
+            real_transforms=Path(real_transforms), real_root=Path(real_root),
+            masks_root=Path(masks_root), undistorted_transforms=Path(undistorted_transforms),
+            motion_dir=Path(motion_source), transform=Path(transform), out_dir=Path(out_dir),
+            gen_runs=gen_runs, gen_weight=gen_weight, holdout=holdout,
+            min_separation_deg=min_separation_deg, color_match=color_match,
+        )
+
+        def on_line(line: str) -> None:
+            _send_text(node_id, line)
+
+        try:
+            out = riggap.build_hybrid_dataset(settings, options, on_line=on_line,
+                                              should_cancel=_cancelled)
+            checked = validate_dataset(out)
+        except SubprocessCancelled:
+            raise InterruptProcessingException() from None
+        except (riggap.RigGapError, SubprocessError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        except ValidationError as exc:
+            raise RuntimeError(f"Cumuli: build_hybrid_dataset.py wrote a dataset that "
+                               f"does not pass the trainer's own contract: {exc}") from None
+
+        # No fingerprint: build_hybrid_dataset.py stamps nothing, and its
+        # inputs (a whole plan of generation runs) are not the single-run
+        # fingerprint CumuliBuildDataset/CumuliGenerateRing track -- matches
+        # CumuliLoadDataset's own "external dataset" identity for anything
+        # this bridge did not itself fingerprint.
+        handle = DatasetHandle(root=out.resolve(), fingerprint=None, source="external")
+        report = "\n".join([
+            f"merged {len(gen_runs)} generation run(s) -> {out.resolve()}",
+            *(f"{key}: {value}" for key, value in sorted(checked.items())),
+        ])
+        _send_text(node_id, report)
+        return IO.NodeOutput(handle, str(out.resolve()), report)
 
 
 class CumuliStageCapture(IO.ComfyNode):
@@ -1887,6 +2294,10 @@ class CumuliExtension(ComfyExtension):
             CumuliSelectView,
             CumuliStageRing,
             CumuliSolveRig,
+            CumuliRig,
+            CumuliPlanCoverage,
+            CumuliGenerateCoverageRings,
+            CumuliBuildHybridDataset,
             CumuliStageCapture,
             CumuliLoadFlipbook,
             CumuliRingMasks,
