@@ -159,7 +159,7 @@ The three checkout paths are **`fdanyone_root`** (ring generation),
 Bake SOGST and Solve Rig drive in place). They are independent: OMG4 does not
 have to be cumuli's submodule.
 
-Set **`dataset_roots`** / **`flipbook_roots`** / **`ring_roots`** to the
+Set **`dataset_roots`** / **`flipbook_roots`** / **`ring_roots`** / **`model_roots`** to the
 directories where your external captures live; the loader nodes scan them (plus
 `work_root`, and the 4DAnyone data dir for rings) into their dropdowns, model-loader style, and re-scan on the widget's refresh
 button and at every queue. This works over remote connections, where a native
@@ -190,7 +190,7 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | node | what it does |
 |---|---|
 | **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
-| **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other two loaders. |
+| **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other loaders. |
 | **Ring Contact Sheet** | One frame from every view, tiled. The fastest way to spot cross-view identity drift. |
 | **Select View** | One view as VIDEO + IMAGE + its camera JSON. |
 | **Stage Ring** | Transposes 24 videos x 121 frames into 121 frame directories, with a per-frame `transforms.json`. |
@@ -200,8 +200,9 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | **Ring Masks** | Mattes every staged frame. Takes a `BACKGROUND_REMOVAL` model, so ComfyUI's stock loader (or any substitute) drives it. Reports foreground coverage, because empty masks collapse the visual hull much later and confusingly. |
 | **Build 4DGS Dataset** | Carves a time-stamped visual-hull init cloud, bakes the mattes into RGBA alpha, writes `transforms_train/test.json` with per-camera intrinsics, and checks the result against the trainer's contract. Emits a typed `DATASET`. |
 | **Load 4DGS Dataset** | Validates and describes an existing dataset directory (D-NeRF layout) — the entry point for **finished external datasets** and real-capture exports. The widget is a discovery combo (work_root + config `dataset_roots`) with a refresh button. |
-| **Train 4DGS** | Trains the rotor 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. Clips longer than `max_window_frames` train as several short windows instead (see [Windowed training](#windowed-training) below); the extra `window_manifest` output feeds that into Bake SOGST. |
-| **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. Given a `window_manifest`, bakes every window and stitches them into one archive instead. |
+| **Train 4DGS** | Trains the rotor 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. Clips longer than `max_window_frames` train as several short windows instead (see [Windowed training](#windowed-training) below). Emits a typed `MODEL` either way, and records it on disk as a cumuli `window_plan.json`. |
+| **Load Model** | Opens a trained run so it can be baked without retraining: a Train 4DGS output directory, a run trained by cumuli's own `run_window_plan.py` (its `window_plan.json`), or a single cumuli run directory (`gs4d_config.yaml` + `train4d_output/`). The widget is a discovery combo (work_root + config `model_roots`) with a refresh button. |
+| **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. Takes a `MODEL`; for a windowed one it bakes every window and stitches them into one archive, and its `windows` widget (`"0"`, `"1-2"`, empty for all) picks a contiguous subset. |
 | **Preview SOGST** | Evaluates the baked clip at one instant and outputs ComfyUI's native `SPLAT`. |
 
 ### Caching
@@ -246,7 +247,9 @@ Three entry points, by how far your data has been processed:
 - frames + cameras, no dataset yet → **Load Flipbook** → Ring Masks → Build
   4DGS Dataset (this pack computes the mattes and hull for you);
 - a finished D-NeRF dataset (`transforms_train.json` + `points3d.ply`) →
-  **Load 4DGS Dataset** → Train 4DGS.
+  **Load 4DGS Dataset** → Train 4DGS;
+- a trained run, from this pack or from cumuli's command line → **Load Model**
+  → Bake SOGST.
 
 #### Solving a rig
 
@@ -365,9 +368,9 @@ factor of ½.
   real subject capture (30.87 vs 30.04 dB); 3 measured better on a generated
   ring (23.2 vs 21.0 dB held-out). When in doubt, try both — the runs are an
   hour each and the fingerprint cache keeps whichever you keep.
-- **`mask_filter_root`** on Bake SOGST enables the lifetime mask-consistency
-  filter, which drops silhouette-escaping splats. It is junk removal, not a
-  quality regulariser.
+- **`mask_filter`** on Bake SOGST (on by default) runs the lifetime
+  mask-consistency filter against each window's own dataset, which drops
+  silhouette-escaping splats. It is junk removal, not a quality regulariser.
 - **`max_window_frames`** on Train 4DGS (default 31): see
   [Windowed training](#windowed-training) below.
 - **`background`** on Build 4DGS Dataset and Train 4DGS: black or white only
@@ -394,12 +397,22 @@ as it always has, as one model. A longer clip splits into
 length (121 frames at the default 31 → windows of 31/30/30/30, the exact
 split measured above) and trains each independently, with its own visual
 hull slice, checkpoint, and fingerprint-based caching — changing one
-window's dataset only retrains that window. The node's `checkpoint`/
-`duration_seconds` outputs describe the *first* window only, for a quick
-preview; wire its **`window_manifest`** output into **Bake SOGST**'s input of
-the same name to bake every window and stitch them into one `.sogst` (driving
-cumuli's own `merge_sogst_segments.py`, the same script the measurements
-above came from). Left empty, Bake SOGST behaves exactly as before.
+window's dataset only retrains that window. Either way Train emits one
+`MODEL`, so the graph is wired the same for a windowed clip as for a short
+one: **Bake SOGST** bakes every window and stitches them into one `.sogst`
+(driving cumuli's own `merge_sogst_segments.py`, the same script the
+measurements above came from). Its `windows` widget bakes a contiguous subset
+instead — `"0"` for a quick look at the first window, `"1-2"` for a stretch
+of the middle — rebased so the archive starts at 0.
+
+On disk, Train records the run in cumuli's own format: a `window_plan.json`
+in its `out_dir`, naming each window's directory and offset, and in each
+window's directory the trainer's `gs4d_config.yaml`, `dataset_4dgs/` and
+`train4d_output/`. That is the same layout `plan_temporal_windows.py` and
+`run_window_plan.py` produce, so **Load Model** opens a run trained by
+cumuli's command line, and `merge_sogst_segments.py --plan` reads one trained
+here. Load Model refuses a single window's checkpoint on its own and points at
+the plan instead.
 
 `max_parallel_windows` (advanced, default 1) bounds how many windows train at
 once. **On the reference single-GPU workstation this makes no difference**:
