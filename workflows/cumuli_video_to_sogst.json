@@ -2,7 +2,7 @@
   "id": "11652199-dad8-4345-a925-7e8b65997d1c",
   "revision": 0,
   "last_node_id": 31,
-  "last_link_id": 47,
+  "last_link_id": 48,
   "nodes": [
     {
       "id": 1,
@@ -30,10 +30,10 @@
         }
       },
       "widgets_values": [
-        "# Video → .sogst (Cumuli)\n\n**Load Video → Generate Ring → Stage → Masks → Dataset → Train → Bake → Preview.**\nOne monocular clip in, a streamable 4D gaussian splat in the output gallery\n(~1.5 h total on a 32 GB card: ring ~25 min with the default `enable_turbo`,\ntraining ~1 h).\n\n## Configuration lives in ComfyUI's Settings\nOpen **Settings → search \"Cumuli\"**: work root (heavy intermediates,\n~20 GB/run → `<work_root>/<run>/`), the loader dropdowns' discovery\nroots, the VRAM floor, and the checkout paths. Stored as `cumuli.*` keys in\nComfyUI's own settings store; re-read at every queue, no restart. The final\n`.sogst` + PLY land in the output gallery (ComfyUI's `--output-directory`).\n\n## Before you queue\n1. **Upload or pick your clip in the *Load Video* node** — 121 frames after\n   `start_time` at 720p+ (~5 s at 24 fps), checked up front.\n2. Keep the seed control on **fixed** so re-queues hit the cache.\n\n## Caching — no toggles\nNodes re-run **only when inputs change** (ComfyUI semantics), extended to disk\nfor the expensive stages: unchanged re-queues reuse the finished ring and\ncheckpoint even across restarts (\"CACHED RESULT\"). Changing any input (seed,\nprompt, LoRA...) regenerates from that stage on. Seed changes keep the motion\ncache.\n\n## Identity LoRAs — stock nodes, one toggle\nThe muted ALT branch at the top left is **ComfyUI's own** chain:\n`Load Diffusion Model (4danyone_wan22_5b) → LoraLoaderModelOnly → Generate\nRing.model`. To enable: **unmute both nodes (Ctrl+B)** and set Generate Ring's\n**prompt** widget to the trigger, e.g. `rin_karasuba, 视频中的人在做动作` —\nwithout it the LoRA runs at half effect. Any LoRA trained on stock Wan 2.2\nTI2V-5B works; stack loaders freely; folded and merged in the subprocess at\nzero extra VRAM. Sweep strength 0.3–1.0. Enabling changes the ring\nfingerprint, so the first LoRA run regenerates (correct: it is a new ring).\n\n## Re-entry & real captures — the ALT loaders\nThe **Load Flipbook** and **Load 4DGS Dataset** nodes are muted ALTs feeding\nAny Switch nodes: **unmute one (Ctrl+B) and its loaded artifact wins** over\nthe generated branch; mute it again to go back. Their dropdowns list artifacts\ndiscovered under the work root + the Settings-dialog roots (↻ refreshes).\n- *Load Flipbook* also accepts an external frame-major capture\n  (`frame_NNNN/images_flat/<label>.png` + `transforms.json`) — this\n  workflow's matting + hull then run on it.\n- *Load 4DGS Dataset* takes any finished D-NeRF dataset straight into Train.\n\n## Knobs that matter\n| where | knob | note |\n|---|---|---|\n| Generate Ring | `enable_rcp` **on** | off = the back of the ring is invented per group, will not reconstruct |\n| Generate Ring | `enable_turbo` **on** | 4DAnyone-Turbo: 4 denoising steps. Off runs the base model, much slower, and is what the older figures were measured on |\n| Generate Ring | `views_per_group` **4** | 6 overruns 32 GB |\n| Generate Ring | `prompt` | LoRA trigger words; empty = stock prompt |\n| Build Dataset | `test_cameras` **12** | empty = PSNR is a training-view number |\n| Train 4DGS | `sh_degree` | content-dependent: 3 won on a generated ring (+2.2 dB), 2 on a real capture |\n| Bake SOGST | `mask_filter_root` link | lifetime mask-consistency filter (junk removal) |\n| Bake SOGST | `fps` | advisory playback rate — match your source |\n"
+        "# Video \u2192 .sogst (Cumuli)\n\n**Load Video \u2192 Generate Ring \u2192 Stage \u2192 Masks \u2192 Dataset \u2192 Train \u2192 Bake \u2192 Preview.**\nOne monocular clip in, a streamable 4D gaussian splat in the output gallery\n(~1.5 h total on a 32 GB card: ring ~25 min with the default `enable_turbo`,\ntraining ~1 h).\n\n## Configuration lives in ComfyUI's Settings\nOpen **Settings \u2192 search \"Cumuli\"**: work root (heavy intermediates,\n~20 GB/run \u2192 `<work_root>/<run>/`), the loader dropdowns' discovery\nroots, the VRAM floor, and the checkout paths. Stored as `cumuli.*` keys in\nComfyUI's own settings store; re-read at every queue, no restart. The final\n`.sogst` + PLY land in the output gallery (ComfyUI's `--output-directory`).\n\n## Before you queue\n1. **Upload or pick your clip in the *Load Video* node** \u2014 121 frames after\n   `start_time` at 720p+ (~5 s at 24 fps), checked up front.\n2. Keep the seed control on **fixed** so re-queues hit the cache.\n\n## Caching \u2014 no toggles\nNodes re-run **only when inputs change** (ComfyUI semantics), extended to disk\nfor the expensive stages: unchanged re-queues reuse the finished ring and\ncheckpoint even across restarts (\"CACHED RESULT\"). Changing any input (seed,\nprompt, LoRA...) regenerates from that stage on. Seed changes keep the motion\ncache.\n\n## Identity LoRAs \u2014 stock nodes, one toggle\nThe muted ALT branch at the top left is **ComfyUI's own** chain:\n`Load Diffusion Model (4danyone_wan22_5b) \u2192 LoraLoaderModelOnly \u2192 Generate\nRing.model`. To enable: **unmute both nodes (Ctrl+B)** and set Generate Ring's\n**prompt** widget to the trigger, e.g. `rin_karasuba, \u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c` \u2014\nwithout it the LoRA runs at half effect. Any LoRA trained on stock Wan 2.2\nTI2V-5B works; stack loaders freely; folded and merged in the subprocess at\nzero extra VRAM. Sweep strength 0.3\u20131.0. Enabling changes the ring\nfingerprint, so the first LoRA run regenerates (correct: it is a new ring).\n\n## Re-entry & real captures \u2014 the ALT loaders\nThe **Load Flipbook** and **Load 4DGS Dataset** nodes are muted ALTs feeding\nAny Switch nodes: **unmute one (Ctrl+B) and its loaded artifact wins** over\nthe generated branch; mute it again to go back. Their dropdowns list artifacts\ndiscovered under the work root + the Settings-dialog roots (\u21bb refreshes).\n- *Load Flipbook* also accepts an external frame-major capture\n  (`frame_NNNN/images_flat/<label>.png` + `transforms.json`) \u2014 this\n  workflow's matting + hull then run on it.\n- *Load 4DGS Dataset* takes any finished D-NeRF dataset straight into Train.\n\n## Knobs that matter\n| where | knob | note |\n|---|---|---|\n| Generate Ring | `enable_rcp` **on** | off = the back of the ring is invented per group, will not reconstruct |\n| Generate Ring | `enable_turbo` **on** | 4DAnyone-Turbo: 4 denoising steps. Off runs the base model, much slower, and is what the older figures were measured on |\n| Generate Ring | `views_per_group` **4** | 6 overruns 32 GB |\n| Generate Ring | `prompt` | LoRA trigger words; empty = stock prompt |\n| Build Dataset | `test_cameras` **12** | empty = PSNR is a training-view number |\n| Train 4DGS | `sh_degree` | content-dependent: 3 won on a generated ring (+2.2 dB), 2 on a real capture |\n| Bake SOGST | `mask_filter_root` link | lifetime mask-consistency filter (junk removal) |\n| Bake SOGST | `fps` | advisory playback rate \u2014 match your source |\n"
       ],
       "widgets_values_named": {
-        "text": "# Video → .sogst (Cumuli)\n\n**Load Video → Generate Ring → Stage → Masks → Dataset → Train → Bake → Preview.**\nOne monocular clip in, a streamable 4D gaussian splat in the output gallery\n(~1.5 h total on a 32 GB card: ring ~25 min with the default `enable_turbo`,\ntraining ~1 h).\n\n## Configuration lives in ComfyUI's Settings\nOpen **Settings → search \"Cumuli\"**: work root (heavy intermediates,\n~20 GB/run → `<work_root>/<run>/`), the loader dropdowns' discovery\nroots, the VRAM floor, and the checkout paths. Stored as `cumuli.*` keys in\nComfyUI's own settings store; re-read at every queue, no restart. The final\n`.sogst` + PLY land in the output gallery (ComfyUI's `--output-directory`).\n\n## Before you queue\n1. **Upload or pick your clip in the *Load Video* node** — 121 frames after\n   `start_time` at 720p+ (~5 s at 24 fps), checked up front.\n2. Keep the seed control on **fixed** so re-queues hit the cache.\n\n## Caching — no toggles\nNodes re-run **only when inputs change** (ComfyUI semantics), extended to disk\nfor the expensive stages: unchanged re-queues reuse the finished ring and\ncheckpoint even across restarts (\"CACHED RESULT\"). Changing any input (seed,\nprompt, LoRA...) regenerates from that stage on. Seed changes keep the motion\ncache.\n\n## Identity LoRAs — stock nodes, one toggle\nThe muted ALT branch at the top left is **ComfyUI's own** chain:\n`Load Diffusion Model (4danyone_wan22_5b) → LoraLoaderModelOnly → Generate\nRing.model`. To enable: **unmute both nodes (Ctrl+B)** and set Generate Ring's\n**prompt** widget to the trigger, e.g. `rin_karasuba, 视频中的人在做动作` —\nwithout it the LoRA runs at half effect. Any LoRA trained on stock Wan 2.2\nTI2V-5B works; stack loaders freely; folded and merged in the subprocess at\nzero extra VRAM. Sweep strength 0.3–1.0. Enabling changes the ring\nfingerprint, so the first LoRA run regenerates (correct: it is a new ring).\n\n## Re-entry & real captures — the ALT loaders\nThe **Load Flipbook** and **Load 4DGS Dataset** nodes are muted ALTs feeding\nAny Switch nodes: **unmute one (Ctrl+B) and its loaded artifact wins** over\nthe generated branch; mute it again to go back. Their dropdowns list artifacts\ndiscovered under the work root + the Settings-dialog roots (↻ refreshes).\n- *Load Flipbook* also accepts an external frame-major capture\n  (`frame_NNNN/images_flat/<label>.png` + `transforms.json`) — this\n  workflow's matting + hull then run on it.\n- *Load 4DGS Dataset* takes any finished D-NeRF dataset straight into Train.\n\n## Knobs that matter\n| where | knob | note |\n|---|---|---|\n| Generate Ring | `enable_rcp` **on** | off = the back of the ring is invented per group, will not reconstruct |\n| Generate Ring | `enable_turbo` **on** | 4DAnyone-Turbo: 4 denoising steps. Off runs the base model, much slower, and is what the older figures were measured on |\n| Generate Ring | `views_per_group` **4** | 6 overruns 32 GB |\n| Generate Ring | `prompt` | LoRA trigger words; empty = stock prompt |\n| Build Dataset | `test_cameras` **12** | empty = PSNR is a training-view number |\n| Train 4DGS | `sh_degree` | content-dependent: 3 won on a generated ring (+2.2 dB), 2 on a real capture |\n| Bake SOGST | `mask_filter_root` link | lifetime mask-consistency filter (junk removal) |\n| Bake SOGST | `fps` | advisory playback rate — match your source |\n"
+        "text": "# Video \u2192 .sogst (Cumuli)\n\n**Load Video \u2192 Generate Ring \u2192 Stage \u2192 Masks \u2192 Dataset \u2192 Train \u2192 Bake \u2192 Preview.**\nOne monocular clip in, a streamable 4D gaussian splat in the output gallery\n(~1.5 h total on a 32 GB card: ring ~25 min with the default `enable_turbo`,\ntraining ~1 h).\n\n## Configuration lives in ComfyUI's Settings\nOpen **Settings \u2192 search \"Cumuli\"**: work root (heavy intermediates,\n~20 GB/run \u2192 `<work_root>/<run>/`), the loader dropdowns' discovery\nroots, the VRAM floor, and the checkout paths. Stored as `cumuli.*` keys in\nComfyUI's own settings store; re-read at every queue, no restart. The final\n`.sogst` + PLY land in the output gallery (ComfyUI's `--output-directory`).\n\n## Before you queue\n1. **Upload or pick your clip in the *Load Video* node** \u2014 121 frames after\n   `start_time` at 720p+ (~5 s at 24 fps), checked up front.\n2. Keep the seed control on **fixed** so re-queues hit the cache.\n\n## Caching \u2014 no toggles\nNodes re-run **only when inputs change** (ComfyUI semantics), extended to disk\nfor the expensive stages: unchanged re-queues reuse the finished ring and\ncheckpoint even across restarts (\"CACHED RESULT\"). Changing any input (seed,\nprompt, LoRA...) regenerates from that stage on. Seed changes keep the motion\ncache.\n\n## Identity LoRAs \u2014 stock nodes, one toggle\nThe muted ALT branch at the top left is **ComfyUI's own** chain:\n`Load Diffusion Model (4danyone_wan22_5b) \u2192 LoraLoaderModelOnly \u2192 Generate\nRing.model`. To enable: **unmute both nodes (Ctrl+B)** and set Generate Ring's\n**prompt** widget to the trigger, e.g. `rin_karasuba, \u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c` \u2014\nwithout it the LoRA runs at half effect. Any LoRA trained on stock Wan 2.2\nTI2V-5B works; stack loaders freely; folded and merged in the subprocess at\nzero extra VRAM. Sweep strength 0.3\u20131.0. Enabling changes the ring\nfingerprint, so the first LoRA run regenerates (correct: it is a new ring).\n\n## Re-entry & real captures \u2014 the ALT loaders\nThe **Load Flipbook** and **Load 4DGS Dataset** nodes are muted ALTs feeding\nAny Switch nodes: **unmute one (Ctrl+B) and its loaded artifact wins** over\nthe generated branch; mute it again to go back. Their dropdowns list artifacts\ndiscovered under the work root + the Settings-dialog roots (\u21bb refreshes).\n- *Load Flipbook* also accepts an external frame-major capture\n  (`frame_NNNN/images_flat/<label>.png` + `transforms.json`) \u2014 this\n  workflow's matting + hull then run on it.\n- *Load 4DGS Dataset* takes any finished D-NeRF dataset straight into Train.\n\n## Knobs that matter\n| where | knob | note |\n|---|---|---|\n| Generate Ring | `enable_rcp` **on** | off = the back of the ring is invented per group, will not reconstruct |\n| Generate Ring | `enable_turbo` **on** | 4DAnyone-Turbo: 4 denoising steps. Off runs the base model, much slower, and is what the older figures were measured on |\n| Generate Ring | `views_per_group` **4** | 6 overruns 32 GB |\n| Generate Ring | `prompt` | LoRA trigger words; empty = stock prompt |\n| Build Dataset | `test_cameras` **12** | empty = PSNR is a training-view number |\n| Train 4DGS | `sh_degree` | content-dependent: 3 won on a generated ring (+2.2 dB), 2 on a real capture |\n| Bake SOGST | `mask_filter_root` link | lifetime mask-consistency filter (junk removal) |\n| Bake SOGST | `fps` | advisory playback rate \u2014 match your source |\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -170,11 +170,11 @@
           "links": []
         }
       ],
-      "title": "3 · Ring Masks",
+      "title": "3 \u00b7 Ring Masks",
       "properties": {
         "Node name for S&R": "CumuliRingMasks",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.1.0",
         "ue_properties": {
           "widget_ue_connectable": {},
           "version": "7.8",
@@ -266,11 +266,11 @@
           "links": []
         }
       ],
-      "title": "7 · Preview SOGST  (scrub time_seconds)",
+      "title": "7 \u00b7 Preview SOGST  (scrub time_seconds)",
       "properties": {
         "Node name for S&R": "CumuliPreviewSogst",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.1.0",
         "ue_properties": {
           "widget_ue_connectable": {
             "path": true
@@ -425,7 +425,7 @@
           "links": []
         }
       ],
-      "title": "8 · Render Splat",
+      "title": "8 \u00b7 Render Splat",
       "properties": {
         "Node name for S&R": "RenderSplat",
         "cnr_id": "comfy-core",
@@ -579,11 +579,11 @@
           ]
         }
       ],
-      "title": "QC · Ring Contact Sheet",
+      "title": "QC \u00b7 Ring Contact Sheet",
       "properties": {
         "Node name for S&R": "CumuliRingContactSheet",
         "cnr_id": "comfyui-cumuli",
-        "ver": "0.0.1",
+        "ver": "0.1.0",
         "ue_properties": {
           "widget_ue_connectable": {},
           "version": "7.8",
@@ -635,7 +635,7 @@
           "links": null
         }
       ],
-      "title": "QC · every view, one frame",
+      "title": "QC \u00b7 every view, one frame",
       "properties": {
         "Node name for S&R": "PreviewImage",
         "cnr_id": "comfy-core",
@@ -677,7 +677,7 @@
           "links": null
         }
       ],
-      "title": "QC · mattes",
+      "title": "QC \u00b7 mattes",
       "properties": {
         "Node name for S&R": "PreviewImage",
         "cnr_id": "comfy-core",
@@ -807,7 +807,7 @@
           "links": null
         }
       ],
-      "title": "→ .sogst path",
+      "title": "\u2192 .sogst path",
       "properties": {
         "Node name for S&R": "PreviewAny",
         "cnr_id": "comfy-core",
@@ -909,7 +909,7 @@
           ]
         }
       ],
-      "title": "0 · Load Video (upload your clip here)",
+      "title": "0 \u00b7 Load Video (upload your clip here)",
       "properties": {
         "Node name for S&R": "LoadVideo",
         "ue_properties": {
@@ -1375,9 +1375,7 @@
           "localized_name": "dataset_dir",
           "name": "dataset_dir",
           "type": "STRING",
-          "links": [
-            35
-          ]
+          "links": []
         },
         {
           "localized_name": "report",
@@ -1530,6 +1528,42 @@
           "link": null
         },
         {
+          "localized_name": "background",
+          "name": "background",
+          "type": "COMBO",
+          "widget": {
+            "name": "background"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "lambda_opa_mask",
+          "name": "lambda_opa_mask",
+          "type": "FLOAT",
+          "widget": {
+            "name": "lambda_opa_mask"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_window_frames",
+          "name": "max_window_frames",
+          "type": "INT",
+          "widget": {
+            "name": "max_window_frames"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_parallel_windows",
+          "name": "max_parallel_windows",
+          "type": "INT",
+          "widget": {
+            "name": "max_parallel_windows"
+          },
+          "link": null
+        },
+        {
           "localized_name": "min_free_vram_gb",
           "name": "min_free_vram_gb",
           "type": "FLOAT",
@@ -1560,19 +1594,11 @@
       ],
       "outputs": [
         {
-          "localized_name": "checkpoint",
-          "name": "checkpoint",
-          "type": "STRING",
+          "localized_name": "model",
+          "name": "model",
+          "type": "CUMULI_MODEL",
           "links": [
-            33
-          ]
-        },
-        {
-          "localized_name": "duration_seconds",
-          "name": "duration_seconds",
-          "type": "FLOAT",
-          "links": [
-            34
+            48
           ]
         },
         {
@@ -1602,6 +1628,10 @@
         25000,
         3000000,
         100,
+        "auto",
+        0.005,
+        31,
+        1,
         -1,
         false,
         ""
@@ -1616,6 +1646,10 @@
         "densify_until_iter": 25000,
         "densify_until_num_points": 3000000,
         "t_init_div": 100,
+        "background": "auto",
+        "lambda_opa_mask": 0.005,
+        "max_window_frames": 31,
+        "max_parallel_windows": 1,
         "min_free_vram_gb": -1,
         "dry_run": false,
         "out_dir": ""
@@ -1637,29 +1671,17 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "checkpoint",
-          "name": "checkpoint",
-          "type": "STRING",
-          "widget": {
-            "name": "checkpoint"
-          },
-          "link": 33
+          "localized_name": "model",
+          "name": "model",
+          "type": "CUMULI_MODEL",
+          "link": 48
         },
         {
-          "localized_name": "duration_seconds",
-          "name": "duration_seconds",
-          "type": "FLOAT",
+          "localized_name": "mask_filter",
+          "name": "mask_filter",
+          "type": "BOOLEAN",
           "widget": {
-            "name": "duration_seconds"
-          },
-          "link": 34
-        },
-        {
-          "localized_name": "fps",
-          "name": "fps",
-          "type": "FLOAT",
-          "widget": {
-            "name": "fps"
+            "name": "mask_filter"
           },
           "link": null
         },
@@ -1709,6 +1731,34 @@
           "link": null
         },
         {
+          "localized_name": "merge_mode",
+          "name": "merge_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "merge_mode"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "merge_fade_seconds",
+          "name": "merge_fade_seconds",
+          "type": "FLOAT",
+          "widget": {
+            "name": "merge_fade_seconds"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "windows",
+          "name": "windows",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "windows"
+          },
+          "link": null
+        },
+        {
           "localized_name": "filename_prefix",
           "name": "filename_prefix",
           "shape": 7,
@@ -1717,16 +1767,6 @@
             "name": "filename_prefix"
           },
           "link": null
-        },
-        {
-          "localized_name": "mask_filter_root",
-          "name": "mask_filter_root",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "mask_filter_root"
-          },
-          "link": 35
         }
       ],
       "outputs": [
@@ -1764,28 +1804,28 @@
         }
       },
       "widgets_values": [
-        "",
-        0,
-        24,
+        true,
         3,
         false,
         65536,
         0.1,
         true,
-        "cumuli/splat_4d",
-        ""
+        "fade",
+        0.35,
+        "",
+        "cumuli/splat_4d"
       ],
       "widgets_values_named": {
-        "checkpoint": "",
-        "duration_seconds": 0,
-        "fps": 24,
+        "mask_filter": true,
         "sh_clamp": 3,
         "filter_corrupted": false,
         "shn_count": 65536,
         "segment_duration": 0.1,
         "emit_ply": true,
-        "filename_prefix": "cumuli/splat_4d",
-        "mask_filter_root": ""
+        "merge_mode": "fade",
+        "merge_fade_seconds": 0.35,
+        "windows": "",
+        "filename_prefix": "cumuli/splat_4d"
       }
     },
     {
@@ -1835,7 +1875,7 @@
           "links": null
         }
       ],
-      "title": "ALT · Load 4DGS Dataset  (unmute = use loaded)",
+      "title": "ALT \u00b7 Load 4DGS Dataset  (unmute = use loaded)",
       "properties": {
         "Node name for S&R": "CumuliLoadDataset",
         "ue_properties": {
@@ -1905,7 +1945,7 @@
           "links": null
         }
       ],
-      "title": "ALT · Load Flipbook  (unmute = use loaded)",
+      "title": "ALT \u00b7 Load Flipbook  (unmute = use loaded)",
       "properties": {
         "Node name for S&R": "CumuliLoadFlipbook",
         "ue_properties": {
@@ -1984,7 +2024,7 @@
           ]
         }
       ],
-      "title": "flipbook source  (loaded ▸ generated)",
+      "title": "flipbook source  (loaded \u25b8 generated)",
       "properties": {
         "Node name for S&R": "Any Switch (rgthree)",
         "ue_properties": {
@@ -2051,7 +2091,7 @@
           ]
         }
       ],
-      "title": "dataset source  (loaded ▸ built)",
+      "title": "dataset source  (loaded \u25b8 built)",
       "properties": {
         "Node name for S&R": "Any Switch (rgthree)",
         "ue_properties": {
@@ -2105,7 +2145,7 @@
           ]
         }
       ],
-      "title": "ALT · Load Diffusion Model (4DAnyone DiT)",
+      "title": "ALT \u00b7 Load Diffusion Model (4DAnyone DiT)",
       "properties": {
         "Node name for S&R": "UNETLoader",
         "ue_properties": {
@@ -2173,7 +2213,7 @@
           ]
         }
       ],
-      "title": "ALT · identity LoRA (unmute BOTH + set prompt trigger)",
+      "title": "ALT \u00b7 identity LoRA (unmute BOTH + set prompt trigger)",
       "properties": {
         "Node name for S&R": "LoraLoaderModelOnly",
         "ue_properties": {
@@ -2276,33 +2316,9 @@
     [
       31,
       24,
-      2,
+      1,
       16,
       0,
-      "STRING"
-    ],
-    [
-      33,
-      24,
-      0,
-      25,
-      0,
-      "STRING"
-    ],
-    [
-      34,
-      24,
-      1,
-      25,
-      1,
-      "FLOAT"
-    ],
-    [
-      35,
-      23,
-      0,
-      25,
-      9,
       "STRING"
     ],
     [
@@ -2392,6 +2408,14 @@
       20,
       1,
       "MODEL"
+    ],
+    [
+      48,
+      24,
+      0,
+      25,
+      0,
+      "CUMULI_MODEL"
     ]
   ],
   "groups": [
