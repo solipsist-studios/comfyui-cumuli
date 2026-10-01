@@ -654,7 +654,7 @@ def test_training_needs_a_built_dataset(tmp_path):
 # --------------------------------------------------------------------------
 # the 4D evaluation, whose three traps all fail silently
 # --------------------------------------------------------------------------
-def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False, sh: bool = False,
+def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False, sh: bool | int = False,
                            comments: dict | None = None) -> Path:
     import numpy as np
 
@@ -662,7 +662,7 @@ def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False,
 
     names = list(BASE_COLUMNS)
     if sh:
-        names += [f"f_rest_{i}" for i in range(45)]
+        names += [f"f_rest_{i}" for i in range(45 if sh is True else sh)]
     if accel:
         names += list(ACCEL_COLUMNS)
     header = "ply\nformat binary_little_endian 1.0\n"
@@ -751,6 +751,25 @@ def test_scales_are_delogged_and_sh_is_channel_major(tmp_path):
     assert sh[0, 1, 0] == pytest.approx(0.0)
     assert sh[0, 1, 1] == pytest.approx(15.0)
     assert sh[0, 1, 2] == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize("width, degree", [(9, 1), (24, 2), (45, 3)])
+def test_every_format_sh_width_loads(tmp_path, width, degree):
+    from cumuli_bridge.sogst import load_interchange_ply
+
+    rest = {f"f_rest_{i}": float(i) for i in range(width)}
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row(**rest)], sh=width)
+    asset = load_interchange_ply(path)
+    assert asset.sh_degree == degree
+    assert asset.sh_at().shape == (1, (degree + 1) ** 2, 3)
+
+
+def test_an_off_format_sh_width_is_refused(tmp_path):
+    from cumuli_bridge.sogst import SogstError, load_interchange_ply
+
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row()], sh=12)
+    with pytest.raises(SogstError, match="9, 24 or 45"):
+        load_interchange_ply(path)
 
 
 def test_a_plain_3dgs_ply_is_refused_with_a_useful_message(tmp_path):
