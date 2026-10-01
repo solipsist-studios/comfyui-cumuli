@@ -66,8 +66,9 @@ COMMENT_PREFIX = "sogst."
 SIDECAR_SUFFIX = ".sogst.json"
 REQUIRED_SCALARS = ("time_min", "time_max", "fps")
 
-#: SH degree 3 is 15 higher-order coefficients per channel.
-_F_REST_COUNT = 45
+#: ``f_rest_*`` widths the format allows, mapped to the SH degree they carry:
+#: 3 channels x (1, 2 or 3 bands) = 3 x (3, 8 or 15) coefficients.
+_F_REST_DEGREES = {9: 1, 24: 2, 45: 3}
 
 
 class SogstError(RuntimeError):
@@ -87,7 +88,7 @@ class Sogst4D:
     t_center: np.ndarray  # (N,) seconds
     t_sigma: np.ndarray  # (N,) seconds, standard deviation
     f_dc: np.ndarray  # (N, 3)
-    f_rest: np.ndarray | None  # (N, 45) channel-major
+    f_rest: np.ndarray | None  # (N, 9|24|45) channel-major
     time_min: float
     time_max: float
     fps: float
@@ -103,7 +104,7 @@ class Sogst4D:
 
     @property
     def sh_degree(self) -> int:
-        return 3 if self.f_rest is not None else 0
+        return _F_REST_DEGREES[self.f_rest.shape[1]] if self.f_rest is not None else 0
 
     @property
     def duration(self) -> float:
@@ -211,8 +212,10 @@ def load_interchange_ply(path: str | Path) -> Sogst4D:
         (name for name in columns if name.startswith("f_rest_")),
         key=lambda name: int(name.rsplit("_", 1)[1]),
     )
-    if rest_names and len(rest_names) != _F_REST_COUNT:
-        raise SogstError(f"{path}: {len(rest_names)} of {_F_REST_COUNT} f_rest_* columns; all or none.")
+    if rest_names and len(rest_names) not in _F_REST_DEGREES:
+        raise SogstError(
+            f"{path}: {len(rest_names)} f_rest_* columns; expected 9, 24 or 45 (SH degree 1, 2 or 3)."
+        )
 
     # The sidecar wins over the comments when both carry a key.
     sidecar_path = path.with_name(path.stem + SIDECAR_SUFFIX)
