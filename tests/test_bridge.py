@@ -764,6 +764,19 @@ def test_every_format_sh_width_loads(tmp_path, width, degree):
     assert asset.sh_at().shape == (1, (degree + 1) ** 2, 3)
 
 
+def test_a_ply_with_no_f_rest_is_degree_zero(tmp_path):
+    import numpy as np
+
+    from cumuli_bridge.sogst import load_interchange_ply
+
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row(f_dc_0=1.0, f_dc_1=2.0, f_dc_2=3.0)])
+    asset = load_interchange_ply(path)
+    assert asset.f_rest is None and asset.sh_degree == 0
+    sh = asset.sh_at()
+    assert sh.shape == (1, 1, 3)
+    assert np.allclose(sh[0, 0], [1.0, 2.0, 3.0])
+
+
 def test_an_off_format_sh_width_is_refused(tmp_path):
     from cumuli_bridge.sogst import SogstError, load_interchange_ply
 
