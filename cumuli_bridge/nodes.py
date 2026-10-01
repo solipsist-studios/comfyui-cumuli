@@ -1526,9 +1526,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 IO.Int.Input("iterations", default=30000, min=100, max=200000, step=100),
                 IO.Int.Input("num_pts", default=100000, min=1000, max=2000000, step=1000),
                 IO.Int.Input("batch_size", default=2, min=1, max=16, step=1),
-                IO.Combo.Input("sh_degree", options=["3", "2", "1"], default="2",
+                IO.Combo.Input("sh_degree", options=["3", "2", "1", "0"], default="2",
                                tooltip="Spherical-harmonic degree. 2 measured better than 3 on "
-                                       "subject captures (30.87 vs 30.04 dB)."),
+                                       "subject captures (30.87 vs 30.04 dB). 0 is view-independent "
+                                       "colour only, and bakes to a much smaller .sogst."),
                 IO.Int.Input("densify_until_iter", default=25000, min=100, max=200000, step=100,
                              advanced=True),
                 IO.Int.Input("densify_until_num_points", default=3000000, min=10000, max=20000000,
