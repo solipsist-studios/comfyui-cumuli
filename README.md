@@ -367,7 +367,8 @@ factor of ½.
 - **`sh_degree`** on Train 4DGS: content-dependent. 2 measured better on one
   real subject capture (30.87 vs 30.04 dB); 3 measured better on a generated
   ring (23.2 vs 21.0 dB held-out). When in doubt, try both — the runs are an
-  hour each and the fingerprint cache keeps whichever you keep.
+  hour each and the fingerprint cache keeps whichever you keep. 0 trains view-independent colour only (no
+  `f_rest` columns), for the smallest bake.
 - **`mask_filter`** on Bake SOGST (on by default) runs the lifetime
   mask-consistency filter against each window's own dataset, which drops
   silhouette-escaping splats. It is junk removal, not a quality regulariser.
