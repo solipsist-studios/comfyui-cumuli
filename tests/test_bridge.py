@@ -211,7 +211,7 @@ def test_subprocess_env_drops_comfyui_python_paths(settings, monkeypatch):
         ({"views_per_layer": 10, "views_per_group": "4"}, "divisible"),
         ({"layer_pitches": "60"}, "between -15 and 45"),
         ({"layer_pitches": "15,15"}, "must not repeat"),
-        ({"layer_pitches": ""}, "at least one pitch"),
+        ({"layer_pitches": ""}, "at least one elevation"),
         ({"yaw_span": 0}, "between 1 and 360"),
         ({"seed": -1}, "non-negative"),
         ({"start_time": -2.0}, "non-negative"),
@@ -751,6 +751,44 @@ def test_scales_are_delogged_and_sh_is_channel_major(tmp_path):
     assert sh[0, 1, 0] == pytest.approx(0.0)
     assert sh[0, 1, 1] == pytest.approx(15.0)
     assert sh[0, 1, 2] == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs, per_row, pitches",
+    [
+        ({}, 24, (15,)),
+        ({"views_per_row": 12}, 12, (15,)),
+        ({"total_views": 48}, 48, (15,)),
+        ({"elevation_rows": 3}, 24, (15, 30, 45)),
+        ({"total_views": 72, "elevation_rows": 3}, 24, (15, 30, 45)),
+        ({"total_views": 72, "views_per_row": 24}, 24, (15, 30, 45)),
+        ({"elevation_rows": 3, "views_per_row": 12, "start_elevation": -10, "end_elevation": 35}, 12, (-10, 12, 35)),
+        ({"total_views": 72, "elevation_rows": 3, "views_per_row": 24}, 24, (15, 30, 45)),
+        ({"pitch_list": "-10,15,35", "views_per_row": 8}, 8, (-10, 15, 35)),
+        ({"pitch_list": "15", "views_per_row": 24}, 24, (15,)),
+    ],
+)
+def test_ring_layout_deduces_the_missing_count(kwargs, per_row, pitches):
+    layout = runner.resolve_ring_layout(**kwargs)
+    assert (layout.views_per_row, layout.pitches) == (per_row, pitches)
+    assert layout.total_views == per_row * len(pitches)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"total_views": 50, "elevation_rows": 3}, "does not split into 3 equal rows"),
+        ({"total_views": 50, "views_per_row": 24}, "whole number of rows"),
+        ({"total_views": 70, "elevation_rows": 3, "views_per_row": 24}, "is not elevation_rows"),
+        ({"elevation_rows": 2, "pitch_list": "15,30,45"}, "names 3 pitches"),
+        ({"elevation_rows": 3, "start_elevation": 15, "end_elevation": 15}, "must not repeat"),
+        ({"elevation_rows": 2, "start_elevation": -20, "end_elevation": 15}, "between -15 and 45"),
+        ({"views_per_row": -1}, "cannot be negative"),
+    ],
+)
+def test_ring_layout_refuses_an_inconsistent_description(kwargs, message):
+    with pytest.raises(runner.ValidationError, match=message):
+        runner.resolve_ring_layout(**kwargs)
 
 
 @pytest.mark.parametrize("width, degree", [(9, 1), (24, 2), (45, 3)])

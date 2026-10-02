@@ -93,20 +93,122 @@ def parse_layer_pitches(value: str | Sequence[int]) -> tuple[int, ...]:
     else:
         cleaned = value.strip().strip("[]()")
         if not cleaned:
-            raise ValidationError("layer_pitches must list at least one pitch in degrees, for example 15.")
+            raise ValidationError("pitch_list must list at least one elevation in degrees, for example 15.")
         parts = [part.strip() for part in cleaned.replace(";", ",").split(",") if part.strip()]
         try:
             pitches = tuple(int(part) for part in parts)
         except ValueError:
-            raise ValidationError(f"layer_pitches must be whole degrees, got {value!r}.") from None
+            raise ValidationError(f"pitch_list must be whole degrees, got {value!r}.") from None
     if not pitches:
-        raise ValidationError("layer_pitches must list at least one pitch in degrees, for example 15.")
+        raise ValidationError("pitch_list must list at least one elevation in degrees, for example 15.")
     if len(set(pitches)) != len(pitches):
-        raise ValidationError(f"layer_pitches must not repeat a pitch, got {list(pitches)}.")
+        raise ValidationError(f"Elevations must not repeat, got {list(pitches)}.")
     bad = [pitch for pitch in pitches if not MIN_PITCH <= pitch <= MAX_PITCH]
     if bad:
-        raise ValidationError(f"Each layer pitch must be between {MIN_PITCH} and {MAX_PITCH} degrees, got {bad}.")
+        raise ValidationError(f"Each elevation must be between {MIN_PITCH} and {MAX_PITCH} degrees, got {bad}.")
     return pitches
+
+
+DEFAULT_VIEWS_PER_ROW = 24
+
+
+@dataclass(frozen=True)
+class RingLayout:
+    """A ring as 4DAnyone takes it: yaw views per layer and one pitch per layer."""
+
+    views_per_row: int
+    pitches: tuple[int, ...]
+
+    @property
+    def rows(self) -> int:
+        return len(self.pitches)
+
+    @property
+    def total_views(self) -> int:
+        return self.views_per_row * self.rows
+
+
+def resolve_ring_layout(
+    *,
+    total_views: int = 0,
+    elevation_rows: int = 0,
+    views_per_row: int = 0,
+    start_elevation: int = 15,
+    end_elevation: int = 45,
+    pitch_list: str | Sequence[int] = "",
+) -> RingLayout:
+    """Turn the node's ring description into 4DAnyone's ``views_per_layer`` and
+    ``layer_pitches``.
+
+    ``total_views``, ``elevation_rows`` and ``views_per_row`` are related by
+    ``total = rows x per_row``; 0 means "not set", and any two of them give the
+    third. Setting all three is allowed when they agree. One alone is completed
+    with the obvious default (a single row; 24 views per row), and none at all
+    is the stock 24-view single-row ring.
+
+    Rows are spaced evenly from ``start_elevation`` to ``end_elevation`` (a
+    single row sits at ``start_elevation``). A non-empty ``pitch_list``
+    overrides that spacing and fixes the row count itself.
+    """
+
+    total, rows, per_row = int(total_views), int(elevation_rows), int(views_per_row)
+    if min(total, rows, per_row) < 0:
+        raise ValidationError("total_views, elevation_rows and views_per_row cannot be negative; use 0 to leave one unset.")
+
+    explicit = None
+    if not isinstance(pitch_list, str) or pitch_list.strip():
+        explicit = parse_layer_pitches(pitch_list)
+        if rows and rows != len(explicit):
+            raise ValidationError(
+                f"elevation_rows is {rows} but pitch_list names {len(explicit)} pitches {list(explicit)}. "
+                "Clear one of them."
+            )
+        rows = len(explicit)
+
+    if total and rows and per_row:
+        if total != rows * per_row:
+            raise ValidationError(
+                f"total_views ({total}) is not elevation_rows ({rows}) x views_per_row ({per_row}) = {rows * per_row}. "
+                "Set any two and leave the third at 0 to have it worked out."
+            )
+    elif total and rows:
+        if total % rows:
+            raise ValidationError(
+                f"total_views ({total}) does not split into {rows} equal rows. "
+                f"Try {total // rows * rows} or {(total // rows + 1) * rows}."
+            )
+        per_row = total // rows
+    elif total and per_row:
+        if total % per_row:
+            raise ValidationError(
+                f"total_views ({total}) is not a whole number of rows of {per_row} views. "
+                f"Try {total // per_row * per_row} or {(total // per_row + 1) * per_row}."
+            )
+        rows = total // per_row
+    elif total:
+        rows, per_row = 1, total
+    elif rows or per_row:
+        rows = rows or 1
+        per_row = per_row or DEFAULT_VIEWS_PER_ROW
+    else:
+        rows, per_row = 1, DEFAULT_VIEWS_PER_ROW
+
+    if explicit is not None:
+        return RingLayout(per_row, explicit)
+
+    start, end = int(start_elevation), int(end_elevation)
+    if rows == 1:
+        spaced = (start,)
+    else:
+        spaced = tuple(round(start + i * (end - start) / (rows - 1)) for i in range(rows))
+    try:
+        pitches = parse_layer_pitches(spaced)
+    except ValidationError as exc:
+        raise ValidationError(
+            f"{exc} (from {rows} rows spaced evenly from start_elevation {start} to end_elevation {end}; "
+            "each whole-degree elevation must be distinct)"
+        ) from None
+    return RingLayout(per_row, pitches)
 
 
 def resolve_views_per_group(value: str | int, views_per_layer: int) -> int | str:
@@ -115,7 +217,7 @@ def resolve_views_per_group(value: str | int, views_per_layer: int) -> int | str
     if isinstance(value, str) and value.strip().lower() == "auto":
         divisors = [size for size in VALID_VIEWS_PER_GROUP if views_per_layer % size == 0]
         if not divisors:
-            raise ValidationError(f"views_per_layer ({views_per_layer}) must be divisible by 4 or 6.")
+            raise ValidationError(f"views_per_row ({views_per_layer}) must be divisible by 4 or 6.")
         return "auto"
     try:
         size = int(value)
@@ -124,7 +226,7 @@ def resolve_views_per_group(value: str | int, views_per_layer: int) -> int | str
     if size not in VALID_VIEWS_PER_GROUP:
         raise ValidationError(f"views_per_group must be 'auto', 4 or 6, got {value!r}.")
     if views_per_layer % size:
-        raise ValidationError(f"views_per_layer ({views_per_layer}) must be divisible by views_per_group ({size}).")
+        raise ValidationError(f"views_per_row ({views_per_layer}) must be divisible by views_per_group ({size}).")
     return size
 
 
@@ -309,7 +411,7 @@ def build_request(
 
     views_per_layer = int(views_per_layer)
     if views_per_layer <= 0:
-        raise ValidationError(f"views_per_layer must be positive, got {views_per_layer}.")
+        raise ValidationError(f"views_per_row must be positive, got {views_per_layer}.")
     pitches = parse_layer_pitches(layer_pitches)
     group = resolve_views_per_group(views_per_group, views_per_layer)
     yaw_span = int(yaw_span)
