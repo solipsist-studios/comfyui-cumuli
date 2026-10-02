@@ -297,16 +297,20 @@ class CumuliGenerateRing(IO.ComfyNode):
                     ),
                     optional=True,
                 ),
-                IO.Int.Input("views_per_layer", default=24, min=4, max=96, step=1,
-                             tooltip="Evenly spaced yaw views per pitch layer. Must divide by 4 or 6."),
+                IO.Int.Input("views_per_row", default=0, min=0, max=96, step=1,
+                             tooltip="Evenly spaced azimuth (yaw) views in each elevation row. Must divide by "
+                                     "4 or 6. 0 = work it out from total_views and elevation_rows "
+                                     "(24 if neither is set)."),
                 IO.Combo.Input("views_per_group", options=["4", "6", "auto"], default="4",
                                tooltip="Target views denoised together. 6 overruns 32 GB; 4 is the safe value."),
-                IO.String.Input("layer_pitches", default="15",
-                                tooltip="Camera pitch per layer in degrees, comma separated, each between -15 and 45."),
+                IO.String.Input("pitch_list", default="", advanced=True,
+                                tooltip="Advanced: an explicit elevation per row in degrees, comma separated "
+                                        "(for example -10,15,35), each between -15 and 45. Overrides "
+                                        "start_elevation/end_elevation and fixes the number of rows."),
                 IO.Int.Input("start_yaw", default=0, min=-180, max=180, step=1,
-                             tooltip="First yaw in every layer. 0 faces the person."),
+                             tooltip="First yaw in every row. 0 faces the person."),
                 IO.Int.Input("yaw_span", default=360, min=1, max=360, step=1,
-                             tooltip="Angular range each layer sweeps. The end angle is excluded."),
+                             tooltip="Angular range each row sweeps. The end angle is excluded."),
                 IO.Boolean.Input("enable_rcp", default=True,
                                  tooltip="Reference-view proposals: anchors at yaw 60/135/210/285 that every "
                                          "dense group is then conditioned on. Without it the far side of the "
@@ -341,6 +345,20 @@ class CumuliGenerateRing(IO.ComfyNode):
                                          "settings were measured against. Part of the ring "
                                          "fingerprint, so switching regenerates.",
                                  advanced=True),
+                IO.Int.Input("total_views", default=0, min=0, max=384, step=1,
+                             tooltip="Total views in the ring = elevation_rows x views_per_row. Set any two of "
+                                     "total_views, elevation_rows and views_per_row and the third is worked "
+                                     "out; 0 leaves one unset. With none set the ring is 1 row of 24."),
+                IO.Int.Input("elevation_rows", default=0, min=0, max=16, step=1,
+                             tooltip="Number of elevation rows (camera heights). They are spaced evenly from "
+                                     "start_elevation to end_elevation. 0 = work it out (1 if nothing else "
+                                     "is set)."),
+                IO.Int.Input("start_elevation", default=15, min=-15, max=45, step=1,
+                             tooltip="Elevation of the first row in degrees above the subject (-15 to 45). "
+                                     "A single row sits here."),
+                IO.Int.Input("end_elevation", default=45, min=-15, max=45, step=1,
+                             tooltip="Elevation of the last row in degrees. Ignored with one row; rows in "
+                                     "between are spaced evenly, rounded to whole degrees."),
             ],
             outputs=[
                 Ring.Output(display_name="ring"),
@@ -356,9 +374,9 @@ class CumuliGenerateRing(IO.ComfyNode):
         video,
         model=None,
         run_name="",
-        views_per_layer=24,
+        views_per_row=0,
         views_per_group="4",
-        layer_pitches="15",
+        pitch_list="",
         start_yaw=0,
         yaw_span=360,
         enable_rcp=True,
@@ -371,17 +389,29 @@ class CumuliGenerateRing(IO.ComfyNode):
         min_free_vram_gb=-1.0,
         dry_run=False,
         enable_turbo=True,
+        total_views=0,
+        elevation_rows=0,
+        start_elevation=15,
+        end_elevation=45,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         try:
             settings = load_settings()
             settings.validate()
+            layout = runner.resolve_ring_layout(
+                total_views=total_views,
+                elevation_rows=elevation_rows,
+                views_per_row=views_per_row,
+                start_elevation=start_elevation,
+                end_elevation=end_elevation,
+                pitch_list=pitch_list,
+            )
             source = runner.materialize_video_source(video, run_name, settings.source_root)
             staged = runner.stage_source_video(settings, source, run_name)
             request = runner.build_request(
                 video_path=staged,
-                views_per_layer=views_per_layer,
-                layer_pitches=layer_pitches,
+                views_per_layer=layout.views_per_row,
+                layer_pitches=layout.pitches,
                 start_yaw=start_yaw,
                 yaw_span=yaw_span,
                 views_per_group=views_per_group,
@@ -429,8 +459,9 @@ class CumuliGenerateRing(IO.ComfyNode):
             f"@ {float(requirements.probe.fps):.3f} fps, {requirements.probe.num_frames} frames",
             f"clip: {requirements.num_frames} frames @ {float(requirements.canonical_fps):.3f} fps "
             f"from {request.start_time:.2f}s",
-            f"views: {request.num_target_views} ({request.views_per_layer} per layer x "
-            f"{len(request.layer_pitches)} layer(s), group {request.views_per_group}, rcp={request.enable_rcp})",
+            f"views: {request.num_target_views} ({len(request.layer_pitches)} row(s) x "
+            f"{request.views_per_layer} per row, elevations {list(request.layer_pitches)} deg, "
+            f"group {request.views_per_group}, rcp={request.enable_rcp})",
             f"result_dir: {result_dir}",
             f"gvhmr motion cache: {'reused' if cached_motion else 'will be solved'} "
             f"({settings.motion_dir(request.run_name)})",
