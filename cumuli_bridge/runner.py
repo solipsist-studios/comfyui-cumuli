@@ -197,6 +197,39 @@ def resolve_ring_layout(
     return RingLayout(per_row, pitches)
 
 
+def start_time_for_frame(start_frame: int, fps: Fraction) -> float:
+    """Where a source-video frame is on the input timeline, in seconds.
+
+    The node asks for a frame number (what a video loader shows) and 4DAnyone is given a time, so
+    the conversion lives here. Done in exact fractions so a rate like 30000/1001 does not pick up
+    float noise before it is rounded once, at the end.
+    """
+
+    frame = int(start_frame)
+    if frame < 0:
+        raise ValidationError(f"start_frame must be 0 or more, got {start_frame}.")
+    if fps <= 0:
+        raise ValidationError(f"The input video reports a frame rate of {fps}, so a start frame cannot be placed in time.")
+    return float(Fraction(frame) / Fraction(fps))
+
+
+def fps_from_setting(value: float) -> str:
+    """The node's ``target_fps`` number as 4DAnyone takes it: 0 keeps the source's own rate
+    (``"auto"``); anything else is that rate."""
+
+    rate = float(value)
+    if rate < 0:
+        raise ValidationError(f"target_fps must be 0 (keep the source rate) or positive, got {value}.")
+    return "auto" if rate == 0 else format(rate, ".6g")
+
+
+def vram_floor(widget_value: float, settings: BridgeSettings) -> float:
+    """The free-VRAM floor a stage must clear. 0 on the node means "use the bridge config value",
+    like every other 0-means-unset widget; set that config value to 0 to skip the check."""
+
+    return settings.min_free_vram_gb if float(widget_value) <= 0 else float(widget_value)
+
+
 def check_view_count(views_per_row: int, rows: int) -> None:
     """4DAnyone denoises views in fixed groups of six, so the *total* ring must
     split into whole groups (``fdanyone.views`` enforces the same rule)."""

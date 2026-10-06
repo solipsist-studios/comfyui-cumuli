@@ -120,6 +120,104 @@ def test_argv_is_the_known_good_command_line(settings, tmp_path):
     assert flags["--enable_turbo"] == "False"
 
 
+@pytest.mark.parametrize("frame, fps, seconds", [
+    (0, Fraction(24), 0.0),
+    (48, Fraction(24), 2.0),
+    (30, Fraction(30000, 1001), 1.001),      # NTSC: exact fractions, no float noise before the one rounding
+    (7, Fraction(25), 0.28),
+])
+def test_a_start_frame_becomes_a_time_on_the_input_timeline(frame, fps, seconds):
+    assert runner.start_time_for_frame(frame, fps) == pytest.approx(seconds, abs=1e-9)
+
+
+def test_a_start_frame_survives_the_trip_to_a_time_and_back():
+    """check_video asks the probe how many frames remain after the start *time*; it must land on the
+    frame the user typed, including at an NTSC rate."""
+
+    from cumuli_bridge.videoio import VideoProbe
+
+    for fps in (Fraction(24), Fraction(30000, 1001), Fraction(25)):
+        probe = VideoProbe(path=Path("x.mp4"), width=1280, height=720, fps=fps, num_frames=500, duration=20.0,
+                           frames_are_exact=True)
+        for frame in (0, 1, 37, 240, 499):
+            assert probe.frames_from(runner.start_time_for_frame(frame, fps)) == 500 - frame
+
+
+def test_a_bad_start_frame_or_frame_rate_is_refused():
+    with pytest.raises(runner.ValidationError, match="0 or more"):
+        runner.start_time_for_frame(-1, Fraction(24))
+    with pytest.raises(runner.ValidationError, match="frame rate"):
+        runner.start_time_for_frame(5, Fraction(0))
+
+
+@pytest.mark.parametrize("value, expected", [(0, "auto"), (0.0, "auto"), (24, "24"), (23.976, "23.976"), (29.97, "29.97"),
+                                             (12.5, "12.5"), (60.0, "60")])
+def test_target_fps_is_a_number_where_zero_keeps_the_source_rate(value, expected, tmp_path):
+    assert runner.fps_from_setting(value) == expected
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360, enable_rcp=False,
+        enable_tcr=True, start_time=0.0, target_fps=runner.fps_from_setting(value), seed=0, device="cuda:0",
+    )
+    assert request.target_fps == expected
+
+
+def test_a_negative_target_fps_is_refused():
+    with pytest.raises(runner.ValidationError, match="0 .keep the source rate."):
+        runner.fps_from_setting(-1)
+
+
+def test_the_vram_floor_uses_the_config_at_zero_like_every_other_widget(settings):
+    assert settings.min_free_vram_gb == 30.0
+    assert runner.vram_floor(0, settings) == 30.0           # unset -> the bridge config
+    assert runner.vram_floor(0.0, settings) == 30.0
+    assert runner.vram_floor(12.5, settings) == 12.5        # an explicit floor wins
+    import dataclasses
+
+    off = dataclasses.replace(settings, min_free_vram_gb=0.0)
+    assert runner.vram_floor(0, off) == 0.0                 # the way to skip the check is the config, not the widget
+
+
+def test_a_machine_with_no_gpu_stops_before_any_work(monkeypatch):
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(vram.NoCudaDevice, match="No CUDA device is available.*Load Ring"):
+        vram.check_device("cuda:0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)          # a driver that reports none
+    with pytest.raises(vram.NoCudaDevice, match="No CUDA device"):
+        vram.check_device("cuda")
+
+
+def test_the_vram_check_alone_lets_a_gpu_less_machine_through(monkeypatch):
+    """The reason check_device exists: an unknown card size reads as "nothing to check", so without
+    it the run reaches the pose stage and fails there."""
+
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert vram.require_free_vram("cuda:0", 30.0) == (0.0, 0.0)
+
+
+def test_a_device_that_does_not_exist_is_named_with_the_ones_that_do(monkeypatch):
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    for fine in ("cuda", "cuda:0", "cuda:1", "cuda:abc"):               # all visible, either card, or a name the parser reports
+        vram.check_device(fine)
+    with pytest.raises(vram.NoCudaDevice, match=r"cuda:2 does not exist.*2 CUDA device.*cuda:0 to cuda:1"):
+        vram.check_device("cuda:2")
+
+
 def test_turbo_is_off_by_default_everywhere_it_is_declared(tmp_path):
     import inspect
 

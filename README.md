@@ -48,7 +48,7 @@ new enough to target it.
 ### About your clip
 
 Exactly **121 frames** are used by 4DAnyone, so at least that many frames after 
-`start_time` (~5 s at 24 fps) at 720p are required. Generate Ring checks this up 
+`start_frame` (~5 s at 24 fps) at 720p are required. Generate Ring checks this up 
 front rather than failing an hour in.
 
 ### What to expect
@@ -390,7 +390,7 @@ factor of ½.
   4DAnyone release (group 4 + sdpa: ~28.6 GiB peak on a 32 GB card; group 6
   did not fit) predate its memory work and are not yet re-measured.*
 - **Input length.** 4DAnyone always generates exactly 121 frames. The clip must
-  supply that many after `start_time` — about 5 s at 24 fps — at 720p or better.
+  supply that many after `start_frame` — about 5 s at 24 fps — at 720p or better.
   The node checks this and says what is missing rather than failing an hour in.
 - **`test_cameras`** on Build 4DGS Dataset. Left empty, the dataset duplicates a
   training camera into the test split, so that PSNR is a training-view monitor
