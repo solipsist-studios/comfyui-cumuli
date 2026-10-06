@@ -485,6 +485,15 @@ def test_the_pose_batch_halves_on_out_of_memory_until_it_fits():
     assert (result, used) == ("done at 2", 2) and attempts == [16, 8, 4, 2] and len(released) == 3
 
 
+def test_the_pose_model_runs_with_autograd_off_whoever_calls_it():
+    import torch
+
+    from cumuli_bridge import pose
+
+    assert torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+    assert pose._under_inference_mode(lambda: torch.is_inference_mode_enabled())() is True
+
+
 def test_the_pose_backoff_stops_at_one_and_never_retries_other_errors():
     from cumuli_bridge import pose
 
