@@ -508,7 +508,7 @@ class CumuliGenerateRing(IO.ComfyNode):
 
         def estimate(clip: Path, npz: Path) -> None:
             _send_text(node_id, "estimating body pose (SAM 3D Body)")
-            pose_module.estimate_pose(clip, npz, weights=weights)
+            pose_module.estimate_pose(clip, npz, weights=weights, batch_size=settings.sam3d_batch_size)
 
         _send_text(node_id, "preparing the clip")
         try:
