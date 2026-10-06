@@ -220,6 +220,66 @@ def test_the_4danyone_pin_is_a_full_commit_hash():
     assert install._is_commit_hash(ref)
 
 
+def _pip_calls(monkeypatch, installed: dict[str, str]):
+    calls = []
+    monkeypatch.setattr(install, "installed_version", lambda dist: installed.get(dist))
+    monkeypatch.setattr(install, "_run", lambda argv, **kwargs: calls.append(list(argv)))
+    return calls
+
+
+def test_the_viewer_group_is_opt_in_and_pinned_to_the_bundled_viewer():
+    from cumuli_bridge import viewer_assets
+
+    group = install.build_groups("13")["viewer"]
+    assert group.optional and group.exact
+    assert group.requirements == [(f"rerun-sdk=={viewer_assets.VIEWER_VERSION}", "rerun-sdk")]
+    assert not any(other.optional for name, other in install.build_groups("13").items() if name != "viewer")
+
+
+def test_a_mismatched_rerun_sdk_is_changed_with_a_warning(monkeypatch, caplog):
+    from cumuli_bridge import viewer_assets
+
+    calls = _pip_calls(monkeypatch, {"rerun-sdk": "0.38.1"})
+    group = install.build_groups("13")["viewer"]
+    with caplog.at_level("WARNING", logger="cumuli-install"):
+        install.install_requirements(group, force=False, dry_run=False)
+    assert [call[-1] for call in calls] == [f"rerun-sdk=={viewer_assets.VIEWER_VERSION}"]
+    assert f"changing rerun-sdk 0.38.1 -> {viewer_assets.VIEWER_VERSION}" in caplog.text
+
+
+def test_a_matching_or_absent_rerun_sdk_needs_no_change_or_just_an_install(monkeypatch, caplog):
+    from cumuli_bridge import viewer_assets
+
+    group = install.build_groups("13")["viewer"]
+    calls = _pip_calls(monkeypatch, {"rerun-sdk": viewer_assets.VIEWER_VERSION})
+    install.install_requirements(group, force=False, dry_run=False)
+    assert calls == []
+    calls = _pip_calls(monkeypatch, {})
+    with caplog.at_level("WARNING", logger="cumuli-install"):
+        install.install_requirements(group, force=False, dry_run=False)
+    assert len(calls) == 1 and "changing" not in caplog.text            # a fresh install changes nothing
+
+
+def test_other_groups_keep_their_install_if_absent_behaviour(monkeypatch):
+    """The exact-version rule is the viewer's alone: a differently-versioned pin elsewhere stays put."""
+
+    group = install.Group(name="x", summary="x", requirements=[("pycolmap==4.0.4", "pycolmap")])
+    calls = _pip_calls(monkeypatch, {"pycolmap": "4.0.5"})
+    install.install_requirements(group, force=False, dry_run=False)
+    assert calls == []
+
+
+def test_verify_reports_a_wrong_rerun_version_and_missing_viewer_files(monkeypatch, tmp_path):
+    from cumuli_bridge import viewer_assets
+
+    monkeypatch.setattr(install, "installed_version", lambda dist: "0.38.1" if dist == "rerun-sdk" else None)
+    monkeypatch.setattr(viewer_assets, "assets_root", lambda: tmp_path / "none")
+    groups = install.build_groups("13")
+    missing = install.verify(groups, ["viewer"])
+    assert any("rerun-sdk (installed 0.38.1" in item for item in missing)
+    assert "rerun web viewer files" in missing
+
+
 @pytest.mark.parametrize("with_turbo, expected", [(False, "False"), (True, "True")])
 def test_the_turbo_lora_is_only_downloaded_when_asked_for(tmp_path, monkeypatch, with_turbo, expected):
     """The Turbo adapter is CC BY-NC-SA 4.0, so a default install must not fetch it."""

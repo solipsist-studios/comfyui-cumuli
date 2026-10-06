@@ -33,7 +33,7 @@ from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, InputImpl, IO
 
 from . import pose as pose_module
-from . import runner
+from . import rerun_view, runner, viewer_assets, viewer_routes
 from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset, slice_dataset_window
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
 from .masks import MaskError, mask_coverage, matte_flipbook
@@ -245,6 +245,22 @@ def _register_option_routes() -> None:
 
 
 _register_option_routes()
+
+
+def _register_viewer_routes() -> None:
+    """Serve the Rerun viewer from ComfyUI's own port (GET /cumuli/viewer/*); see viewer_routes.
+    Registered lazily, like the option routes, so the module stays importable without a server."""
+
+    try:
+        from server import PromptServer
+
+        routes = PromptServer.instance.routes
+    except Exception:  # standalone import (tests, CLI)
+        return
+    viewer_routes.setup(routes)
+
+
+_register_viewer_routes()
 
 
 class CumuliGenerateRing(IO.ComfyNode):
@@ -2345,6 +2361,54 @@ def _dataset_background(dataset: Path) -> str:
     return value if value in ("black", "white") else "black"
 
 
+class CumuliPreviewRing(IO.ComfyNode):
+    """Play a ring's generated views in 3D, each on its own camera, inside the node."""
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliPreviewRing",
+            display_name="Cumuli Preview Ring (Rerun)",
+            category=CATEGORY,
+            description=(
+                "Shows the ring in the Rerun viewer inside the node: every generated view plays on its own "
+                "camera frustum in one 3D scene, on a shared timeline, so camera placement and view "
+                "consistency can be judged together. Needs the viewer files and a matching rerun-sdk "
+                "(./install.sh --groups viewer). The viewer is served from ComfyUI's own port and cannot reach "
+                "any other network address."
+            ),
+            inputs=[Ring.Input("ring")],
+            outputs=[],
+            is_output_node=True,
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, ring) -> IO.NodeOutput:
+        if ring is None:
+            raise RuntimeError("Cumuli: no ring connected. Run the generator or load a result directory.")
+        if viewer_assets.find_assets() is None:
+            raise RuntimeError(
+                f"Cumuli: the Rerun viewer files ({viewer_assets.VIEWER_VERSION}) are not installed. Run "
+                "./install.sh --groups viewer, then restart ComfyUI."
+            )
+        problem = rerun_view.sdk_problem()
+        if problem:
+            raise RuntimeError(f"Cumuli: {problem}")
+        try:
+            destination = (
+                Path(folder_paths.get_temp_directory()) / "cumuli" / "view"
+                / f"{ring.run_name}-{rerun_view.recording_key(ring)}.rrd"
+            )
+            if not destination.is_file():
+                _send_text(cls.hidden.unique_id, "writing the recording")
+                rerun_view.write_ring_recording(ring, destination)
+        except (rerun_view.RerunError, RingError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        token = viewer_routes.register_recording(destination)
+        return IO.NodeOutput(ui={"cumuli_view": [{"token": token, "name": ring.run_name, "views": ring.num_views}]})
+
+
 class CumuliExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
@@ -2352,6 +2416,7 @@ class CumuliExtension(ComfyExtension):
             CumuliGenerateRing,
             CumuliLoadRing,
             CumuliRingContactSheet,
+            CumuliPreviewRing,
             CumuliSelectView,
             CumuliStageRing,
             CumuliSolveRig,
