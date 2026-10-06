@@ -48,21 +48,12 @@ LOGGER = logging.getLogger("comfyui-cumuli")
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 #: Environment given to the inference subprocess on top of the inherited one.
-#: These three entries are the empirically required settings for a 32 GB card.
-#:
-#: ``FDANYONE_ATTENTION_BACKEND`` matters specifically because we run inside
-#: ComfyUI's environment, where ``sageattention`` is installed for ComfyUI's
-#: own use. 4DAnyone's auto policy ranks backends by speed and would pick it,
-#: but this pipeline is memory-bound: measured on an RTX 5090 at the shapes
-#: this model uses, sageattn peaks at exactly 2x SDPA's memory (it holds INT8
-#: copies of q and k plus a smoothed k), while torch SDPA already dispatches
-#: to the flash kernel. Pinning SDPA gives back ~1.9 GiB -- most of what RCP
-#: costs -- and is bit-identical to the reference path, where sageattn's INT8
-#: quantisation carries a ~1.3% relative error.
+#: ``expandable_segments`` is the empirically required setting for a 32 GB card.
+#: The attention backend used to be an environment variable here; 4DAnyone now
+#: takes it as the ``--attention_backend`` flag, so it is the
+#: ``attention_backend`` setting below.
 DEFAULT_SUBPROCESS_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-    "FDANYONE_PERSISTENT_PARAMS": "1e9",
-    "FDANYONE_ATTENTION_BACKEND": "sdpa",
 }
 
 DEFAULTS: dict[str, object] = {
@@ -72,7 +63,23 @@ DEFAULTS: dict[str, object] = {
     "python_exe": "",  # empty -> sys.executable, unless conda_env is set
     "data_dir": "data",  # relative paths are resolved against fdanyone_root
     "model_dir": "models",
-    "gvhmr_root": "third_party/GVHMR",
+    # SAM 3D Body weights, which estimate the body pose that conditions generation.
+    # A file name is looked up in ComfyUI's ``detection`` model folders; an absolute
+    # path is used as it is. Meta's gated SAM License covers these weights.
+    "sam3d_weights": "sam_3d_body_dinov3_bf16.safetensors",
+    # Crops SAM 3D Body processes together. It is only the *starting* size: the pose stage halves
+    # it on every out-of-memory until it fits. 16 needs ~29 GB on a 1088x1600 clip.
+    "sam3d_batch_size": 8,
+    # ``sdpa`` on purpose. We run inside ComfyUI's environment, where
+    # ``sageattention`` is installed for ComfyUI's own use, and 4DAnyone's
+    # ``auto`` ranks backends by speed and would pick it. This pipeline is
+    # memory-bound: measured on an RTX 5090 at the shapes this model uses,
+    # sageattn peaks at exactly 2x SDPA's memory (it holds INT8 copies of q
+    # and k plus a smoothed k), while torch SDPA already dispatches to the
+    # flash kernel. SDPA gives back ~1.9 GiB -- most of what RCP costs -- and
+    # is bit-identical to the reference path, where sageattn's INT8
+    # quantisation carries a ~1.3% relative error.
+    "attention_backend": "sdpa",
     "device": "cuda:0",
     "min_free_vram_gb": 30.0,
     # The rotor 4DGS trainer (OMG4), vendored by the cumuli pipeline.
@@ -107,7 +114,9 @@ _ENV_KEYS = {
     "python_exe": ("CUMULI_PYTHON",),
     "data_dir": ("CUMULI_DATA_DIR",),
     "model_dir": ("CUMULI_MODEL_DIR",),
-    "gvhmr_root": ("CUMULI_GVHMR_ROOT",),
+    "sam3d_weights": ("CUMULI_SAM3D_WEIGHTS",),
+    "sam3d_batch_size": ("CUMULI_SAM3D_BATCH_SIZE",),
+    "attention_backend": ("CUMULI_ATTENTION_BACKEND",),
     "device": ("CUMULI_DEVICE",),
     "min_free_vram_gb": ("CUMULI_MIN_FREE_VRAM_GB",),
     "trainer_root": ("CUMULI_TRAINER_ROOT",),
@@ -212,9 +221,11 @@ class BridgeSettings:
     python_exe: str
     data_dir: Path
     model_dir: Path
-    gvhmr_root: Path
     device: str
     min_free_vram_gb: float
+    attention_backend: str = "sdpa"
+    sam3d_weights: str = "sam_3d_body_dinov3_bf16.safetensors"
+    sam3d_batch_size: int = 8
     work_root: str = ""
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
@@ -255,6 +266,12 @@ class BridgeSettings:
 
         fdanyone_root = Path(str(values["fdanyone_root"])).expanduser()
         try:
+            batch = int(values["sam3d_batch_size"])
+        except (TypeError, ValueError):
+            batch = 0
+        if batch < 1:
+            raise SettingsError(f"sam3d_batch_size must be a whole number of at least 1, got {values['sam3d_batch_size']!r}.")
+        try:
             min_free = float(values["min_free_vram_gb"])
         except (TypeError, ValueError):
             raise SettingsError(f"min_free_vram_gb must be a number, got {values['min_free_vram_gb']!r}.") from None
@@ -266,9 +283,11 @@ class BridgeSettings:
             python_exe=str(values["python_exe"]),
             data_dir=_resolve_under(fdanyone_root, str(values["data_dir"])),
             model_dir=_resolve_under(fdanyone_root, str(values["model_dir"])),
-            gvhmr_root=_resolve_under(fdanyone_root, str(values["gvhmr_root"])),
             device=str(values["device"]),
             min_free_vram_gb=min_free,
+            sam3d_weights=str(values["sam3d_weights"]).strip(),
+            sam3d_batch_size=batch,
+            attention_backend=str(values["attention_backend"]).strip().lower() or "sdpa",
             work_root=str(values.get("work_root") or ""),
             dataset_roots=_roots(values.get("dataset_roots")),
             flipbook_roots=_roots(values.get("flipbook_roots")),
@@ -299,18 +318,18 @@ class BridgeSettings:
         return self.data_dir / "fdanyone"
 
     @property
-    def motion_root(self) -> Path:
-        return self.data_dir / "gvhmr" / "results"
-
-    @property
     def source_root(self) -> Path:
         return self.data_dir / "source"
 
     def result_dir(self, run_name: str) -> Path:
         return self.results_root / run_name
 
-    def motion_dir(self, run_name: str) -> Path:
-        return self.motion_root / run_name
+    def pose_dir(self, run_name: str) -> Path:
+        """The reusable body-pose artifacts of one clip: its canonical frames and
+        the SAM 3D Body pose estimated on them. Deliberately outside the result
+        directory, which 4DAnyone owns and refuses to share."""
+
+        return self.data_dir / "pose" / run_name
 
     # -- process launching -------------------------------------------------
     def find_conda(self) -> str:

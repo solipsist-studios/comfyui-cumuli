@@ -40,7 +40,8 @@ _INTEGER_RATIO_TOLERANCE = 1e-3
 MIN_INPUT_SHORT_SIDE = 704
 RECOMMENDED_INPUT_SHORT_SIDE = 720
 
-VALID_VIEWS_PER_GROUP = (4, 6)
+#: 4DAnyone's views are denoised in groups of this size; it is no longer a flag.
+VIEW_GROUP_SIZE = 6
 MIN_PITCH = -15
 MAX_PITCH = 45
 
@@ -86,46 +87,161 @@ def choose_canonical_fps(input_rate: Fraction) -> Fraction:
 
 
 def parse_layer_pitches(value: str | Sequence[int]) -> tuple[int, ...]:
-    """Accept ``"15"``, ``"-10,15,35"`` or ``"[-10, 15]"`` and return a tuple."""
+    """Accept ``"15"``, ``"-10,15,35"``, ``"[-10, 15]"`` or a sequence, and return a tuple of elevations."""
 
     if not isinstance(value, str):
         pitches = tuple(int(item) for item in value)
     else:
         cleaned = value.strip().strip("[]()")
         if not cleaned:
-            raise ValidationError("layer_pitches must list at least one pitch in degrees, for example 15.")
+            raise ValidationError("At least one elevation in degrees is needed, for example 15.")
         parts = [part.strip() for part in cleaned.replace(";", ",").split(",") if part.strip()]
         try:
             pitches = tuple(int(part) for part in parts)
         except ValueError:
-            raise ValidationError(f"layer_pitches must be whole degrees, got {value!r}.") from None
+            raise ValidationError(f"Elevations must be whole degrees, got {value!r}.") from None
     if not pitches:
-        raise ValidationError("layer_pitches must list at least one pitch in degrees, for example 15.")
+        raise ValidationError("At least one elevation in degrees is needed, for example 15.")
     if len(set(pitches)) != len(pitches):
-        raise ValidationError(f"layer_pitches must not repeat a pitch, got {list(pitches)}.")
+        raise ValidationError(f"Elevations must not repeat, got {list(pitches)}.")
     bad = [pitch for pitch in pitches if not MIN_PITCH <= pitch <= MAX_PITCH]
     if bad:
-        raise ValidationError(f"Each layer pitch must be between {MIN_PITCH} and {MAX_PITCH} degrees, got {bad}.")
+        raise ValidationError(f"Each elevation must be between {MIN_PITCH} and {MAX_PITCH} degrees, got {bad}.")
     return pitches
 
 
-def resolve_views_per_group(value: str | int, views_per_layer: int) -> int | str:
-    """Validate ``views_per_group`` the way ``fdanyone.views`` will."""
+DEFAULT_VIEWS_PER_ROW = 24
 
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        divisors = [size for size in VALID_VIEWS_PER_GROUP if views_per_layer % size == 0]
-        if not divisors:
-            raise ValidationError(f"views_per_layer ({views_per_layer}) must be divisible by 4 or 6.")
-        return "auto"
+
+@dataclass(frozen=True)
+class RingLayout:
+    """A ring as 4DAnyone takes it: yaw views per layer and one pitch per layer."""
+
+    views_per_row: int
+    pitches: tuple[int, ...]
+
+    @property
+    def rows(self) -> int:
+        return len(self.pitches)
+
+    @property
+    def total_views(self) -> int:
+        return self.views_per_row * self.rows
+
+
+def resolve_ring_layout(
+    *,
+    total_views: int = 0,
+    elevation_rows: int = 0,
+    views_per_row: int = 0,
+    start_elevation: int = 15,
+    end_elevation: int = 45,
+) -> RingLayout:
+    """Turn the node's ring description into 4DAnyone's ``views_per_layer`` and
+    ``layer_pitches``.
+
+    ``total_views``, ``elevation_rows`` and ``views_per_row`` are related by
+    ``total = rows x per_row``; 0 means "not set", and any two of them give the
+    third. Setting all three is allowed when they agree. One alone is completed
+    with the obvious default (a single row; 24 views per row), and none at all
+    is the stock 24-view single-row ring.
+
+    Rows are spaced evenly from ``start_elevation`` to ``end_elevation`` (a
+    single row sits at ``start_elevation``), rounded to whole degrees.
+    """
+
+    total, rows, per_row = int(total_views), int(elevation_rows), int(views_per_row)
+    if min(total, rows, per_row) < 0:
+        raise ValidationError("total_views, elevation_rows and views_per_row cannot be negative; use 0 to leave one unset.")
+
+    if total and rows and per_row:
+        if total != rows * per_row:
+            raise ValidationError(
+                f"total_views ({total}) is not elevation_rows ({rows}) x views_per_row ({per_row}) = {rows * per_row}. "
+                "Set any two and leave the third at 0 to have it worked out."
+            )
+    elif total and rows:
+        if total % rows:
+            raise ValidationError(
+                f"total_views ({total}) does not split into {rows} equal rows. "
+                f"Try {total // rows * rows} or {(total // rows + 1) * rows}."
+            )
+        per_row = total // rows
+    elif total and per_row:
+        if total % per_row:
+            raise ValidationError(
+                f"total_views ({total}) is not a whole number of rows of {per_row} views. "
+                f"Try {total // per_row * per_row} or {(total // per_row + 1) * per_row}."
+            )
+        rows = total // per_row
+    elif total:
+        rows, per_row = 1, total
+    elif rows or per_row:
+        rows = rows or 1
+        per_row = per_row or DEFAULT_VIEWS_PER_ROW
+    else:
+        rows, per_row = 1, DEFAULT_VIEWS_PER_ROW
+
+    start, end = int(start_elevation), int(end_elevation)
+    if rows == 1:
+        spaced = (start,)
+    else:
+        spaced = tuple(round(start + i * (end - start) / (rows - 1)) for i in range(rows))
     try:
-        size = int(value)
-    except (TypeError, ValueError):
-        raise ValidationError(f"views_per_group must be 'auto', 4 or 6, got {value!r}.") from None
-    if size not in VALID_VIEWS_PER_GROUP:
-        raise ValidationError(f"views_per_group must be 'auto', 4 or 6, got {value!r}.")
-    if views_per_layer % size:
-        raise ValidationError(f"views_per_layer ({views_per_layer}) must be divisible by views_per_group ({size}).")
-    return size
+        pitches = parse_layer_pitches(spaced)
+    except ValidationError as exc:
+        raise ValidationError(
+            f"{exc} (from {rows} rows spaced evenly from start_elevation {start} to end_elevation {end}; "
+            "each whole-degree elevation must be distinct)"
+        ) from None
+    return RingLayout(per_row, pitches)
+
+
+def start_time_for_frame(start_frame: int, fps: Fraction) -> float:
+    """Where a source-video frame is on the input timeline, in seconds.
+
+    The node asks for a frame number (what a video loader shows) and 4DAnyone is given a time, so
+    the conversion lives here. Done in exact fractions so a rate like 30000/1001 does not pick up
+    float noise before it is rounded once, at the end.
+    """
+
+    frame = int(start_frame)
+    if frame < 0:
+        raise ValidationError(f"start_frame must be 0 or more, got {start_frame}.")
+    if fps <= 0:
+        raise ValidationError(f"The input video reports a frame rate of {fps}, so a start frame cannot be placed in time.")
+    return float(Fraction(frame) / Fraction(fps))
+
+
+def fps_from_setting(value: float) -> str:
+    """The node's ``target_fps`` number as 4DAnyone takes it: 0 keeps the source's own rate
+    (``"auto"``); anything else is that rate."""
+
+    rate = float(value)
+    if rate < 0:
+        raise ValidationError(f"target_fps must be 0 (keep the source rate) or positive, got {value}.")
+    return "auto" if rate == 0 else format(rate, ".6g")
+
+
+def vram_floor(widget_value: float, settings: BridgeSettings) -> float:
+    """The free-VRAM floor a stage must clear. 0 on the node means "use the bridge config value",
+    like every other 0-means-unset widget; set that config value to 0 to skip the check."""
+
+    return settings.min_free_vram_gb if float(widget_value) <= 0 else float(widget_value)
+
+
+def check_view_count(views_per_row: int, rows: int) -> None:
+    """4DAnyone denoises views in fixed groups of six, so the *total* ring must
+    split into whole groups (``fdanyone.views`` enforces the same rule)."""
+
+    total = views_per_row * rows
+    if total % VIEW_GROUP_SIZE:
+        lower = total // VIEW_GROUP_SIZE * VIEW_GROUP_SIZE
+        raise ValidationError(
+            f"The ring has {total} views ({rows} row(s) x {views_per_row} per row), which does not split "
+            f"into groups of {VIEW_GROUP_SIZE}. Use a total divisible by {VIEW_GROUP_SIZE}, for example "
+            f"{lower or VIEW_GROUP_SIZE} or {lower + VIEW_GROUP_SIZE}."
+        )
 
 
 def stage_source_video(settings: BridgeSettings, video_path: str | Path, run_name: str) -> Path:
@@ -252,7 +368,6 @@ class RunRequest:
     layer_pitches: tuple[int, ...] = (15,)
     start_yaw: int = 0
     yaw_span: int = 360
-    views_per_group: int | str = 4
     enable_rcp: bool = True
     enable_tcr: bool = True
     start_time: float = 0.0
@@ -261,7 +376,7 @@ class RunRequest:
     prompt: str = ""
     seed: int = 42
     device: str = "cuda:0"
-    enable_turbo: bool = True
+    enable_turbo: bool = False
 
     @property
     def run_name(self) -> str:
@@ -278,7 +393,6 @@ class RunRequest:
             "layer_pitches": list(self.layer_pitches),
             "start_yaw": self.start_yaw,
             "yaw_span": self.yaw_span,
-            "views_per_group": self.views_per_group,
             "enable_rcp": self.enable_rcp,
             "enable_tcr": self.enable_tcr,
             "start_time": self.start_time,
@@ -296,22 +410,21 @@ def build_request(
     layer_pitches: str | Sequence[int],
     start_yaw: int,
     yaw_span: int,
-    views_per_group: str | int,
     enable_rcp: bool,
     enable_tcr: bool,
     start_time: float,
     target_fps: str,
     seed: int,
     device: str,
-    enable_turbo: bool = True,
+    enable_turbo: bool = False,
 ) -> RunRequest:
     """Validate every knob and produce a :class:`RunRequest`."""
 
     views_per_layer = int(views_per_layer)
     if views_per_layer <= 0:
-        raise ValidationError(f"views_per_layer must be positive, got {views_per_layer}.")
+        raise ValidationError(f"views_per_row must be positive, got {views_per_layer}.")
     pitches = parse_layer_pitches(layer_pitches)
-    group = resolve_views_per_group(views_per_group, views_per_layer)
+    check_view_count(views_per_layer, len(pitches))
     yaw_span = int(yaw_span)
     if not 0 < yaw_span <= 360:
         raise ValidationError(f"yaw_span must be between 1 and 360 degrees, got {yaw_span}.")
@@ -343,7 +456,6 @@ def build_request(
         layer_pitches=pitches,
         start_yaw=start_yaw,
         yaw_span=yaw_span,
-        views_per_group=group,
         enable_rcp=bool(enable_rcp),
         enable_tcr=bool(enable_tcr),
         start_time=float(start_time),
@@ -375,7 +487,27 @@ def gpu_ids_for(device: str) -> list[int] | None:
         ) from None
 
 
-def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
+def build_prepare_argv(settings: BridgeSettings, request: RunRequest, out_dir: Path) -> list[str]:
+    """The ``inference.py`` command that writes the clip the pose must be estimated on.
+
+    ``--prepare_only`` decodes the canonical 121 frames into ``out_dir`` and stops: no
+    models, no GPU. It has to be 4DAnyone that cuts the clip, because the pose is only
+    valid on exactly the frames (start time, frame rate, timestamps) it will generate from.
+    """
+
+    argv = list(settings.launcher())
+    argv += [
+        str(settings.inference_script),
+        "--prepare_only=True",
+        f"--video_path={request.video_path}",
+        f"--output_dir={out_dir}",
+        f"--start_time={request.start_time}",
+        f"--target_fps={request.target_fps}",
+    ]
+    return argv
+
+
+def build_argv(settings: BridgeSettings, request: RunRequest, *, sam3d_npz: Path | None = None) -> list[str]:
     """Assemble the exact ``inference.py`` command line.
 
     ``fire`` literal-evaluates ``--flag=value``, so lists and booleans are
@@ -397,17 +529,18 @@ def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
         f"--layer_pitches={pitches}",
         f"--start_yaw={request.start_yaw}",
         f"--yaw_span={request.yaw_span}",
-        f"--views_per_group={request.views_per_group}",
         f"--enable_rcp={bool(request.enable_rcp)}",
         f"--enable_tcr={bool(request.enable_tcr)}",
         f"--enable_turbo={bool(request.enable_turbo)}",
-        f"--data_dir={settings.data_dir}",
+        f"--output_dir={settings.result_dir(request.run_name)}",
         f"--model_dir={settings.model_dir}",
-        f"--gvhmr_root={settings.gvhmr_root}",
+        f"--attention_backend={settings.attention_backend}",
         f"--target_fps={request.target_fps}",
         f"--start_time={request.start_time}",
         f"--seed={request.seed}",
     ]
+    if sam3d_npz is not None:
+        argv.append(f"--sam3d_npz={sam3d_npz}")
     gpu_ids = gpu_ids_for(request.device)
     if gpu_ids is not None:
         argv.append(f"--gpu_ids={gpu_ids}".replace(" ", ""))
@@ -496,10 +629,84 @@ def check_video(settings: BridgeSettings, request: RunRequest) -> VideoRequireme
 
 
 
-def motion_is_cached(settings: BridgeSettings, request: RunRequest) -> bool:
-    """GVHMR motion is keyed by the video stem and reused across runs."""
+#: Names this pack owns inside a clip's pose directory (``settings.pose_dir``).
+POSE_NPZ = "sam3d_mhr70.npz"
+CANONICAL_CLIP = "canonical_clip.mp4"
+CANONICAL_CLIP_META = "canonical_clip.json"
+POSE_STAMP = ".pose_stamp.json"
 
-    return (settings.motion_dir(request.run_name) / "motion.json").is_file()
+#: Folded into every cache key so a pose made by a different method can never be
+#: mistaken for this one (rings and caches from the GVHMR era carry no such marker).
+POSE_METHOD = "sam3d-mhr70"
+
+
+def pose_key(request: RunRequest, weights: Path) -> str:
+    """What the pose of one clip depends on: the clip and how it is windowed, the
+    pose method, and the weights that estimated it. The seed, the view layout and
+    the denoiser do not matter, so changing them reuses the pose."""
+
+    return compute_fingerprint({"pose": POSE_METHOD, "clip": _clip_identity(request), "weights": file_identity(weights)})
+
+
+def pose_is_cached(settings: BridgeSettings, request: RunRequest, weights: Path) -> bool:
+    """Whether ``ensure_pose`` would reuse an existing pose rather than estimate one."""
+
+    pose_dir = settings.pose_dir(request.run_name)
+    stamp = read_stamp(pose_dir, POSE_STAMP)
+    return (
+        stamp is not None
+        and stamp.get("fingerprint") == pose_key(request, weights)
+        and (pose_dir / POSE_NPZ).is_file()
+    )
+
+
+def ensure_pose(
+    settings: BridgeSettings,
+    request: RunRequest,
+    *,
+    weights: Path,
+    estimate: Callable[[Path, Path], object],
+    on_line: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[Path, bool]:
+    """Return ``(npz, reused)``: the SAM 3D Body pose of this request's clip.
+
+    Reuses the cached pose when the clip, its window and the weights are unchanged.
+    Otherwise 4DAnyone cuts the canonical clip (cheap, no GPU) and ``estimate`` --
+    supplied by the caller, because it runs inside ComfyUI -- writes the pose npz
+    for it. The stamp is written last, so an interrupted estimate is never trusted.
+    """
+
+    pose_dir = settings.pose_dir(request.run_name)
+    key = pose_key(request, weights)
+    npz = pose_dir / POSE_NPZ
+    if pose_is_cached(settings, request, weights):
+        LOGGER.info("Reusing the cached body pose at %s", npz)
+        return npz, True
+
+    # Only this pack's own files live here, so a stale pose is cleared by name.
+    for name in (POSE_NPZ, CANONICAL_CLIP, CANONICAL_CLIP_META, POSE_STAMP):
+        (pose_dir / name).unlink(missing_ok=True)
+    argv = build_prepare_argv(settings, request, pose_dir)
+    check_argv_against_checkout(settings, argv)
+    run_streaming(
+        argv,
+        cwd=settings.fdanyone_root,
+        env=build_env(settings),
+        on_line=on_line,
+        should_cancel=should_cancel,
+    )
+    clip = pose_dir / CANONICAL_CLIP
+    if not clip.is_file():
+        raise RuntimeError(
+            f"4DAnyone finished preparing the clip but wrote no {CANONICAL_CLIP} in {pose_dir}; "
+            "the pose cannot be estimated without it."
+        )
+    estimate(clip, npz)
+    if not npz.is_file():
+        raise RuntimeError(f"The pose estimate finished but wrote no {npz.name} in {pose_dir}.")
+    write_stamp(pose_dir, key, POSE_STAMP)
+    return npz, False
 
 
 @dataclass
@@ -561,6 +768,7 @@ def execute(
     settings: BridgeSettings,
     request: RunRequest,
     *,
+    sam3d_npz: Path,
     on_progress: Callable[[ProgressState], None] | None = None,
     on_line: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -573,7 +781,7 @@ def execute(
     settings.validate()
     check_video(settings, request)
     result_dir = settings.result_dir(request.run_name)
-    argv = build_argv(settings, request)
+    argv = build_argv(settings, request, sam3d_npz=sam3d_npz)
     check_argv_against_checkout(settings, argv)
     state = ProgressState(expected_views=request.num_target_views)
 
@@ -589,7 +797,6 @@ def execute(
         cwd=settings.fdanyone_root,
         env=build_env(settings, {
             "FDANYONE_LORA_PATH": request.lora_path,
-            "FDANYONE_PROMPT": request.prompt,
         }),
         on_line=handle,
         should_cancel=should_cancel,
@@ -724,7 +931,15 @@ def write_stamp(root: Path, fingerprint: str, filename: str = FINGERPRINT_FILE, 
     (Path(root) / filename).write_text(_json.dumps(payload, indent=1))
 
 
-def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
+#: What 4DAnyone leaves in a result directory before it publishes: its motion
+#: record, its private staging area and the saved request. It refuses any other
+#: entry, so a ring directory holding only these is an interrupted run of its
+#: own, not a foreign one.
+RING_RUN_ENTRIES = frozenset({"gvhmr", ".inference", ".4danyone-request.json"})
+
+
+def prepare_artifact_dir(root: Path, fingerprint: str, *,
+                         resumable: frozenset[str] = frozenset()) -> str:
     """Return ``"reuse"`` when the on-disk artifact matches the inputs, else
     clear the way and return ``"build"``.
 
@@ -732,6 +947,11 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
     reused without asking; changed inputs -> the stale artifact is replaced.
     A directory that exists but carries no stamp was not produced by this
     bridge, and is never deleted -- that is the one case that still errors.
+
+    ``resumable`` names the entries a producer leaves behind when it is
+    interrupted: an unstamped directory that holds only those is that
+    producer's own unfinished run, so it is left for the producer to resume
+    rather than refused.
     """
 
     root = Path(root)
@@ -739,7 +959,8 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
         return "build"
     stamp = read_stamp(root)
     if stamp is None:
-        if not any(root.iterdir()):
+        names = {child.name for child in root.iterdir()}
+        if not names or (resumable and names <= resumable):
             return "build"
         raise ValidationError(
             f"{root} exists but was not produced by this bridge (no {FINGERPRINT_FILE}). "
@@ -752,12 +973,23 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
     return "build"
 
 
+def _clip_identity(request: RunRequest) -> dict:
+    """The clip bytes and how they are windowed: everything the body pose depends on."""
+
+    return {
+        "video": file_identity(request.video_path),
+        "start_time": float(request.start_time),
+        "target_fps": str(request.target_fps),
+    }
+
+
 def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
     """Return ``(fingerprint, motion_key)`` for one ring request.
 
-    ``motion_key`` covers only what the GVHMR motion solve depends on (the
-    clip bytes and how it is windowed), so seed- or view-layout-only changes
-    keep the motion cache while still regenerating the ring.
+    ``motion_key`` covers only what the body pose depends on (the clip bytes, how
+    it is windowed and the pose method), so seed- or view-layout-only changes keep
+    the pose cache while still regenerating the ring. The pose method is part of it
+    so that a ring made with another pose method is never reused for this one.
     """
 
     lora = {}
@@ -765,19 +997,15 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         import hashlib
 
         lora = {"md5": hashlib.md5(Path(request.lora_path).read_bytes()).hexdigest()}
-    clip = {
-        "video": file_identity(request.video_path),
-        "start_time": float(request.start_time),
-        "target_fps": str(request.target_fps),
-    }
-    motion_key = compute_fingerprint(clip)
+    clip = _clip_identity(request)
+    motion_key = compute_fingerprint({"pose": POSE_METHOD, "clip": clip})
     full = compute_fingerprint({
+        "pose": POSE_METHOD,
         "clip": clip,
         "views_per_layer": request.views_per_layer,
         "layer_pitches": list(request.layer_pitches),
         "start_yaw": request.start_yaw,
         "yaw_span": request.yaw_span,
-        "views_per_group": str(request.views_per_group),
         "enable_rcp": request.enable_rcp,
         "enable_tcr": request.enable_tcr,
         "enable_turbo": request.enable_turbo,
@@ -786,38 +1014,6 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         "lora": lora,
     })
     return full, motion_key
-
-
-def clear_stale_motion(settings: BridgeSettings, request: RunRequest, motion_key: str,
-                       previous_stamp: dict | None) -> bool:
-    """Drop the GVHMR motion cache when the clip it solved no longer matches.
-
-    The pipeline hard-errors on a stale motion cache, so clearing it here turns
-    a confusing failure 45 minutes in into a clean re-solve. Returns True when
-    the cache was removed.
-    """
-
-    motion_dir = settings.motion_dir(request.run_name)
-    if not motion_dir.exists():
-        return False
-    if previous_stamp is not None:
-        if previous_stamp.get("motion_key") == motion_key:
-            return False
-        shutil.rmtree(motion_dir)
-        return True
-    # No stamp to compare against: fall back to the identity GVHMR itself records.
-    import json as _json
-
-    try:
-        meta = _json.loads((motion_dir / "motion.json").read_text())
-        stat = Path(request.video_path).stat()
-        if meta.get("source_size_bytes") == stat.st_size and meta.get("source_mtime_ns") == stat.st_mtime_ns:
-            return False
-    except (OSError, ValueError, KeyError):
-        pass
-    shutil.rmtree(motion_dir)
-    return True
-
 
 
 def discover_flipbooks(settings: BridgeSettings) -> list[str]:

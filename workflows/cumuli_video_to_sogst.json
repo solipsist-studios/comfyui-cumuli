@@ -936,7 +936,7 @@
       ],
       "size": [
         365.09375,
-        490
+        568
       ],
       "flags": {},
       "order": 7,
@@ -957,29 +957,11 @@
           "link": 47
         },
         {
-          "localized_name": "views_per_layer",
-          "name": "views_per_layer",
+          "localized_name": "views_per_row",
+          "name": "views_per_row",
           "type": "INT",
           "widget": {
-            "name": "views_per_layer"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "views_per_group",
-          "name": "views_per_group",
-          "type": "COMBO",
-          "widget": {
-            "name": "views_per_group"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "layer_pitches",
-          "name": "layer_pitches",
-          "type": "STRING",
-          "widget": {
-            "name": "layer_pitches"
+            "name": "views_per_row"
           },
           "link": null
         },
@@ -1020,18 +1002,18 @@
           "link": null
         },
         {
-          "localized_name": "start_time",
-          "name": "start_time",
-          "type": "FLOAT",
+          "localized_name": "start_frame",
+          "name": "start_frame",
+          "type": "INT",
           "widget": {
-            "name": "start_time"
+            "name": "start_frame"
           },
           "link": null
         },
         {
           "localized_name": "target_fps",
           "name": "target_fps",
-          "type": "STRING",
+          "type": "FLOAT",
           "widget": {
             "name": "target_fps"
           },
@@ -1049,7 +1031,7 @@
         {
           "localized_name": "device",
           "name": "device",
-          "type": "STRING",
+          "type": "COMBO",
           "widget": {
             "name": "device"
           },
@@ -1079,6 +1061,51 @@
           "type": "BOOLEAN",
           "widget": {
             "name": "dry_run"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "enable_turbo",
+          "name": "enable_turbo",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "enable_turbo"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "total_views",
+          "name": "total_views",
+          "type": "INT",
+          "widget": {
+            "name": "total_views"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "elevation_rows",
+          "name": "elevation_rows",
+          "type": "INT",
+          "widget": {
+            "name": "elevation_rows"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "start_elevation",
+          "name": "start_elevation",
+          "type": "INT",
+          "widget": {
+            "name": "start_elevation"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "end_elevation",
+          "name": "end_elevation",
+          "type": "INT",
+          "widget": {
+            "name": "end_elevation"
           },
           "link": null
         },
@@ -1126,38 +1153,44 @@
       },
       "widgets_values": [
         24,
-        "4",
-        "15",
         0,
         360,
         true,
         true,
         0,
-        "auto",
+        0.0,
         782310901564530,
         "fixed",
         "cuda:0",
         "",
-        -1,
+        0,
         false,
+        false,
+        0,
+        0,
+        15,
+        45,
         ""
       ],
       "widgets_values_named": {
-        "views_per_layer": 24,
-        "views_per_group": "4",
-        "layer_pitches": "15",
+        "views_per_row": 24,
         "start_yaw": 0,
         "yaw_span": 360,
         "enable_rcp": true,
         "enable_tcr": true,
-        "start_time": 0,
-        "target_fps": "auto",
+        "start_frame": 0,
+        "target_fps": 0.0,
         "seed": 782310901564530,
         "control_after_generate": "fixed",
         "device": "cuda:0",
         "prompt": "",
-        "min_free_vram_gb": -1,
+        "min_free_vram_gb": 0,
         "dry_run": false,
+        "enable_turbo": false,
+        "total_views": 0,
+        "elevation_rows": 0,
+        "start_elevation": 15,
+        "end_elevation": 45,
         "run_name": ""
       }
     },
@@ -1632,7 +1665,7 @@
         0.005,
         31,
         1,
-        -1,
+        0,
         false,
         ""
       ],
@@ -1650,7 +1683,7 @@
         "lambda_opa_mask": 0.005,
         "max_window_frames": 31,
         "max_parallel_windows": 1,
-        "min_free_vram_gb": -1,
+        "min_free_vram_gb": 0,
         "dry_run": false,
         "out_dir": ""
       }

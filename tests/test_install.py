@@ -121,15 +121,29 @@ def test_only_real_drift_fails_the_run(before, after, expected):
     assert install.compare_pinned(before, after) == expected
 
 
-def test_smplx_is_reported_missing_until_it_is_placed(tmp_path):
-    """The one asset no installer may fetch, so it must be named explicitly."""
+def test_the_sam3d_weights_are_reported_missing_until_they_are_placed(tmp_path):
+    """The one asset no installer may fetch (Meta's gated SAM License), so it is named explicitly."""
 
-    root = tmp_path / "4DAnyone"
-    smplx = root / "models" / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
-    assert install.missing_manual_assets({"fdanyone_root": root}) == [str(smplx)]
-    smplx.parent.mkdir(parents=True)
-    smplx.write_text("")
-    assert install.missing_manual_assets({"fdanyone_root": root}) == []
+    comfy = tmp_path / "ComfyUI"
+    weights = comfy / "models" / "detection" / install.SAM3D_WEIGHTS
+    assert install.missing_manual_assets({"comfyui_root": comfy}) == [str(weights)]
+    weights.parent.mkdir(parents=True)
+    weights.write_text("")
+    assert install.missing_manual_assets({"comfyui_root": comfy}) == []
+
+
+def test_without_a_comfyui_root_the_weights_are_named_not_checked():
+    (message,) = install.missing_manual_assets({})
+    assert message == f"ComfyUI/models/detection/{install.SAM3D_WEIGHTS}"
+
+
+def test_neither_smplx_nor_ultralytics_is_installed_or_guarded():
+    """GVHMR's dependencies are gone; reintroducing them would bring back their licences."""
+
+    groups = install.build_groups("13")
+    requirements = [req for group in groups.values() for req, _dist in group.requirements]
+    assert not any(req.startswith(("smplx", "ultralytics")) for req in requirements)
+    assert "ultralytics" not in install.PINNED
 
 
 def test_each_checkout_is_cloned_at_its_own_pinned_ref(tmp_path, monkeypatch):
@@ -163,6 +177,62 @@ def test_ref_override_beats_the_pin(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "CHECKOUTS", {"cumuli_root": ("pinned", url, "v0.0.1")})
     paths = install.fetch_checkouts(tmp_path / "deps", ref="main")
     assert (paths["cumuli_root"] / "README").read_text() == "moved on"
+
+
+def _commit_second(repo: Path) -> str:
+    """Move the repo's branch on by one commit; return the *first* commit's hash."""
+
+    first = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                           capture_output=True, text=True).stdout.strip()
+    (repo / "README").write_text("moved on")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "second"], check=True, capture_output=True)
+    return first
+
+
+def test_a_full_commit_hash_pin_clones_exactly_that_commit(tmp_path, monkeypatch):
+    """A pin must keep meaning the same code even after the branch moves on."""
+
+    remotes = tmp_path / "remotes"
+    url = _repo(remotes, "pinned")
+    first = _commit_second(remotes / "pinned")
+    monkeypatch.setattr(install, "CHECKOUTS", {"fdanyone_root": ("pinned", url, first)})
+    paths = install.fetch_checkouts(tmp_path / "deps")
+    clone = paths["fdanyone_root"]
+    assert (clone / "README").read_text() == "pinned"
+    head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    assert head == first
+
+
+def test_only_a_full_forty_character_hash_counts_as_a_commit_pin():
+    assert install._is_commit_hash("6d5ec422ba4a4eef48f05c18ca33a9d4e7ca8d33")
+    for ref in ("v0.0.1", "main", "f7af869", "f7af8697b282a3106e395b19ca8004dd35c2087z"):
+        assert not install._is_commit_hash(ref)
+
+
+def test_the_4danyone_pin_is_a_full_commit_hash():
+    """The fork's SAM 3D Body branch is not tagged yet; a branch name would not stay pinned."""
+
+    _name, url, ref = install.CHECKOUTS["fdanyone_root"]
+    assert url.endswith("solipsist-studios/4DAnyone.git")
+    assert install._is_commit_hash(ref)
+
+
+@pytest.mark.parametrize("with_turbo, expected", [(False, "False"), (True, "True")])
+def test_the_turbo_lora_is_only_downloaded_when_asked_for(tmp_path, monkeypatch, with_turbo, expected):
+    """The Turbo adapter is CC BY-NC-SA 4.0, so a default install must not fetch it."""
+
+    root = tmp_path / "4DAnyone"
+    (root / "fdanyone").mkdir(parents=True)
+    (root / "fdanyone" / "download.py").write_text("")
+    calls = []
+    monkeypatch.setattr(install, "_run", lambda argv, **kwargs: calls.append(argv))
+    install.fetch_models({"fdanyone_root": root}, with_turbo=with_turbo)
+    (argv,) = calls
+    assert "enable_turbo=sys.argv[3] == 'True'" in argv[2]    # the -c program reads the flag
+    assert argv[-1] == expected
 
 
 def test_dry_run_clones_nothing(origins):

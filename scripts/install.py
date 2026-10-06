@@ -16,7 +16,7 @@ working set of packages somewhere ComfyUI will never look.
 
 Four groups, all installed by default (``--groups core,bake,sfm,trainer``):
 
-  core     4DAnyone and its vendored GVHMR
+  core     4DAnyone's runtime dependencies
   bake     the ``.sogst`` container writer
   sfm      the rig solve behind Solve Rig (hloc, pycolmap, lightglue)
   trainer  the OMG4 rotor-4DGS trainer, including its CUDA extensions
@@ -27,7 +27,7 @@ silent when they happen by hand:
 * **pip upgrading torch out from under ComfyUI.** Several of these packages
   declare pinned dependencies older than a working ComfyUI carries. The affected
   installs pass ``--no-deps``, and the versions of torch, numpy, transformers,
-  timm and ultralytics are recorded before and compared after: if anything moved,
+  and timm are recorded before and compared after: if anything moved,
   the run fails loudly instead of leaving a broken ComfyUI to discover later.
 * **Building the trainer's CUDA extensions against the wrong nvcc.**
   ``/usr/bin/nvcc`` is often a distro CUDA too old to target the installed GPU.
@@ -79,7 +79,7 @@ TRAINER_EXTENSIONS = ("diff-gaussian-rasterization", "simple-knn", "pointops2")
 
 #: Packages whose version must not move. The additive-install promise is exactly
 #: this list holding still across the whole run.
-PINNED = ("torch", "numpy", "transformers", "timm", "ultralytics")
+PINNED = ("torch", "numpy", "transformers", "timm")
 
 
 class InstallError(RuntimeError):
@@ -138,7 +138,7 @@ def compare_pinned(before: dict[str, str | None], after: dict[str, str | None]) 
     """Describe any guarded package that changed version or disappeared.
 
     A package that was absent and is now present was pulled in as a dependency
-    -- numpy arrives with smplx, for instance -- which is an install, not a
+    -- numpy arrives with many packages, for instance -- which is an install, not a
     downgrade. Only a version moving under ComfyUI, or a package vanishing from
     beneath it, is the failure this guard exists to catch.
     """
@@ -235,9 +235,8 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
     return {
         "core": Group(
             name="core",
-            summary="4DAnyone and its vendored GVHMR",
+            summary="4DAnyone's runtime dependencies",
             requirements=[
-                ("smplx==0.1.28", "smplx"),
                 ("hydra-zen", "hydra-zen"),
                 ("hydra_colorlog", "hydra_colorlog"),
                 ("yacs", "yacs"),
@@ -289,9 +288,18 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
 #: submodules belong to the wider pipeline, not to this pack.
 #: ``(directory, url, ref)``. The ref is pinned per repository so an archive
 #: shipped today installs the same code next year, and so one checkout can move
-#: without dragging the others. ``--ref`` overrides all three at once.
+#: without dragging the others. ``--ref`` overrides all three at once. A ref is a
+#: tag, a branch, or a full 40-character commit hash.
+#:
+#: 4DAnyone is pinned to a commit of the fork's ``sam3d-pose`` branch: the first
+#: version with SAM 3D Body pose in place of GVHMR and SMPL-X, and upstream's newer
+#: command line. Move it to a tag once that branch is merged and released.
 CHECKOUTS = {
-    "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git", "v0.0.1"),
+    "fdanyone_root": (
+        "4DAnyone",
+        "https://github.com/solipsist-studios/4DAnyone.git",
+        "6d5ec422ba4a4eef48f05c18ca33a9d4e7ca8d33",
+    ),
     "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
     "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
 }
@@ -324,11 +332,30 @@ def fetch_checkouts(deps_dir: Path, *, ref: str | None = None, dry_run: bool = F
                 "--deps-dir to put the checkouts somewhere else."
             )
         deps_dir.mkdir(parents=True, exist_ok=True)
-        wanted = ref or pinned
-        # --branch takes a tag as happily as a branch, and --depth 1 against a
-        # tag fetches exactly that commit.
-        _run([git, "clone", "--depth", "1", "--branch", wanted, url, str(target)], dry_run=dry_run)
+        _clone_at(git, url, ref or pinned, target, dry_run=dry_run)
     return resolved
+
+
+def _is_commit_hash(ref: str) -> bool:
+    return len(ref) == 40 and all(char in "0123456789abcdef" for char in ref.lower())
+
+
+def _clone_at(git: str, url: str, ref: str, target: Path, *, dry_run: bool = False) -> None:
+    """Shallow-clone ``url`` at ``ref``: a tag, a branch, or a full commit hash.
+
+    ``--branch`` takes a tag as happily as a branch, and ``--depth 1`` against a tag
+    fetches exactly that commit. It cannot take a commit hash, so that case is an
+    init plus a fetch of just that commit, which the server allows for any commit
+    reachable from one of its branches.
+    """
+
+    if not _is_commit_hash(ref):
+        _run([git, "clone", "--depth", "1", "--branch", ref, url, str(target)], dry_run=dry_run)
+        return
+    _run([git, "init", "-q", str(target)], dry_run=dry_run)
+    _run([git, "-C", str(target), "remote", "add", "origin", url], dry_run=dry_run)
+    _run([git, "-C", str(target), "fetch", "--depth", "1", "origin", ref], dry_run=dry_run)
+    _run([git, "-C", str(target), "-c", "advice.detachedHead=false", "checkout", "FETCH_HEAD"], dry_run=dry_run)
 
 
 def checkout_revisions(paths: dict[str, Path]) -> dict[str, str]:
@@ -379,8 +406,12 @@ def write_config(paths: dict[str, Path], work_root: str | None, *, dry_run: bool
     CONFIG_FILE.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
-    """Pull 4DAnyone's published weights using its own downloader."""
+def fetch_models(paths: dict[str, Path], *, with_turbo: bool = False, dry_run: bool = False) -> None:
+    """Pull 4DAnyone's published weights using its own downloader.
+
+    The Turbo LoRA is left out unless asked for: it is licensed CC BY-NC-SA 4.0, so a
+    default install must not put a non-commercial file where commercial use would find it.
+    """
 
     root = paths.get("fdanyone_root")
     if root is None or not (root / "fdanyone" / "download.py").is_file():
@@ -389,25 +420,29 @@ def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
     argv = [sys.executable, "-c",
             "import sys; sys.path.insert(0, sys.argv[1]); "
             "from fdanyone.download import ensure_models; "
-            "ensure_models(model_dir=sys.argv[2], gvhmr_root=sys.argv[3])",
-            str(root), str(root / "models"), str(root / "third_party" / "GVHMR")]
+            "ensure_models(model_dir=sys.argv[2], enable_turbo=sys.argv[3] == 'True')",
+            str(root), str(root / "models"), str(bool(with_turbo))]
     _run(argv, cwd=root, dry_run=dry_run)
+
+
+#: The weights Generate Ring estimates the body pose with. They are gated behind
+#: Meta's SAM License on Hugging Face, so no installer may fetch them for you.
+SAM3D_WEIGHTS = "sam_3d_body_dinov3_bf16.safetensors"
 
 
 def missing_manual_assets(paths: dict[str, Path]) -> list[str]:
     """What no installer may fetch: licence-gated downloads.
 
-    SMPL-X is not in 4DAnyone's published model list. It is gated behind
-    registration at smpl-x.is.tue.mpg.de, and GVHMR needs it for the motion
-    solve -- so Generate Ring fails without it, however complete everything
-    else looks.
+    SAM 3D Body's weights live in ComfyUI's ``models/detection`` folder. With
+    ``--comfyui-root`` the check is exact; without it the installer cannot see
+    ComfyUI's model folders, so it names the file and says where it goes.
     """
 
-    root = paths.get("fdanyone_root")
-    if root is None:
-        return []
-    smplx = root / "models" / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
-    return [] if smplx.is_file() else [str(smplx)]
+    comfy = paths.get("comfyui_root")
+    if comfy is None:
+        return [f"ComfyUI/models/detection/{SAM3D_WEIGHTS}"]
+    target = Path(comfy) / "models" / "detection" / SAM3D_WEIGHTS
+    return [] if target.is_file() else [str(target)]
 
 
 # -- steps -----------------------------------------------------------------
@@ -599,11 +634,17 @@ def main() -> int:
                         help=f"Where to clone the three checkouts. Default: {PACKAGE_ROOT / 'deps'}")
     parser.add_argument("--ref", default=None,
                         help="Override the pinned ref for every checkout (default: each repo's own pin, "
-                             + ", ".join(f"{n}@{r}" for n, _, r in CHECKOUTS.values()) + ").")
+                             + ", ".join(f"{n}@{r[:10] if _is_commit_hash(r) else r}" for n, _, r in CHECKOUTS.values()) + ").")
     parser.add_argument("--work-root", default=None,
                         help="Large drive for per-run intermediates (~20 GB/run). Written to config.json.")
+    parser.add_argument("--comfyui-root", type=Path, default=None,
+                        help="ComfyUI checkout; lets the installer check whether the SAM 3D Body "
+                             "weights are already in its models/detection folder")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Do not clone the checkouts; use whatever the config already points at.")
+    parser.add_argument("--with-turbo", action="store_true",
+                        help="Also download the 4DAnyone-Turbo LoRA. It is CC BY-NC-SA 4.0 "
+                             "(non-commercial) and Generate Ring leaves it off by default.")
     parser.add_argument("--no-models", action="store_true",
                         help="Do not download 4DAnyone's published weights.")
     parser.add_argument("--no-configure", action="store_true",
@@ -700,7 +741,7 @@ def main() -> int:
     if not args.no_models and checkouts:
         LOGGER.info("models -- 4DAnyone's published weights")
         try:
-            fetch_models(checkouts, dry_run=args.dry_run)
+            fetch_models(checkouts, with_turbo=args.with_turbo, dry_run=args.dry_run)
         except InstallError as exc:
             LOGGER.error("%s", exc)
             LOGGER.error("The weights can be fetched later; everything else is installed.")
@@ -721,16 +762,17 @@ def main() -> int:
     LOGGER.info("done -- %s installed, torch untouched", ", ".join(selected))
 
     # The one thing no installer may do for you.
-    manual = missing_manual_assets(checkouts)
+    manual = missing_manual_assets({**checkouts, **({"comfyui_root": args.comfyui_root} if args.comfyui_root else {})})
     if manual:
         LOGGER.info("")
-        LOGGER.info("ONE STEP LEFT -- SMPL-X body models are licence-gated and cannot be")
-        LOGGER.info("downloaded automatically. Generate Ring needs them for the motion solve.")
-        LOGGER.info("  1. register and accept the licence at https://smpl-x.is.tue.mpg.de/")
-        LOGGER.info("  2. download models_smplx_v1_1.zip")
-        LOGGER.info("  3. place SMPLX_NEUTRAL.npz at:")
+        LOGGER.info("ONE STEP LEFT -- the SAM 3D Body weights are gated behind Meta's SAM License and")
+        LOGGER.info("cannot be downloaded automatically. Generate Ring estimates the body pose with them.")
+        LOGGER.info("  1. accept the license and download %s", SAM3D_WEIGHTS)
+        LOGGER.info("     (Comfy-Org/sam-3d-body on Hugging Face)")
+        LOGGER.info("  2. place it at:")
         for path in manual:
             LOGGER.info("       %s", path)
+        LOGGER.info("  Needs a ComfyUI that ships the SAM 3D Body nodes (0.34 or newer).")
     LOGGER.info("")
     LOGGER.info("Restart ComfyUI to pick up the nodes.")
     return 0

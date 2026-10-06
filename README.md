@@ -29,13 +29,17 @@ new enough to target it.
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
    or `./install.sh` on Linux. It clones the three checkouts it drives at
-   pinned versions (4DAnyone `v0.0.1`, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs
-   the Python dependencies into ComfyUI's own environment, downloads the model
-   weights, and writes `config.json` pointing at all of it. Expect it to take a while and around 30 GB.
-3. **Download SMPL-X** models that require manual registration at
-   [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), download
-   `models_smplx_v1_1.zip`, and extract `SMPLX_NEUTRAL.npz` under
-   `deps/4DAnyone/models/body_models/smplx/`.
+   pinned versions (4DAnyone at a pinned commit of our fork's SAM 3D Body
+   branch, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs the Python dependencies
+   into ComfyUI's own environment, downloads the model weights, and writes
+   `config.json` pointing at all of it. Expect it to take a while and around
+   30 GB. The non-commercial Turbo LoRA is *not* downloaded unless you pass
+   `--with-turbo` (see [Commercial use](#commercial-use)).
+3. **Download the SAM 3D Body weights**, which are gated behind Meta's SAM
+   License: accept it on Hugging Face (`Comfy-Org/sam-3d-body`), download
+   `sam_3d_body_dinov3_bf16.safetensors`, and put it in
+   `<ComfyUI>/models/detection/`. This needs a ComfyUI that ships the SAM 3D
+   Body nodes (0.34 or newer). Generate Ring uses it to estimate the body pose.
 4. **Restart ComfyUI** if it was running — custom nodes load at startup.
 5. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.
@@ -44,13 +48,14 @@ new enough to target it.
 ### About your clip
 
 Exactly **121 frames** are used by 4DAnyone, so at least that many frames after 
-`start_time` (~5 s at 24 fps) at 720p are required. Generate Ring checks this up 
+`start_frame` (~5 s at 24 fps) at 720p are required. Generate Ring checks this up 
 front rather than failing an hour in.
 
 ### What to expect
 
-Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
-`enable_turbo`, from one 121-frame clip:
+Measured on an RTX 5090 (32 GB), 24 views with RCP on and `enable_turbo` **on**
+(the Generate Ring row below is Turbo's; the stages after it do not depend on it),
+from one 121-frame clip:
 
 | stage | time | peak VRAM |
 |---|---|---|
@@ -59,9 +64,12 @@ Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
 | Train 4DGS | ~1 h (30000 iterations) | whole card |
 | Bake SOGST | ~1 min | — |
 
-`enable_turbo` is on by default and does the ring in 4 denoising steps. Turning
-it off runs the base model — substantially slower, and the configuration the
-older figures in this README were measured against.
+`enable_turbo` is **off by default**. Turbo does the ring in 4 denoising steps,
+but its LoRA is licensed CC BY-NC-SA 4.0 — non-commercial — so the default is the
+Apache-2.0 base model: substantially slower (24 steps), and the configuration the
+older figures in this README were measured against. Turn it on only for
+non-commercial work, after fetching the LoRA with `./install.sh --with-turbo
+--groups core` (or 4DAnyone's `scripts/download_model.py`).
 
 The `.sogst` and its interchange PLY land in ComfyUI's output gallery under
 `cumuli/`. Everything heavier lives under `<work_root>/<run_name>/`.
@@ -76,9 +84,29 @@ button. See [Caching](#caching) for when a stage re-runs.
 `./install.sh --help` breaks the run into parts: `--no-fetch` keeps checkouts
 you already have, `--no-models` and `--no-configure` skip those stages,
 `--deps-dir` moves the clones, `--work-root` sets the scratch drive, `--ref`
-overrides the pinned versions, and `--dry-run` prints every command without
-running any of it. The sections below
+overrides the pinned versions (a tag, a branch, or a full commit hash),
+`--with-turbo` also fetches the Turbo LoRA, `--comfyui-root` lets the final
+check see whether the SAM 3D Body weights are already in place, and `--dry-run`
+prints every command without running any of it. The sections below
 document what each stage does and why.
+
+## Commercial use
+
+The code in this repository is PolyForm-Noncommercial; a commercial licence is
+available separately. Whether a *pipeline* can be used commercially also depends on
+the third-party models it runs, and as of this writing that holds only up to the
+trainer:
+
+| stage | status |
+|---|---|
+| Body pose (SAM 3D Body, MHR) | Replaces GVHMR and SMPL-X, which were research-only and non-commercial. SAM 3D Body is under Meta's SAM License, which allows commercial use but excludes ITAR and military or warfare uses, lets Meta amend the terms, and carries an indemnity. Read it. |
+| Ring generation | 4DAnyone and the Wan2.2 base model are Apache-2.0. **`enable_turbo` is off by default**: the Turbo adapter is CC BY-NC-SA 4.0. Leave it off for commercial use. |
+| Masks (BiRefNet) | MIT. |
+| Real-capture rig solve | `feature_type` defaults to `aliked` (BSD). `superpoint`'s weights are non-commercial research use only. |
+| **4DGS training (OMG4)** | **Not cleared.** The trainer builds Inria's `diff-gaussian-rasterization` and `simple-knn`, which carry a non-commercial research licence, and OMG4 itself has no licence file. Until that is resolved with the rights holders or replaced, this stage is non-commercial. |
+
+See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md). This is a summary
+of licence texts, not legal advice.
 
 ## Requirements
 
@@ -91,11 +119,11 @@ document what each stage does and why.
 
 Everything runs in ComfyUI's environment. On top of a stock ComfyUI install it
 needs the packages below, all additive — no downgrade of torch, numpy,
-transformers, timm or ultralytics.
+transformers or timm.
 
 **`install.sh` / `install.bat` do all of it** — see [Quickstart](#quickstart).
 It is idempotent (already-installed packages are skipped), auto-detects the CUDA
-toolkit and GPU arch for the extension builds, and records the five pinned
+toolkit and GPU arch for the extension builds, and records the four pinned
 packages before and after: if pip moves one, the run fails loudly instead of
 leaving a broken ComfyUI to discover an hour later. `--force` reinstalls and
 rebuilds, which is what you want after a torch upgrade. The interpreter is the
@@ -106,8 +134,8 @@ interpreter it picked has no torch.
 The rest of this section is what the script does, for anyone doing it by hand:
 
 ```bash
-# 4DAnyone + vendored GVHMR
-pip install smplx==0.1.28 hydra-zen hydra_colorlog yacs lapx ftfy \
+# 4DAnyone
+pip install hydra-zen hydra_colorlog yacs lapx ftfy \
             sentencepiece fire colorlog ffmpeg-python
 # the .sogst bake
 pip install dahuffman
@@ -173,11 +201,11 @@ staging, the 4DGS dataset, trainer checkpoints — ~20 GB per run) land under
 The generation and training stages run as *child processes of that same
 interpreter*, not of another env: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 only takes effect before a process's first CUDA allocation, and both stages
-want the whole device. The subprocess env also pins
-`FDANYONE_ATTENTION_BACKEND=sdpa` — 4DAnyone's auto policy would pick
-sageattention when ComfyUI has it installed, and at this model's shapes
-sageattn peaks at exactly **2x** SDPA's memory, which is the difference between
-RCP fitting a 32 GB card and not.
+want the whole device. The `attention_backend` setting (default `sdpa`, passed
+as 4DAnyone's `--attention_backend`) pins the attention implementation —
+4DAnyone's `auto` policy would pick sageattention when ComfyUI has it
+installed, and at this model's shapes sageattn peaks at exactly **2x** SDPA's
+memory, which is the difference between RCP fitting a 32 GB card and not.
 
 ## The nodes
 
@@ -189,7 +217,7 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 
 | node | what it does |
 |---|---|
-| **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
+| **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. The ring is described as `total_views` = `elevation_rows` x `views_per_row`: set any two and the third is worked out (0 = unset; nothing set is one row of 24). Rows are spaced evenly from `start_elevation` to `end_elevation` (degrees above the subject, -15 to 45; one row sits at the start), rounded to whole degrees. These are translated to 4DAnyone's `views_per_layer` and `layer_pitches`, and the report prints the resolved layout. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
 | **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other loaders. |
 | **Ring Contact Sheet** | One frame from every view, tiled. The fastest way to spot cross-view identity drift. |
 | **Select View** | One view as VIDEO + IMAGE + its camera JSON. |
@@ -216,7 +244,7 @@ after a server restart reuses the 90-minute ring and the 1-hour checkpoint
 instantly, and a changed input replaces the stale artifact automatically.
 Two deliberate exceptions: a directory the bridge did not stamp is never
 deleted (foreign results error with guidance instead), and seed-only changes
-keep the GVHMR motion cache, which does not depend on the seed.
+keep the cached body pose, which does not depend on the seed.
 
 ### LoRA identity
 
@@ -353,13 +381,16 @@ factor of ½.
 
 ### Settings that matter
 
-- **`enable_rcp True` (the default) with `views_per_group 4`** on Generate Ring.
-  RCP generates four anchor views the whole ring is conditioned on; without it
-  each denoising group invents its own far side and the back of the ring will
-  not reconstruct (measured: scene swaps, 1.6x saturation swings). With group 4
-  and the sdpa pin it peaks at ~28.6 GiB on a 32 GB card; group 6 does not fit.
+- **`enable_rcp True` (the default)** on Generate Ring. RCP generates anchor
+  views the whole ring is conditioned on; without it each denoising group
+  invents its own far side and the back of the ring will not reconstruct
+  (measured: scene swaps, 1.6x saturation swings). The total ring must divide
+  by 6: current 4DAnyone denoises views in fixed groups of six, so the old
+  `views_per_group` widget is gone. *Memory figures from the previous
+  4DAnyone release (group 4 + sdpa: ~28.6 GiB peak on a 32 GB card; group 6
+  did not fit) predate its memory work and are not yet re-measured.*
 - **Input length.** 4DAnyone always generates exactly 121 frames. The clip must
-  supply that many after `start_time` — about 5 s at 24 fps — at 720p or better.
+  supply that many after `start_frame` — about 5 s at 24 fps — at 720p or better.
   The node checks this and says what is missing rather than failing an hour in.
 - **`test_cameras`** on Build 4DGS Dataset. Left empty, the dataset duplicates a
   training camera into the test split, so that PSNR is a training-view monitor
@@ -367,7 +398,8 @@ factor of ½.
 - **`sh_degree`** on Train 4DGS: content-dependent. 2 measured better on one
   real subject capture (30.87 vs 30.04 dB); 3 measured better on a generated
   ring (23.2 vs 21.0 dB held-out). When in doubt, try both — the runs are an
-  hour each and the fingerprint cache keeps whichever you keep.
+  hour each and the fingerprint cache keeps whichever you keep. 0 trains view-independent colour only (no
+  `f_rest` columns), for the smallest bake.
 - **`mask_filter`** on Bake SOGST (on by default) runs the lifetime
   mask-consistency filter against each window's own dataset, which drops
   silhouette-escaping splats. It is junk removal, not a quality regulariser.

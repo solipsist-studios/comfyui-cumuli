@@ -32,6 +32,7 @@ from comfy.model_management import InterruptProcessingException, processing_inte
 from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, InputImpl, IO
 
+from . import pose as pose_module
 from . import runner
 from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset, slice_dataset_window
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
@@ -57,7 +58,7 @@ from .train import (
 )
 from .validate import ValidationError, validate_dataset
 from .videoio import read_frames
-from .vram import InsufficientVRAM, require_free_vram
+from .vram import InsufficientVRAM, NoCudaDevice, check_device, require_free_vram
 from .windowing import WindowingError, even_windows
 
 LOGGER = logging.getLogger("comfyui-cumuli")
@@ -246,18 +247,47 @@ def _register_option_routes() -> None:
 _register_option_routes()
 
 
+def _cuda_device_options() -> tuple[list[str], str]:
+    """The devices the Generate Ring dropdown offers, and the tooltip naming them.
+
+    Values stay plain ``cuda:N`` (a combo carries strings only), so a workflow saved with
+    ``cuda:0`` is still valid; the GPU names go in the tooltip. ``cuda`` (all visible GPUs) is
+    offered when there is more than one. Read when ComfyUI starts, like every combo's options.
+    """
+
+    try:
+        names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    except Exception:  # noqa: BLE001 - no usable CUDA: say so, and keep the old default valid
+        names = []
+    if not names:
+        return ["cuda:0"], "GPU the ring is generated on. No CUDA device was detected when ComfyUI started."
+    options = [f"cuda:{index}" for index in range(len(names))]
+    listing = "; ".join(f"cuda:{index} = {name}" for index, name in enumerate(names))
+    if len(names) > 1:
+        options.insert(0, "cuda")
+        return options, f"GPU the ring is generated on ({listing}). 'cuda' uses all visible GPUs."
+    return options, f"GPU the ring is generated on ({listing})."
+
+
 class CumuliGenerateRing(IO.ComfyNode):
     """Generate a synchronized ring of novel views from one monocular clip.
 
     The input is a **file on disk**, not an IMAGE batch, for three reasons:
     4DAnyone re-decodes the clip itself against a canonical presentation clock;
-    the file stem is the cache key for the reusable GVHMR motion solve and the
-    name of the published result directory; and the job runs in a separate
-    interpreter, so any in-memory batch would have to be re-encoded anyway.
+    the file stem is the cache key for the reusable body pose and the name of
+    the published result directory; and the job runs in a separate process, so
+    any in-memory batch would have to be re-encoded anyway.
+
+    Three stages run in order: 4DAnyone cuts the canonical 121-frame clip (a
+    cheap child process); SAM 3D Body estimates the body pose on it *inside
+    ComfyUI*, using ComfyUI's own model machinery; then 4DAnyone generates the
+    views from that pose in a child process. The pose is cached per clip, so a
+    seed or layout change does not estimate it again.
     """
 
     @classmethod
     def define_schema(cls):
+        device_options, device_tooltip = _cuda_device_options()
         return IO.Schema(
             node_id="CumuliGenerateRing",
             display_name="Cumuli Generate Ring (4DAnyone)",
@@ -293,20 +323,18 @@ class CumuliGenerateRing(IO.ComfyNode):
                     default="",
                     tooltip=(
                         "Optional name for this run. Empty uses the video's filename stem. "
-                        "The name keys both the result directory and the reusable GVHMR motion cache."
+                        "The name keys both the result directory and the reusable body-pose cache."
                     ),
                     optional=True,
                 ),
-                IO.Int.Input("views_per_layer", default=24, min=4, max=96, step=1,
-                             tooltip="Evenly spaced yaw views per pitch layer. Must divide by 4 or 6."),
-                IO.Combo.Input("views_per_group", options=["4", "6", "auto"], default="4",
-                               tooltip="Target views denoised together. 6 overruns 32 GB; 4 is the safe value."),
-                IO.String.Input("layer_pitches", default="15",
-                                tooltip="Camera pitch per layer in degrees, comma separated, each between -15 and 45."),
+                IO.Int.Input("views_per_row", default=0, min=0, max=96, step=1,
+                             tooltip="Evenly spaced azimuth (yaw) views in each elevation row. The total ring "
+                                     "(rows x views per row) must divide by 6. 0 = work it out from "
+                                     "total_views and elevation_rows (24 if neither is set)."),
                 IO.Int.Input("start_yaw", default=0, min=-180, max=180, step=1,
-                             tooltip="First yaw in every layer. 0 faces the person."),
+                             tooltip="First yaw in every row. 0 faces the person."),
                 IO.Int.Input("yaw_span", default=360, min=1, max=360, step=1,
-                             tooltip="Angular range each layer sweeps. The end angle is excluded."),
+                             tooltip="Angular range each row sweeps. The end angle is excluded."),
                 IO.Boolean.Input("enable_rcp", default=True,
                                  tooltip="Reference-view proposals: anchors at yaw 60/135/210/285 that every "
                                          "dense group is then conditioned on. Without it the far side of the "
@@ -314,19 +342,23 @@ class CumuliGenerateRing(IO.ComfyNode):
                                          "packed view (about 2.9 GiB) and ~10 min; fits 32 GB at group 4."),
                 IO.Boolean.Input("enable_tcr", default=True,
                                  tooltip="Shift view groups between denoising steps for cross-view consistency."),
-                IO.Float.Input("start_time", default=0.0, min=0.0, max=86400.0, step=0.1,
-                               tooltip="Where the fixed 121-frame window starts on the input timeline, in seconds."),
-                IO.String.Input("target_fps", default="auto",
-                                tooltip="'auto' keeps the source clock unless it divides cleanly to 24/25/30."),
+                IO.Int.Input("start_frame", default=0, min=0, max=10_000_000, step=1,
+                             tooltip="The frame of the input video where the fixed 121-frame window starts "
+                                     "(0 is the first frame), counted in the source video's own frames. The "
+                                     "node converts it to a time with the video's frame rate."),
+                IO.Float.Input("target_fps", default=0.0, min=0.0, max=480.0, step=0.001,
+                               tooltip="Frame rate to resample the window to. 0 keeps the source's own rate, "
+                                       "which 4DAnyone only changes when it divides cleanly into 24, 25 or 30."),
                 IO.Int.Input("seed", default=42, min=0, max=0xffffffffffffffff, control_after_generate=True),
-                IO.String.Input("device", default="cuda:0",
-                                tooltip="CUDA device for the subprocess.", advanced=True),
+                IO.Combo.Input("device", options=device_options, default="cuda:0",
+                               tooltip=device_tooltip, advanced=True),
                 IO.String.Input("prompt", default="",
                                 tooltip="Override the model's fixed prompt -- put LoRA trigger words "
                                         "here (mixing with the stock Chinese prompt is fine, e.g. "
                                         "'rin_karasuba, \u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c'). Empty keeps the stock prompt."),
-                IO.Float.Input("min_free_vram_gb", default=-1.0, min=-1.0, max=200.0, step=0.5,
-                               tooltip="Refuse to start below this much free VRAM. -1 uses the bridge config value.",
+                IO.Float.Input("min_free_vram_gb", default=0.0, min=0.0, max=200.0, step=0.5,
+                               tooltip="Refuse to start below this much free VRAM. 0 uses the bridge config "
+                                       "value (set that to 0 to skip the check).",
                                advanced=True),
                 IO.Boolean.Input("dry_run", default=False,
                                  tooltip="Validate everything and report the command line without running it.",
@@ -334,13 +366,28 @@ class CumuliGenerateRing(IO.ComfyNode):
                 # Appended last on purpose: a saved workflow stores widget values
                 # positionally, so inserting anywhere earlier shifts every value
                 # after it.
-                IO.Boolean.Input("enable_turbo", default=True,
+                IO.Boolean.Input("enable_turbo", default=False,
                                  tooltip="Use 4DAnyone-Turbo (a distilled LoRA over the same base "
-                                         "checkpoint) for accelerated denoising. Off runs the base "
-                                         "model: slower, and the configuration the pack's empirical "
-                                         "settings were measured against. Part of the ring "
-                                         "fingerprint, so switching regenerates.",
+                                         "checkpoint) for 4-step denoising, several times faster. OFF by "
+                                         "default because the Turbo adapter is licensed CC BY-NC-SA 4.0 "
+                                         "(non-commercial); off runs the Apache-2.0 base model, which is "
+                                         "slower. Turn it on only for non-commercial work. Part of the "
+                                         "ring fingerprint, so switching regenerates.",
                                  advanced=True),
+                IO.Int.Input("total_views", default=0, min=0, max=384, step=1,
+                             tooltip="Total views in the ring = elevation_rows x views_per_row. Set any two of "
+                                     "total_views, elevation_rows and views_per_row and the third is worked "
+                                     "out; 0 leaves one unset. With none set the ring is 1 row of 24."),
+                IO.Int.Input("elevation_rows", default=0, min=0, max=16, step=1,
+                             tooltip="Number of elevation rows (camera heights). They are spaced evenly from "
+                                     "start_elevation to end_elevation. 0 = work it out (1 if nothing else "
+                                     "is set)."),
+                IO.Int.Input("start_elevation", default=15, min=-15, max=45, step=1,
+                             tooltip="Elevation of the first row in degrees above the subject (-15 to 45). "
+                                     "A single row sits here."),
+                IO.Int.Input("end_elevation", default=45, min=-15, max=45, step=1,
+                             tooltip="Elevation of the last row in degrees. Ignored with one row; rows in "
+                                     "between are spaced evenly, rounded to whole degrees."),
             ],
             outputs=[
                 Ring.Output(display_name="ring"),
@@ -356,39 +403,48 @@ class CumuliGenerateRing(IO.ComfyNode):
         video,
         model=None,
         run_name="",
-        views_per_layer=24,
-        views_per_group="4",
-        layer_pitches="15",
+        views_per_row=0,
         start_yaw=0,
         yaw_span=360,
         enable_rcp=True,
         enable_tcr=True,
-        start_time=0.0,
-        target_fps="auto",
+        start_frame=0,
+        target_fps=0.0,
         seed=42,
         device="cuda:0",
         prompt="",
-        min_free_vram_gb=-1.0,
+        min_free_vram_gb=0.0,
         dry_run=False,
-        enable_turbo=True,
+        enable_turbo=False,
+        total_views=0,
+        elevation_rows=0,
+        start_elevation=15,
+        end_elevation=45,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         try:
             settings = load_settings()
             settings.validate()
+            layout = runner.resolve_ring_layout(
+                total_views=total_views,
+                elevation_rows=elevation_rows,
+                views_per_row=views_per_row,
+                start_elevation=start_elevation,
+                end_elevation=end_elevation,
+            )
             source = runner.materialize_video_source(video, run_name, settings.source_root)
             staged = runner.stage_source_video(settings, source, run_name)
+            start_time = runner.start_time_for_frame(start_frame, runner.probe(staged).fps)
             request = runner.build_request(
                 video_path=staged,
-                views_per_layer=views_per_layer,
-                layer_pitches=layer_pitches,
+                views_per_layer=layout.views_per_row,
+                layer_pitches=layout.pitches,
                 start_yaw=start_yaw,
                 yaw_span=yaw_span,
-                views_per_group=views_per_group,
                 enable_rcp=enable_rcp,
                 enable_tcr=enable_tcr,
                 start_time=start_time,
-                target_fps=target_fps,
+                target_fps=runner.fps_from_setting(target_fps),
                 seed=seed,
                 device=device,
                 enable_turbo=enable_turbo,
@@ -416,24 +472,44 @@ class CumuliGenerateRing(IO.ComfyNode):
             requirements = runner.check_video(settings, request)
             result_dir = settings.result_dir(request.run_name)
             fingerprint, motion_key = runner.ring_fingerprint(request)
-            previous_stamp = runner.read_stamp(result_dir)
-            decision = runner.prepare_artifact_dir(result_dir, fingerprint)
-            argv = runner.build_argv(settings, request)
+            decision = runner.prepare_artifact_dir(
+                result_dir, fingerprint, resumable=runner.RING_RUN_ENTRIES
+            )
+            pose_npz = settings.pose_dir(request.run_name) / runner.POSE_NPZ
+            argv = runner.build_argv(settings, request, sam3d_npz=pose_npz)
+            # Resolved up front for the report, but only *required* below: a cached ring
+            # needs neither the weights nor the pose.
+            try:
+                weights = pose_module.resolve_weights(settings.sam3d_weights)
+                weights_problem = pose_module.host_problem()
+            except pose_module.PoseError as exc:
+                weights, weights_problem = None, str(exc)
         except (SettingsError, runner.ValidationError) as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
 
-        cached_motion = runner.motion_is_cached(settings, request)
+        try:
+            check_device(request.device)
+            device_line = f"device: {request.device}"
+        except NoCudaDevice as exc:
+            device_line = f"device: UNAVAILABLE -- {exc}"
+        if weights is not None and runner.pose_is_cached(settings, request, weights):
+            pose_line = f"pose: SAM 3D Body, reused ({pose_npz})"
+        elif weights_problem:
+            pose_line = f"pose: SAM 3D Body UNAVAILABLE -- {weights_problem}"
+        else:
+            pose_line = f"pose: SAM 3D Body, will be estimated ({settings.sam3d_weights})"
         header = [
             f"run_name: {request.run_name}",
             f"input: {requirements.probe.width}x{requirements.probe.height} "
             f"@ {float(requirements.probe.fps):.3f} fps, {requirements.probe.num_frames} frames",
             f"clip: {requirements.num_frames} frames @ {float(requirements.canonical_fps):.3f} fps "
-            f"from {request.start_time:.2f}s",
-            f"views: {request.num_target_views} ({request.views_per_layer} per layer x "
-            f"{len(request.layer_pitches)} layer(s), group {request.views_per_group}, rcp={request.enable_rcp})",
+            f"from frame {start_frame} ({request.start_time:.2f}s)",
+            f"views: {request.num_target_views} ({len(request.layer_pitches)} row(s) x "
+            f"{request.views_per_layer} per row, elevations {list(request.layer_pitches)} deg, "
+            f"groups of {runner.VIEW_GROUP_SIZE}, rcp={request.enable_rcp})",
             f"result_dir: {result_dir}",
-            f"gvhmr motion cache: {'reused' if cached_motion else 'will be solved'} "
-            f"({settings.motion_dir(request.run_name)})",
+            pose_line,
+            device_line,
             "command: " + " ".join(argv),
         ]
         if lora_note:
@@ -449,10 +525,30 @@ class CumuliGenerateRing(IO.ComfyNode):
             ring = RingResult.load(result_dir)
             _send_text(node_id, "cached result (inputs unchanged)")
             return IO.NodeOutput(ring, str(result_dir), "CACHED RESULT\n" + "\n".join(header))
-        if runner.clear_stale_motion(settings, request, motion_key, previous_stamp):
-            header.append("gvhmr motion cache: cleared (clip changed)")
 
-        minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+        try:
+            check_device(request.device)
+        except NoCudaDevice as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        if weights_problem:
+            raise RuntimeError(f"Cumuli: cannot estimate the body pose: {weights_problem}")
+
+        def estimate(clip: Path, npz: Path) -> None:
+            _send_text(node_id, "estimating body pose (SAM 3D Body)")
+            pose_module.estimate_pose(clip, npz, weights=weights, batch_size=settings.sam3d_batch_size)
+
+        _send_text(node_id, "preparing the clip")
+        try:
+            pose_npz, pose_reused = runner.ensure_pose(
+                settings, request, weights=weights, estimate=estimate, should_cancel=_cancelled
+            )
+        except SubprocessCancelled:
+            raise InterruptProcessingException() from None
+        except (SubprocessError, runner.ValidationError, pose_module.PoseError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        header.append(f"pose: {'reused' if pose_reused else 'estimated'} -> {pose_npz}")
+
+        minimum = runner.vram_floor(min_free_vram_gb, settings)
         try:
             free_gb, total_gb = require_free_vram(request.device, minimum)
         except InsufficientVRAM as exc:
@@ -469,6 +565,7 @@ class CumuliGenerateRing(IO.ComfyNode):
             outcome = runner.execute(
                 settings,
                 request,
+                sam3d_npz=pose_npz,
                 on_progress=on_progress,
                 should_cancel=_cancelled,
             )
@@ -1526,9 +1623,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 IO.Int.Input("iterations", default=30000, min=100, max=200000, step=100),
                 IO.Int.Input("num_pts", default=100000, min=1000, max=2000000, step=1000),
                 IO.Int.Input("batch_size", default=2, min=1, max=16, step=1),
-                IO.Combo.Input("sh_degree", options=["3", "2", "1"], default="2",
+                IO.Combo.Input("sh_degree", options=["3", "2", "1", "0"], default="2",
                                tooltip="Spherical-harmonic degree. 2 measured better than 3 on "
-                                       "subject captures (30.87 vs 30.04 dB)."),
+                                       "subject captures (30.87 vs 30.04 dB). 0 is view-independent "
+                                       "colour only, and bakes to a much smaller .sogst."),
                 IO.Int.Input("densify_until_iter", default=25000, min=100, max=200000, step=100,
                              advanced=True),
                 IO.Int.Input("densify_until_num_points", default=3000000, min=10000, max=20000000,
@@ -1564,7 +1662,9 @@ class CumuliTrain4DGS(IO.ComfyNode):
                                      "of what you set here -- it only raises real concurrency on multiple "
                                      "GPUs, or a min_free_vram_gb/num_pts small enough to leave headroom "
                                      "for more than one window at once."),
-                IO.Float.Input("min_free_vram_gb", default=-1.0, min=-1.0, max=200.0, step=0.5,
+                IO.Float.Input("min_free_vram_gb", default=0.0, min=0.0, max=200.0, step=0.5,
+                               tooltip="Refuse to start below this much free VRAM. 0 uses the bridge config "
+                                       "value (set that to 0 to skip the check).",
                                advanced=True),
                 IO.Boolean.Input("dry_run", default=False,
                                  tooltip="Write the config and report the command without training.",
@@ -1595,7 +1695,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
         lambda_opa_mask=0.005,
         max_window_frames=31,
         max_parallel_windows=1,
-        min_free_vram_gb=-1.0,
+        min_free_vram_gb=0.0,
         dry_run=False,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
@@ -1689,10 +1789,11 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 shutil.rmtree(options.model_dir, ignore_errors=True)
                 header.append("previous training crashed before finishing; retraining")
 
-            minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+            minimum = runner.vram_floor(min_free_vram_gb, settings)
             try:
+                check_device(settings.device)
                 free_gb, total_gb = require_free_vram(settings.device, minimum)
-            except InsufficientVRAM as exc:
+            except (InsufficientVRAM, NoCudaDevice) as exc:
                 raise RuntimeError(f"Cumuli: {exc}") from None
             header.append(f"vram: {free_gb:.1f} GB free of {total_gb:.1f} GB")
 
@@ -1816,7 +1917,11 @@ class CumuliTrain4DGS(IO.ComfyNode):
             ))
 
         if specs:
-            minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
+            try:
+                check_device(settings.device)
+            except NoCudaDevice as exc:
+                raise RuntimeError(f"Cumuli: {exc}") from None
+            minimum = runner.vram_floor(min_free_vram_gb, settings)
             progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
             fractions = {i: 1.0 for i in outcomes}
             fractions.update({spec.index: 0.0 for spec in specs})

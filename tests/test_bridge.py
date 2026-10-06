@@ -70,7 +70,6 @@ def settings(fake_repo: Path) -> BridgeSettings:
         python_exe=sys.executable,  # skips conda discovery
         data_dir=fake_repo / "data",
         model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0",
         min_free_vram_gb=30.0,
         subprocess_env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
@@ -84,7 +83,6 @@ def known_good_request(video: Path) -> runner.RunRequest:
         layer_pitches="15",
         start_yaw=0,
         yaw_span=360,
-        views_per_group="4",
         enable_rcp=False,
         enable_tcr=True,
         start_time=0.0,
@@ -103,18 +101,130 @@ def test_argv_is_the_known_good_command_line(settings, tmp_path):
     flags = dict(part.split("=", 1) for part in argv[2:])
     # The empirically safe configuration for a 32 GB card.
     assert flags["--views_per_layer"] == "24"
-    assert flags["--views_per_group"] == "4"
+    assert "--views_per_group" not in flags      # groups are fixed at six upstream
     assert flags["--enable_rcp"] == "False"
     assert flags["--enable_tcr"] == "True"
     assert flags["--layer_pitches"] == "[15]"
     assert flags["--seed"] == "42"
-    assert flags["--data_dir"] == str(settings.data_dir)
+    # 4DAnyone no longer takes a data_dir: the result directory is named outright.
+    assert "--data_dir" not in flags
+    assert flags["--output_dir"] == str(settings.result_dir("clip"))
+    assert flags["--attention_backend"] == "sdpa"
     # inference() takes gpu_ids, not device: it dropped the latter when it
     # gained multi-GPU view stages. fire binds what it knows, runs the job,
     # and only then chokes on the leftover -- so a stale flag costs 90 minutes.
     assert flags["--gpu_ids"] == "[0]"
     assert "--device" not in flags
-    assert flags["--enable_turbo"] == "True"
+    # Off unless asked for: the Turbo adapter is CC BY-NC-SA, so the default must be the
+    # Apache-2.0 base model. Turning it on has to be a deliberate act.
+    assert flags["--enable_turbo"] == "False"
+
+
+@pytest.mark.parametrize("frame, fps, seconds", [
+    (0, Fraction(24), 0.0),
+    (48, Fraction(24), 2.0),
+    (30, Fraction(30000, 1001), 1.001),      # NTSC: exact fractions, no float noise before the one rounding
+    (7, Fraction(25), 0.28),
+])
+def test_a_start_frame_becomes_a_time_on_the_input_timeline(frame, fps, seconds):
+    assert runner.start_time_for_frame(frame, fps) == pytest.approx(seconds, abs=1e-9)
+
+
+def test_a_start_frame_survives_the_trip_to_a_time_and_back():
+    """check_video asks the probe how many frames remain after the start *time*; it must land on the
+    frame the user typed, including at an NTSC rate."""
+
+    from cumuli_bridge.videoio import VideoProbe
+
+    for fps in (Fraction(24), Fraction(30000, 1001), Fraction(25)):
+        probe = VideoProbe(path=Path("x.mp4"), width=1280, height=720, fps=fps, num_frames=500, duration=20.0,
+                           frames_are_exact=True)
+        for frame in (0, 1, 37, 240, 499):
+            assert probe.frames_from(runner.start_time_for_frame(frame, fps)) == 500 - frame
+
+
+def test_a_bad_start_frame_or_frame_rate_is_refused():
+    with pytest.raises(runner.ValidationError, match="0 or more"):
+        runner.start_time_for_frame(-1, Fraction(24))
+    with pytest.raises(runner.ValidationError, match="frame rate"):
+        runner.start_time_for_frame(5, Fraction(0))
+
+
+@pytest.mark.parametrize("value, expected", [(0, "auto"), (0.0, "auto"), (24, "24"), (23.976, "23.976"), (29.97, "29.97"),
+                                             (12.5, "12.5"), (60.0, "60")])
+def test_target_fps_is_a_number_where_zero_keeps_the_source_rate(value, expected, tmp_path):
+    assert runner.fps_from_setting(value) == expected
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    request = runner.build_request(
+        video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360, enable_rcp=False,
+        enable_tcr=True, start_time=0.0, target_fps=runner.fps_from_setting(value), seed=0, device="cuda:0",
+    )
+    assert request.target_fps == expected
+
+
+def test_a_negative_target_fps_is_refused():
+    with pytest.raises(runner.ValidationError, match="0 .keep the source rate."):
+        runner.fps_from_setting(-1)
+
+
+def test_the_vram_floor_uses_the_config_at_zero_like_every_other_widget(settings):
+    assert settings.min_free_vram_gb == 30.0
+    assert runner.vram_floor(0, settings) == 30.0           # unset -> the bridge config
+    assert runner.vram_floor(0.0, settings) == 30.0
+    assert runner.vram_floor(12.5, settings) == 12.5        # an explicit floor wins
+    import dataclasses
+
+    off = dataclasses.replace(settings, min_free_vram_gb=0.0)
+    assert runner.vram_floor(0, off) == 0.0                 # the way to skip the check is the config, not the widget
+
+
+def test_a_machine_with_no_gpu_stops_before_any_work(monkeypatch):
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(vram.NoCudaDevice, match="No CUDA device is available.*Load Ring"):
+        vram.check_device("cuda:0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)          # a driver that reports none
+    with pytest.raises(vram.NoCudaDevice, match="No CUDA device"):
+        vram.check_device("cuda")
+
+
+def test_the_vram_check_alone_lets_a_gpu_less_machine_through(monkeypatch):
+    """The reason check_device exists: an unknown card size reads as "nothing to check", so without
+    it the run reaches the pose stage and fails there."""
+
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert vram.require_free_vram("cuda:0", 30.0) == (0.0, 0.0)
+
+
+def test_a_device_that_does_not_exist_is_named_with_the_ones_that_do(monkeypatch):
+    import torch
+
+    from cumuli_bridge import vram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    for fine in ("cuda", "cuda:0", "cuda:1", "cuda:abc"):               # all visible, either card, or a name the parser reports
+        vram.check_device(fine)
+    with pytest.raises(vram.NoCudaDevice, match=r"cuda:2 does not exist.*2 CUDA device.*cuda:0 to cuda:1"):
+        vram.check_device("cuda:2")
+
+
+def test_turbo_is_off_by_default_everywhere_it_is_declared(tmp_path):
+    import inspect
+
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    assert runner.RunRequest(video_path=video).enable_turbo is False
+    assert inspect.signature(runner.build_request).parameters["enable_turbo"].default is False
 
 
 def test_turbo_changes_the_fingerprint(tmp_path):
@@ -123,7 +233,7 @@ def test_turbo_changes_the_fingerprint(tmp_path):
     video = tmp_path / "clip.mp4"
     video.touch()
     common = dict(video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0,
-                  yaw_span=360, views_per_group=4, enable_rcp=True, enable_tcr=True,
+                  yaw_span=360, enable_rcp=True, enable_tcr=True,
                   start_time=0.0, target_fps="auto", seed=42, device="cuda:0")
     turbo = runner.build_request(**common, enable_turbo=True)
     base = runner.build_request(**common, enable_turbo=False)
@@ -207,11 +317,11 @@ def test_subprocess_env_drops_comfyui_python_paths(settings, monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, fragment",
     [
-        ({"views_per_group": "5"}, "must be 'auto', 4 or 6"),
-        ({"views_per_layer": 10, "views_per_group": "4"}, "divisible"),
+        ({"views_per_layer": 10}, "does not split into groups of 6"),
+        ({"views_per_layer": 8, "layer_pitches": "15,30"}, "does not split into groups of 6"),
         ({"layer_pitches": "60"}, "between -15 and 45"),
         ({"layer_pitches": "15,15"}, "must not repeat"),
-        ({"layer_pitches": ""}, "at least one pitch"),
+        ({"layer_pitches": ""}, "At least one elevation"),
         ({"yaw_span": 0}, "between 1 and 360"),
         ({"seed": -1}, "non-negative"),
         ({"start_time": -2.0}, "non-negative"),
@@ -223,7 +333,7 @@ def test_bad_settings_are_refused_before_any_gpu_work(tmp_path, kwargs, fragment
     video.touch()
     base = dict(
         video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
-        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=42, device="cuda:0",
     )
     with pytest.raises(runner.ValidationError, match=fragment):
@@ -235,11 +345,10 @@ def test_start_yaw_wraps_into_minus180_180(tmp_path):
     video.touch()
     request = runner.build_request(
         video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=270, yaw_span=360,
-        views_per_group="auto", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=0, device="cuda:0",
     )
     assert request.start_yaw == -90
-    assert request.views_per_group == "auto"
 
 
 @pytest.mark.parametrize(
@@ -310,11 +419,284 @@ def test_artifact_dir_never_deletes_foreign_directories(tmp_path):
     assert (root / "somebody-elses.data").exists()
 
 
+def test_an_interrupted_4danyone_run_is_not_a_foreign_directory(tmp_path):
+    """A failed run leaves its motion record and staging dir behind, unstamped.
+    That is 4DAnyone's own unfinished work, to be resumed, not refused."""
+
+    root = tmp_path / "result"
+    (root / "gvhmr").mkdir(parents=True)
+    (root / ".inference").mkdir()
+    (root / ".4danyone-request.json").write_text("{}")
+    assert runner.prepare_artifact_dir(root, "abc", resumable=runner.RING_RUN_ENTRIES) == "build"
+    assert (root / "gvhmr").is_dir() and (root / ".inference").is_dir()
+
+
+def test_a_stranger_beside_the_motion_record_is_still_refused(tmp_path):
+    root = tmp_path / "result"
+    (root / "gvhmr").mkdir(parents=True)
+    (root / "notes.txt").write_text("keep me")
+    with pytest.raises(runner.ValidationError, match="not produced by this bridge"):
+        runner.prepare_artifact_dir(root, "abc", resumable=runner.RING_RUN_ENTRIES)
+    assert (root / "notes.txt").exists()
+
+
+def test_config_example_stays_in_sync_with_the_defaults():
+    import json
+
+    from cumuli_bridge.settings import DEFAULTS
+
+    example = json.loads((Path(__file__).resolve().parent.parent / "config.example.json").read_text())
+    example.pop("_comment", None)
+    assert example == DEFAULTS
+
+
+def test_the_pose_cache_lives_outside_the_result_directory(settings):
+    """4DAnyone refuses any entry it does not recognise inside its result directory."""
+
+    pose_dir = settings.pose_dir("clip")
+    assert pose_dir == settings.data_dir / "pose" / "clip"
+    assert settings.result_dir("clip") not in pose_dir.parents
+
+
+class _PoseHarness:
+    """A stand-in for the two halves of the pose stage: 4DAnyone cutting the canonical
+    clip (a child process) and SAM 3D Body estimating on it (in ComfyUI)."""
+
+    def __init__(self, monkeypatch, tmp_path):
+        self.prepared: list[list[str]] = []
+        self.estimated: list[Path] = []
+        self.fail_estimate = False
+        self.write_npz = True
+        self.weights = tmp_path / "sam3d.safetensors"
+        self.weights.write_bytes(b"weights")
+        self.video = tmp_path / "clip.mp4"
+        self.video.write_bytes(b"data")
+
+        def fake_run(argv, **kwargs):
+            self.prepared.append([str(part) for part in argv])
+            out = Path(next(part.split("=", 1)[1] for part in argv if str(part).startswith("--output_dir=")))
+            out.mkdir(parents=True, exist_ok=True)
+            (out / runner.CANONICAL_CLIP).write_bytes(b"clip")
+
+        monkeypatch.setattr(runner, "run_streaming", fake_run)
+
+    def estimate(self, clip: Path, npz: Path) -> None:
+        self.estimated.append(clip)
+        if self.fail_estimate:
+            raise RuntimeError("SAM 3D Body failed")
+        if self.write_npz:
+            npz.write_bytes(b"pose")
+
+    def request(self, **overrides):
+        import dataclasses
+
+        return dataclasses.replace(known_good_request(self.video), **overrides)
+
+    def ensure(self, settings, request):
+        return runner.ensure_pose(settings, request, weights=self.weights, estimate=self.estimate)
+
+
+def test_the_pose_is_prepared_estimated_and_then_reused(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    npz, reused = harness.ensure(settings, request)
+    assert not reused and npz == settings.pose_dir("clip") / runner.POSE_NPZ and npz.is_file()
+    prepare = harness.prepared[0]
+    assert "--prepare_only=True" in prepare
+    assert f"--output_dir={settings.pose_dir('clip')}" in prepare
+    assert not any(part.startswith("--sam3d_npz") for part in prepare)
+
+    again, reused = harness.ensure(settings, request)
+    assert reused and again == npz
+    assert len(harness.prepared) == 1 and len(harness.estimated) == 1   # nothing re-run
+
+
+def test_a_seed_or_layout_change_keeps_the_pose(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.ensure(settings, harness.request())
+    _, reused = harness.ensure(settings, harness.request(seed=7, views_per_layer=12, enable_turbo=False))
+    assert reused and len(harness.estimated) == 1
+
+
+@pytest.mark.parametrize("change", [{"start_time": 2.0}, {"target_fps": "12"}])
+def test_a_different_clip_window_estimates_the_pose_again(settings, monkeypatch, tmp_path, change):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.ensure(settings, harness.request())
+    _, reused = harness.ensure(settings, harness.request(**change))
+    assert not reused and len(harness.estimated) == 2 and len(harness.prepared) == 2
+
+
+def test_different_weights_estimate_the_pose_again(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    harness.ensure(settings, request)
+    harness.weights.write_bytes(b"different weights")
+    _, reused = harness.ensure(settings, request)
+    assert not reused and len(harness.estimated) == 2
+
+
+def test_a_failed_estimate_is_never_trusted(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    harness.fail_estimate = True
+    with pytest.raises(RuntimeError, match="SAM 3D Body failed"):
+        harness.ensure(settings, request)
+    assert not runner.pose_is_cached(settings, request, harness.weights)
+    harness.fail_estimate = False
+    _, reused = harness.ensure(settings, request)
+    assert not reused and runner.pose_is_cached(settings, request, harness.weights)
+
+
+def test_an_estimate_that_writes_no_pose_is_an_error(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.write_npz = False
+    with pytest.raises(RuntimeError, match="wrote no sam3d_mhr70.npz"):
+        harness.ensure(settings, harness.request())
+
+
+def test_the_generation_command_names_the_pose(settings, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    npz = settings.pose_dir("clip") / runner.POSE_NPZ
+    argv = runner.build_argv(settings, known_good_request(video), sam3d_npz=npz)
+    assert f"--sam3d_npz={npz}" in argv
+    assert not any(part.startswith("--gvhmr_root") for part in argv)
+
+
+def test_the_pose_batch_halves_on_out_of_memory_until_it_fits():
+    from cumuli_bridge import pose
+
+    class FakeOOM(RuntimeError):
+        pass
+
+    attempts, released = [], []
+
+    def run(size):
+        attempts.append(size)
+        if size > 3:
+            raise FakeOOM("CUDA out of memory")
+        return f"done at {size}"
+
+    result, used = pose.run_with_batch_backoff(
+        run, 16, is_oom=lambda exc: isinstance(exc, FakeOOM), release=lambda: released.append(1)
+    )
+    assert (result, used) == ("done at 2", 2) and attempts == [16, 8, 4, 2] and len(released) == 3
+
+
+def test_the_pose_model_runs_with_autograd_off_whoever_calls_it():
+    import torch
+
+    from cumuli_bridge import pose
+
+    assert torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+    assert pose._under_inference_mode(lambda: torch.is_inference_mode_enabled())() is True
+
+
+def test_the_pose_backoff_stops_at_one_and_never_retries_other_errors():
+    from cumuli_bridge import pose
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        pose.run_with_batch_backoff(
+            lambda size: (_ for _ in ()).throw(RuntimeError("CUDA out of memory")), 4, release=lambda: None
+        )
+    calls = []
+
+    def broken(size):
+        calls.append(size)
+        raise ValueError("a real bug")
+
+    with pytest.raises(ValueError, match="a real bug"):
+        pose.run_with_batch_backoff(broken, 16, release=lambda: None)
+    assert calls == [16]                      # not retried: it is not a memory error
+
+
+def test_a_bad_pose_batch_size_is_refused(monkeypatch):
+    from cumuli_bridge.settings import BridgeSettings
+
+    monkeypatch.setenv("CUMULI_SAM3D_BATCH_SIZE", "0")
+    with pytest.raises(SettingsError, match="sam3d_batch_size"):
+        BridgeSettings.load()
+    monkeypatch.setenv("CUMULI_SAM3D_BATCH_SIZE", "4")
+    assert BridgeSettings.load().sam3d_batch_size == 4
+
+
+def test_pose_weights_resolve_from_an_absolute_path_or_comfys_detection_folder(monkeypatch, tmp_path):
+    import types
+
+    from cumuli_bridge import pose
+
+    weights = tmp_path / "sam.safetensors"
+    weights.write_bytes(b"w")
+    assert pose.resolve_weights(str(weights)) == weights
+    with pytest.raises(pose.PoseError, match="not found at"):
+        pose.resolve_weights(str(tmp_path / "missing.safetensors"))
+
+    folders = types.SimpleNamespace(
+        get_full_path=lambda folder, name: str(weights) if (folder, name) == ("detection", "sam.safetensors") else None
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", folders)
+    assert pose.resolve_weights("sam.safetensors") == weights
+    with pytest.raises(pose.PoseError, match="models/detection"):
+        pose.resolve_weights("other.safetensors")
+    with pytest.raises(pose.PoseError, match="setting is empty"):
+        pose.resolve_weights("  ")
+
+
+def test_attention_backend_is_a_setting_not_an_environment_variable(settings, monkeypatch):
+    assert settings.attention_backend == "sdpa"
+    assert "FDANYONE_ATTENTION_BACKEND" not in settings.subprocess_env
+    monkeypatch.setenv("CUMULI_ATTENTION_BACKEND", "Flash_Attn_3")
+    from cumuli_bridge.settings import BridgeSettings
+
+    assert BridgeSettings.load().attention_backend == "flash_attn_3"
+
+
+def _write_ring(root, layout: str, count: int = 2) -> None:
+    import json
+
+    cameras = []
+    for index in range(count):
+        record = {"camera_id": index, "K": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                  "camera_to_world": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}
+        directory = root / ("videos" if layout == "new" else "videos/dense")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{index:02d}.mp4").write_bytes(b"x")
+        if layout != "nameless":
+            record["video"] = f"videos/{index:02d}.mp4" if layout == "new" else f"videos/dense/{index:02d}.mp4"
+        cameras.append(record)
+    (root / "cameras.json").write_text(json.dumps({"cameras": cameras}))
+    (root / "metadata.json").write_text("{}")
+
+
+@pytest.mark.parametrize("layout", ["new", "old"])
+def test_a_ring_loads_from_either_result_layout(tmp_path, layout):
+    from cumuli_bridge.ring import RingResult
+
+    _write_ring(tmp_path, layout)
+    ring = RingResult.load(tmp_path)
+    assert ring.num_views == 2
+    assert ring.video_path(1).is_file()
+    assert ring.sparse_paths() == ()          # videos/sparse is simply absent now
+
+
+def test_a_camera_without_a_video_field_finds_whichever_layout_exists(tmp_path):
+    import json
+
+    from cumuli_bridge.ring import RingResult
+
+    _write_ring(tmp_path, "new")
+    rig = json.loads((tmp_path / "cameras.json").read_text())
+    for record in rig["cameras"]:
+        record.pop("video", None)
+    (tmp_path / "cameras.json").write_text(json.dumps(rig))
+    assert RingResult.load(tmp_path).video_path(0) == tmp_path / "videos" / "00.mp4"
+
+
 def test_ring_fingerprint_tracks_seed_but_motion_key_does_not(tmp_path):
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"data")
     a = runner.build_request(video_path=video, views_per_layer=24, layer_pitches="15",
-                             start_yaw=0, yaw_span=360, views_per_group="4", enable_rcp=True,
+                             start_yaw=0, yaw_span=360, enable_rcp=True,
                              enable_tcr=True, start_time=0.0, target_fps="auto", seed=42, device="cuda:0")
     import dataclasses
     b = dataclasses.replace(a, seed=43)
@@ -352,7 +734,7 @@ def test_a_staged_run_name_survives_into_the_request(settings, tmp_path):
     staged = runner.stage_source_video(settings, video, "take07")
     request = runner.build_request(
         video_path=staged, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
-        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=42, device="cuda:0",
     )
     assert request.run_name == "take07", "the staging symlink was resolved away"
@@ -654,7 +1036,7 @@ def test_training_needs_a_built_dataset(tmp_path):
 # --------------------------------------------------------------------------
 # the 4D evaluation, whose three traps all fail silently
 # --------------------------------------------------------------------------
-def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False, sh: bool = False,
+def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False, sh: bool | int = False,
                            comments: dict | None = None) -> Path:
     import numpy as np
 
@@ -662,7 +1044,7 @@ def _write_interchange_ply(path: Path, *, rows: list[dict], accel: bool = False,
 
     names = list(BASE_COLUMNS)
     if sh:
-        names += [f"f_rest_{i}" for i in range(45)]
+        names += [f"f_rest_{i}" for i in range(45 if sh is True else sh)]
     if accel:
         names += list(ACCEL_COLUMNS)
     header = "ply\nformat binary_little_endian 1.0\n"
@@ -751,6 +1133,73 @@ def test_scales_are_delogged_and_sh_is_channel_major(tmp_path):
     assert sh[0, 1, 0] == pytest.approx(0.0)
     assert sh[0, 1, 1] == pytest.approx(15.0)
     assert sh[0, 1, 2] == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs, per_row, pitches",
+    [
+        ({}, 24, (15,)),
+        ({"views_per_row": 12}, 12, (15,)),
+        ({"total_views": 48}, 48, (15,)),
+        ({"elevation_rows": 3}, 24, (15, 30, 45)),
+        ({"total_views": 72, "elevation_rows": 3}, 24, (15, 30, 45)),
+        ({"total_views": 72, "views_per_row": 24}, 24, (15, 30, 45)),
+        ({"elevation_rows": 3, "views_per_row": 12, "start_elevation": -10, "end_elevation": 35}, 12, (-10, 12, 35)),
+        ({"total_views": 72, "elevation_rows": 3, "views_per_row": 24}, 24, (15, 30, 45)),
+    ],
+)
+def test_ring_layout_deduces_the_missing_count(kwargs, per_row, pitches):
+    layout = runner.resolve_ring_layout(**kwargs)
+    assert (layout.views_per_row, layout.pitches) == (per_row, pitches)
+    assert layout.total_views == per_row * len(pitches)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"total_views": 50, "elevation_rows": 3}, "does not split into 3 equal rows"),
+        ({"total_views": 50, "views_per_row": 24}, "whole number of rows"),
+        ({"total_views": 70, "elevation_rows": 3, "views_per_row": 24}, "is not elevation_rows"),
+        ({"elevation_rows": 3, "start_elevation": 15, "end_elevation": 15}, "must not repeat"),
+        ({"elevation_rows": 2, "start_elevation": -20, "end_elevation": 15}, "between -15 and 45"),
+        ({"views_per_row": -1}, "cannot be negative"),
+    ],
+)
+def test_ring_layout_refuses_an_inconsistent_description(kwargs, message):
+    with pytest.raises(runner.ValidationError, match=message):
+        runner.resolve_ring_layout(**kwargs)
+
+
+@pytest.mark.parametrize("width, degree", [(9, 1), (24, 2), (45, 3)])
+def test_every_format_sh_width_loads(tmp_path, width, degree):
+    from cumuli_bridge.sogst import load_interchange_ply
+
+    rest = {f"f_rest_{i}": float(i) for i in range(width)}
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row(**rest)], sh=width)
+    asset = load_interchange_ply(path)
+    assert asset.sh_degree == degree
+    assert asset.sh_at().shape == (1, (degree + 1) ** 2, 3)
+
+
+def test_a_ply_with_no_f_rest_is_degree_zero(tmp_path):
+    import numpy as np
+
+    from cumuli_bridge.sogst import load_interchange_ply
+
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row(f_dc_0=1.0, f_dc_1=2.0, f_dc_2=3.0)])
+    asset = load_interchange_ply(path)
+    assert asset.f_rest is None and asset.sh_degree == 0
+    sh = asset.sh_at()
+    assert sh.shape == (1, 1, 3)
+    assert np.allclose(sh[0, 0], [1.0, 2.0, 3.0])
+
+
+def test_an_off_format_sh_width_is_refused(tmp_path):
+    from cumuli_bridge.sogst import SogstError, load_interchange_ply
+
+    path = _write_interchange_ply(tmp_path / "a.ply", rows=[_row()], sh=12)
+    with pytest.raises(SogstError, match="9, 24 or 45"):
+        load_interchange_ply(path)
 
 
 def test_a_plain_3dgs_ply_is_refused_with_a_useful_message(tmp_path):
@@ -916,7 +1365,6 @@ def test_work_dir_nests_the_run_name(fake_repo):
         fdanyone_root=fake_repo,
         conda_env="", conda_exe="", python_exe=sys.executable,
         data_dir=fake_repo / "data", model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0", min_free_vram_gb=0.0,
         work_root="/big/drive/comfy",
     )
@@ -1042,7 +1490,6 @@ def _settings_with_roots(fake_repo, **kw):
     return BridgeSettings(
         fdanyone_root=fake_repo, conda_env="", conda_exe="", python_exe=sys.executable,
         data_dir=fake_repo / "data", model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0", min_free_vram_gb=0.0, **kw,
     )
 
