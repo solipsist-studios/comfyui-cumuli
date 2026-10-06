@@ -178,6 +178,21 @@ def _release_cached_memory() -> None:
         LOGGER.debug("Could not empty the CUDA cache between attempts", exc_info=True)
 
 
+def _under_inference_mode(fn):
+    """Run ``fn`` with autograd off. ComfyUI's executor already does this around a node,
+    which is why the core SAM 3D Body node never says so; called from anywhere else (a
+    script, a test) the model builds a graph, keeps every activation alive, and then fails
+    on ``.numpy()`` of a tensor that requires grad. Not relying on the caller is the point."""
+
+    def wrapped(*args, **kwargs):
+        import torch
+
+        with torch.inference_mode():
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
 def run_with_batch_backoff(run, start: int, *, is_oom=_is_oom, release=_release_cached_memory):
     """Call ``run(batch_size)``, halving the batch each time it runs out of memory.
 
@@ -232,13 +247,15 @@ def estimate_pose(
     patcher = _load_model(str(weights))
     image = torch.from_numpy(frames).float().div_(255.0)  # ComfyUI's IMAGE convention
     pose, used_batch = run_with_batch_backoff(
-        lambda size: SAM3DBody_Predict.execute(
-            sam3d_body_model=patcher,
-            image=image,
-            run_hand_refinement=hands,
-            fov=float(fov),
-            batch_size=size,
-        ).result[0],
+        _under_inference_mode(
+            lambda size: SAM3DBody_Predict.execute(
+                sam3d_body_model=patcher,
+                image=image,
+                run_hand_refinement=hands,
+                fov=float(fov),
+                batch_size=size,
+            ).result[0]
+        ),
         batch_size,
     )
     LOGGER.info("Cumuli: SAM 3D Body finished at batch size %d", used_batch)
