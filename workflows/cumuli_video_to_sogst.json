@@ -1138,7 +1138,7 @@
         "fixed",
         "cuda:0",
         "",
-        -1,
+        0,
         false,
         ""
       ],
@@ -1156,7 +1156,7 @@
         "control_after_generate": "fixed",
         "device": "cuda:0",
         "prompt": "",
-        "min_free_vram_gb": -1,
+        "min_free_vram_gb": 0,
         "dry_run": false,
         "run_name": ""
       }
@@ -1632,7 +1632,7 @@
         0.005,
         31,
         1,
-        -1,
+        0,
         false,
         ""
       ],
@@ -1650,7 +1650,7 @@
         "lambda_opa_mask": 0.005,
         "max_window_frames": 31,
         "max_parallel_windows": 1,
-        "min_free_vram_gb": -1,
+        "min_free_vram_gb": 0,
         "dry_run": false,
         "out_dir": ""
       }
