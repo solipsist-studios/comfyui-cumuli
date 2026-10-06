@@ -919,11 +919,11 @@
         }
       },
       "widgets_values": [
-        "MiniMax-207600686417947_00002_.mp4",
+        "",
         "image"
       ],
       "widgets_values_named": {
-        "file": "MiniMax-207600686417947_00002_.mp4",
+        "file": "",
         "upload": "image"
       }
     },
@@ -2209,7 +2209,7 @@
       ],
       "flags": {},
       "order": 6,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "localized_name": "model",
@@ -2256,11 +2256,11 @@
         }
       },
       "widgets_values": [
-        "Wan2.2_5b/rin_karasuba_wan2.2_5b_v1.safetensors",
+        "",
         0.8
       ],
       "widgets_values_named": {
-        "lora_name": "Wan2.2_5b/rin_karasuba_wan2.2_5b_v1.safetensors",
+        "lora_name": "",
         "strength_model": 0.8
       }
     }
