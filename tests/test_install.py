@@ -207,7 +207,7 @@ def test_a_full_commit_hash_pin_clones_exactly_that_commit(tmp_path, monkeypatch
 
 
 def test_only_a_full_forty_character_hash_counts_as_a_commit_pin():
-    assert install._is_commit_hash("f7af8697b282a3106e395b19ca8004dd35c20877")
+    assert install._is_commit_hash("6d5ec422ba4a4eef48f05c18ca33a9d4e7ca8d33")
     for ref in ("v0.0.1", "main", "f7af869", "f7af8697b282a3106e395b19ca8004dd35c2087z"):
         assert not install._is_commit_hash(ref)
 
