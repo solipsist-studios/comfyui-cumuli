@@ -81,7 +81,7 @@ def require_free_vram(device: str, minimum_gb: float) -> tuple[float, float]:
     if total_gb + 0.5 < minimum_gb:
         raise InsufficientVRAM(
             f"{device} has {total_gb:.1f} GB of memory in total but this configuration needs about "
-            f"{minimum_gb:.1f} GB. Lower views_per_group, disable RCP, or lower min_free_vram_gb "
+            f"{minimum_gb:.1f} GB. Disable RCP, or lower min_free_vram_gb "
             "in the bridge config if you know the run fits."
         )
     if free_gb < minimum_gb:

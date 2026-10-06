@@ -48,21 +48,12 @@ LOGGER = logging.getLogger("comfyui-cumuli")
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 #: Environment given to the inference subprocess on top of the inherited one.
-#: These three entries are the empirically required settings for a 32 GB card.
-#:
-#: ``FDANYONE_ATTENTION_BACKEND`` matters specifically because we run inside
-#: ComfyUI's environment, where ``sageattention`` is installed for ComfyUI's
-#: own use. 4DAnyone's auto policy ranks backends by speed and would pick it,
-#: but this pipeline is memory-bound: measured on an RTX 5090 at the shapes
-#: this model uses, sageattn peaks at exactly 2x SDPA's memory (it holds INT8
-#: copies of q and k plus a smoothed k), while torch SDPA already dispatches
-#: to the flash kernel. Pinning SDPA gives back ~1.9 GiB -- most of what RCP
-#: costs -- and is bit-identical to the reference path, where sageattn's INT8
-#: quantisation carries a ~1.3% relative error.
+#: ``expandable_segments`` is the empirically required setting for a 32 GB card.
+#: The attention backend used to be an environment variable here; 4DAnyone now
+#: takes it as the ``--attention_backend`` flag, so it is the
+#: ``attention_backend`` setting below.
 DEFAULT_SUBPROCESS_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-    "FDANYONE_PERSISTENT_PARAMS": "1e9",
-    "FDANYONE_ATTENTION_BACKEND": "sdpa",
 }
 
 DEFAULTS: dict[str, object] = {
@@ -73,6 +64,16 @@ DEFAULTS: dict[str, object] = {
     "data_dir": "data",  # relative paths are resolved against fdanyone_root
     "model_dir": "models",
     "gvhmr_root": "third_party/GVHMR",
+    # ``sdpa`` on purpose. We run inside ComfyUI's environment, where
+    # ``sageattention`` is installed for ComfyUI's own use, and 4DAnyone's
+    # ``auto`` ranks backends by speed and would pick it. This pipeline is
+    # memory-bound: measured on an RTX 5090 at the shapes this model uses,
+    # sageattn peaks at exactly 2x SDPA's memory (it holds INT8 copies of q
+    # and k plus a smoothed k), while torch SDPA already dispatches to the
+    # flash kernel. SDPA gives back ~1.9 GiB -- most of what RCP costs -- and
+    # is bit-identical to the reference path, where sageattn's INT8
+    # quantisation carries a ~1.3% relative error.
+    "attention_backend": "sdpa",
     "device": "cuda:0",
     "min_free_vram_gb": 30.0,
     # The rotor 4DGS trainer (OMG4), vendored by the cumuli pipeline.
@@ -108,6 +109,7 @@ _ENV_KEYS = {
     "data_dir": ("CUMULI_DATA_DIR",),
     "model_dir": ("CUMULI_MODEL_DIR",),
     "gvhmr_root": ("CUMULI_GVHMR_ROOT",),
+    "attention_backend": ("CUMULI_ATTENTION_BACKEND",),
     "device": ("CUMULI_DEVICE",),
     "min_free_vram_gb": ("CUMULI_MIN_FREE_VRAM_GB",),
     "trainer_root": ("CUMULI_TRAINER_ROOT",),
@@ -215,6 +217,7 @@ class BridgeSettings:
     gvhmr_root: Path
     device: str
     min_free_vram_gb: float
+    attention_backend: str = "sdpa"
     work_root: str = ""
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
@@ -269,6 +272,7 @@ class BridgeSettings:
             gvhmr_root=_resolve_under(fdanyone_root, str(values["gvhmr_root"])),
             device=str(values["device"]),
             min_free_vram_gb=min_free,
+            attention_backend=str(values["attention_backend"]).strip().lower() or "sdpa",
             work_root=str(values.get("work_root") or ""),
             dataset_roots=_roots(values.get("dataset_roots")),
             flipbook_roots=_roots(values.get("flipbook_roots")),
@@ -299,10 +303,6 @@ class BridgeSettings:
         return self.data_dir / "fdanyone"
 
     @property
-    def motion_root(self) -> Path:
-        return self.data_dir / "gvhmr" / "results"
-
-    @property
     def source_root(self) -> Path:
         return self.data_dir / "source"
 
@@ -310,7 +310,10 @@ class BridgeSettings:
         return self.results_root / run_name
 
     def motion_dir(self, run_name: str) -> Path:
-        return self.motion_root / run_name
+        """The reusable motion solve. 4DAnyone keeps it inside the result
+        directory, so it must survive a regeneration that wipes the rest."""
+
+        return self.result_dir(run_name) / "gvhmr"
 
     # -- process launching -------------------------------------------------
     def find_conda(self) -> str:

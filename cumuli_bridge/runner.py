@@ -40,7 +40,8 @@ _INTEGER_RATIO_TOLERANCE = 1e-3
 MIN_INPUT_SHORT_SIDE = 704
 RECOMMENDED_INPUT_SHORT_SIDE = 720
 
-VALID_VIEWS_PER_GROUP = (4, 6)
+#: 4DAnyone's views are denoised in groups of this size; it is no longer a flag.
+VIEW_GROUP_SIZE = 6
 MIN_PITCH = -15
 MAX_PITCH = 45
 
@@ -211,23 +212,18 @@ def resolve_ring_layout(
     return RingLayout(per_row, pitches)
 
 
-def resolve_views_per_group(value: str | int, views_per_layer: int) -> int | str:
-    """Validate ``views_per_group`` the way ``fdanyone.views`` will."""
+def check_view_count(views_per_row: int, rows: int) -> None:
+    """4DAnyone denoises views in fixed groups of six, so the *total* ring must
+    split into whole groups (``fdanyone.views`` enforces the same rule)."""
 
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        divisors = [size for size in VALID_VIEWS_PER_GROUP if views_per_layer % size == 0]
-        if not divisors:
-            raise ValidationError(f"views_per_row ({views_per_layer}) must be divisible by 4 or 6.")
-        return "auto"
-    try:
-        size = int(value)
-    except (TypeError, ValueError):
-        raise ValidationError(f"views_per_group must be 'auto', 4 or 6, got {value!r}.") from None
-    if size not in VALID_VIEWS_PER_GROUP:
-        raise ValidationError(f"views_per_group must be 'auto', 4 or 6, got {value!r}.")
-    if views_per_layer % size:
-        raise ValidationError(f"views_per_row ({views_per_layer}) must be divisible by views_per_group ({size}).")
-    return size
+    total = views_per_row * rows
+    if total % VIEW_GROUP_SIZE:
+        lower = total // VIEW_GROUP_SIZE * VIEW_GROUP_SIZE
+        raise ValidationError(
+            f"The ring has {total} views ({rows} row(s) x {views_per_row} per row), which does not split "
+            f"into groups of {VIEW_GROUP_SIZE}. Use a total divisible by {VIEW_GROUP_SIZE}, for example "
+            f"{lower or VIEW_GROUP_SIZE} or {lower + VIEW_GROUP_SIZE}."
+        )
 
 
 def stage_source_video(settings: BridgeSettings, video_path: str | Path, run_name: str) -> Path:
@@ -354,7 +350,6 @@ class RunRequest:
     layer_pitches: tuple[int, ...] = (15,)
     start_yaw: int = 0
     yaw_span: int = 360
-    views_per_group: int | str = 4
     enable_rcp: bool = True
     enable_tcr: bool = True
     start_time: float = 0.0
@@ -380,7 +375,6 @@ class RunRequest:
             "layer_pitches": list(self.layer_pitches),
             "start_yaw": self.start_yaw,
             "yaw_span": self.yaw_span,
-            "views_per_group": self.views_per_group,
             "enable_rcp": self.enable_rcp,
             "enable_tcr": self.enable_tcr,
             "start_time": self.start_time,
@@ -398,7 +392,6 @@ def build_request(
     layer_pitches: str | Sequence[int],
     start_yaw: int,
     yaw_span: int,
-    views_per_group: str | int,
     enable_rcp: bool,
     enable_tcr: bool,
     start_time: float,
@@ -413,7 +406,7 @@ def build_request(
     if views_per_layer <= 0:
         raise ValidationError(f"views_per_row must be positive, got {views_per_layer}.")
     pitches = parse_layer_pitches(layer_pitches)
-    group = resolve_views_per_group(views_per_group, views_per_layer)
+    check_view_count(views_per_layer, len(pitches))
     yaw_span = int(yaw_span)
     if not 0 < yaw_span <= 360:
         raise ValidationError(f"yaw_span must be between 1 and 360 degrees, got {yaw_span}.")
@@ -445,7 +438,6 @@ def build_request(
         layer_pitches=pitches,
         start_yaw=start_yaw,
         yaw_span=yaw_span,
-        views_per_group=group,
         enable_rcp=bool(enable_rcp),
         enable_tcr=bool(enable_tcr),
         start_time=float(start_time),
@@ -499,12 +491,12 @@ def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
         f"--layer_pitches={pitches}",
         f"--start_yaw={request.start_yaw}",
         f"--yaw_span={request.yaw_span}",
-        f"--views_per_group={request.views_per_group}",
         f"--enable_rcp={bool(request.enable_rcp)}",
         f"--enable_tcr={bool(request.enable_tcr)}",
         f"--enable_turbo={bool(request.enable_turbo)}",
-        f"--data_dir={settings.data_dir}",
+        f"--output_dir={settings.result_dir(request.run_name)}",
         f"--model_dir={settings.model_dir}",
+        f"--attention_backend={settings.attention_backend}",
         f"--gvhmr_root={settings.gvhmr_root}",
         f"--target_fps={request.target_fps}",
         f"--start_time={request.start_time}",
@@ -826,7 +818,15 @@ def write_stamp(root: Path, fingerprint: str, filename: str = FINGERPRINT_FILE, 
     (Path(root) / filename).write_text(_json.dumps(payload, indent=1))
 
 
-def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
+#: What 4DAnyone leaves in a result directory before it publishes: the reusable
+#: motion solve, its private staging area and the saved request. It refuses any
+#: other entry, so a ring directory holding only these is an interrupted run of
+#: its own, not a foreign one.
+RING_RUN_ENTRIES = frozenset({"gvhmr", ".inference", ".4danyone-request.json"})
+
+
+def prepare_artifact_dir(root: Path, fingerprint: str, *, keep: Sequence[str] = (),
+                         resumable: frozenset[str] = frozenset()) -> str:
     """Return ``"reuse"`` when the on-disk artifact matches the inputs, else
     clear the way and return ``"build"``.
 
@@ -834,6 +834,12 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
     reused without asking; changed inputs -> the stale artifact is replaced.
     A directory that exists but carries no stamp was not produced by this
     bridge, and is never deleted -- that is the one case that still errors.
+
+    ``keep`` names entries that outlive a replacement (a ring's motion solve,
+    which has its own staleness rule). ``resumable`` names the entries a
+    producer leaves behind when it is interrupted: an unstamped directory that
+    holds only those is that producer's own unfinished run, so it is left for
+    the producer to resume rather than refused.
     """
 
     root = Path(root)
@@ -841,7 +847,8 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
         return "build"
     stamp = read_stamp(root)
     if stamp is None:
-        if not any(root.iterdir()):
+        names = {child.name for child in root.iterdir()}
+        if not names or (resumable and names <= resumable):
             return "build"
         raise ValidationError(
             f"{root} exists but was not produced by this bridge (no {FINGERPRINT_FILE}). "
@@ -850,7 +857,16 @@ def prepare_artifact_dir(root: Path, fingerprint: str) -> str:
     if stamp.get("fingerprint") == fingerprint:
         return "reuse"
     LOGGER.info("Inputs changed; replacing stale artifact %s", root)
-    shutil.rmtree(root)
+    if not keep:
+        shutil.rmtree(root)
+        return "build"
+    for child in root.iterdir():
+        if child.name in keep:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
     return "build"
 
 
@@ -879,7 +895,6 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         "layer_pitches": list(request.layer_pitches),
         "start_yaw": request.start_yaw,
         "yaw_span": request.yaw_span,
-        "views_per_group": str(request.views_per_group),
         "enable_rcp": request.enable_rcp,
         "enable_tcr": request.enable_tcr,
         "enable_turbo": request.enable_turbo,

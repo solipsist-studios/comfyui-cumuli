@@ -103,6 +103,8 @@ class ProgressState:
             return self._advance("skeleton", 0.2, "estimating foreground masks")
         if "skeleton" in text.lower() and "Loading skeleton conditioning" in text:
             return self._advance("skeleton", 0.9, "loading skeleton conditioning")
+        if "Reusing GVHMR" in text or "Reusing validated GVHMR" in text:
+            return self._advance("motion", 1.0, "reusing cached GVHMR motion")
         if "gvhmr" in text.lower() or "GVHMR" in text:
             return self._advance("motion", 0.5, "solving body motion (GVHMR)")
         for marker, message in _SETUP_MARKERS:
