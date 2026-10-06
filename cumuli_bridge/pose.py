@@ -156,13 +156,60 @@ def _default_intrinsics(height: int, width: int) -> np.ndarray:
     )
 
 
+def _is_oom(exc: BaseException) -> bool:
+    """Whether ``exc`` is a CUDA out-of-memory error, in whichever form torch raised it."""
+
+    try:
+        import torch
+
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    return "out of memory" in str(exc).lower()
+
+
+def _release_cached_memory() -> None:
+    try:
+        import comfy.model_management as mm
+
+        mm.soft_empty_cache()
+    except Exception:  # noqa: BLE001 - best effort between attempts
+        LOGGER.debug("Could not empty the CUDA cache between attempts", exc_info=True)
+
+
+def run_with_batch_backoff(run, start: int, *, is_oom=_is_oom, release=_release_cached_memory):
+    """Call ``run(batch_size)``, halving the batch each time it runs out of memory.
+
+    SAM 3D Body's memory grows with the crops processed together (about 29 GB at 16 crops
+    on a 1088x1600 clip), and what fits depends on the clip and the card, so a fixed
+    batch size is either wasteful or a crash. Only memory errors are retried, and only
+    down to a batch of one; anything else, and an out-of-memory at one, is raised as it is.
+    Returns ``(result, batch_size_that_worked)``.
+    """
+
+    size = max(1, int(start))
+    while True:
+        try:
+            return run(size), size
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is a memory error we can retry
+            if size == 1 or not is_oom(exc):
+                raise
+            next_size = max(1, size // 2)
+            LOGGER.warning(
+                "Cumuli: SAM 3D Body ran out of memory at batch size %d; retrying at %d", size, next_size
+            )
+            size = next_size
+            release()
+
+
 def estimate_pose(
     video: Path,
     out_npz: Path,
     *,
     weights: Path,
     fov: float = 0.0,
-    batch_size: int = 16,
+    batch_size: int = 8,
     hands: bool = True,
 ) -> dict:
     """Run SAM 3D Body over the canonical clip and write the generator's pose npz.
@@ -184,13 +231,17 @@ def estimate_pose(
 
     patcher = _load_model(str(weights))
     image = torch.from_numpy(frames).float().div_(255.0)  # ComfyUI's IMAGE convention
-    pose = SAM3DBody_Predict.execute(
-        sam3d_body_model=patcher,
-        image=image,
-        run_hand_refinement=hands,
-        fov=float(fov),
-        batch_size=int(batch_size),
-    ).result[0]
+    pose, used_batch = run_with_batch_backoff(
+        lambda size: SAM3DBody_Predict.execute(
+            sam3d_body_model=patcher,
+            image=image,
+            run_hand_refinement=hands,
+            fov=float(fov),
+            batch_size=size,
+        ).result[0],
+        batch_size,
+    )
+    LOGGER.info("Cumuli: SAM 3D Body finished at batch size %d", used_batch)
 
     keypoints, vertices, cam_t, keypoints_2d = [], [], [], []
     for index, people in enumerate(pose["frames"]):
@@ -240,5 +291,6 @@ def estimate_pose(
         "path": str(out_npz),
         "frames": count,
         "weights": str(weights),
+        "batch_size": used_batch,
         "keypoints": int(np.stack(keypoints).shape[1]),
     }

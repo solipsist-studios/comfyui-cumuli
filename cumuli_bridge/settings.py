@@ -67,6 +67,9 @@ DEFAULTS: dict[str, object] = {
     # A file name is looked up in ComfyUI's ``detection`` model folders; an absolute
     # path is used as it is. Meta's gated SAM License covers these weights.
     "sam3d_weights": "sam_3d_body_dinov3_bf16.safetensors",
+    # Crops SAM 3D Body processes together. It is only the *starting* size: the pose stage halves
+    # it on every out-of-memory until it fits. 16 needs ~29 GB on a 1088x1600 clip.
+    "sam3d_batch_size": 8,
     # ``sdpa`` on purpose. We run inside ComfyUI's environment, where
     # ``sageattention`` is installed for ComfyUI's own use, and 4DAnyone's
     # ``auto`` ranks backends by speed and would pick it. This pipeline is
@@ -112,6 +115,7 @@ _ENV_KEYS = {
     "data_dir": ("CUMULI_DATA_DIR",),
     "model_dir": ("CUMULI_MODEL_DIR",),
     "sam3d_weights": ("CUMULI_SAM3D_WEIGHTS",),
+    "sam3d_batch_size": ("CUMULI_SAM3D_BATCH_SIZE",),
     "attention_backend": ("CUMULI_ATTENTION_BACKEND",),
     "device": ("CUMULI_DEVICE",),
     "min_free_vram_gb": ("CUMULI_MIN_FREE_VRAM_GB",),
@@ -221,6 +225,7 @@ class BridgeSettings:
     min_free_vram_gb: float
     attention_backend: str = "sdpa"
     sam3d_weights: str = "sam_3d_body_dinov3_bf16.safetensors"
+    sam3d_batch_size: int = 8
     work_root: str = ""
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
@@ -261,6 +266,12 @@ class BridgeSettings:
 
         fdanyone_root = Path(str(values["fdanyone_root"])).expanduser()
         try:
+            batch = int(values["sam3d_batch_size"])
+        except (TypeError, ValueError):
+            batch = 0
+        if batch < 1:
+            raise SettingsError(f"sam3d_batch_size must be a whole number of at least 1, got {values['sam3d_batch_size']!r}.")
+        try:
             min_free = float(values["min_free_vram_gb"])
         except (TypeError, ValueError):
             raise SettingsError(f"min_free_vram_gb must be a number, got {values['min_free_vram_gb']!r}.") from None
@@ -275,6 +286,7 @@ class BridgeSettings:
             device=str(values["device"]),
             min_free_vram_gb=min_free,
             sam3d_weights=str(values["sam3d_weights"]).strip(),
+            sam3d_batch_size=batch,
             attention_backend=str(values["attention_backend"]).strip().lower() or "sdpa",
             work_root=str(values.get("work_root") or ""),
             dataset_roots=_roots(values.get("dataset_roots")),

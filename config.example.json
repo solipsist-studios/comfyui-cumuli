@@ -20,6 +20,7 @@
   "data_dir": "data",
   "model_dir": "models",
   "sam3d_weights": "sam_3d_body_dinov3_bf16.safetensors",
+  "sam3d_batch_size": 8,
 
   "trainer_root": "~/Dev/github/cumuli/deps/OMG4",
   "trainer_script": "train_scratch.py",
