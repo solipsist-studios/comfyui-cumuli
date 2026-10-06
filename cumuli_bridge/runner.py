@@ -358,7 +358,7 @@ class RunRequest:
     prompt: str = ""
     seed: int = 42
     device: str = "cuda:0"
-    enable_turbo: bool = True
+    enable_turbo: bool = False
 
     @property
     def run_name(self) -> str:
@@ -398,7 +398,7 @@ def build_request(
     target_fps: str,
     seed: int,
     device: str,
-    enable_turbo: bool = True,
+    enable_turbo: bool = False,
 ) -> RunRequest:
     """Validate every knob and produce a :class:`RunRequest`."""
 
@@ -469,7 +469,27 @@ def gpu_ids_for(device: str) -> list[int] | None:
         ) from None
 
 
-def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
+def build_prepare_argv(settings: BridgeSettings, request: RunRequest, out_dir: Path) -> list[str]:
+    """The ``inference.py`` command that writes the clip the pose must be estimated on.
+
+    ``--prepare_only`` decodes the canonical 121 frames into ``out_dir`` and stops: no
+    models, no GPU. It has to be 4DAnyone that cuts the clip, because the pose is only
+    valid on exactly the frames (start time, frame rate, timestamps) it will generate from.
+    """
+
+    argv = list(settings.launcher())
+    argv += [
+        str(settings.inference_script),
+        "--prepare_only=True",
+        f"--video_path={request.video_path}",
+        f"--output_dir={out_dir}",
+        f"--start_time={request.start_time}",
+        f"--target_fps={request.target_fps}",
+    ]
+    return argv
+
+
+def build_argv(settings: BridgeSettings, request: RunRequest, *, sam3d_npz: Path | None = None) -> list[str]:
     """Assemble the exact ``inference.py`` command line.
 
     ``fire`` literal-evaluates ``--flag=value``, so lists and booleans are
@@ -497,11 +517,12 @@ def build_argv(settings: BridgeSettings, request: RunRequest) -> list[str]:
         f"--output_dir={settings.result_dir(request.run_name)}",
         f"--model_dir={settings.model_dir}",
         f"--attention_backend={settings.attention_backend}",
-        f"--gvhmr_root={settings.gvhmr_root}",
         f"--target_fps={request.target_fps}",
         f"--start_time={request.start_time}",
         f"--seed={request.seed}",
     ]
+    if sam3d_npz is not None:
+        argv.append(f"--sam3d_npz={sam3d_npz}")
     gpu_ids = gpu_ids_for(request.device)
     if gpu_ids is not None:
         argv.append(f"--gpu_ids={gpu_ids}".replace(" ", ""))
@@ -590,10 +611,84 @@ def check_video(settings: BridgeSettings, request: RunRequest) -> VideoRequireme
 
 
 
-def motion_is_cached(settings: BridgeSettings, request: RunRequest) -> bool:
-    """GVHMR motion is keyed by the video stem and reused across runs."""
+#: Names this pack owns inside a clip's pose directory (``settings.pose_dir``).
+POSE_NPZ = "sam3d_mhr70.npz"
+CANONICAL_CLIP = "canonical_clip.mp4"
+CANONICAL_CLIP_META = "canonical_clip.json"
+POSE_STAMP = ".pose_stamp.json"
 
-    return (settings.motion_dir(request.run_name) / "motion.json").is_file()
+#: Folded into every cache key so a pose made by a different method can never be
+#: mistaken for this one (rings and caches from the GVHMR era carry no such marker).
+POSE_METHOD = "sam3d-mhr70"
+
+
+def pose_key(request: RunRequest, weights: Path) -> str:
+    """What the pose of one clip depends on: the clip and how it is windowed, the
+    pose method, and the weights that estimated it. The seed, the view layout and
+    the denoiser do not matter, so changing them reuses the pose."""
+
+    return compute_fingerprint({"pose": POSE_METHOD, "clip": _clip_identity(request), "weights": file_identity(weights)})
+
+
+def pose_is_cached(settings: BridgeSettings, request: RunRequest, weights: Path) -> bool:
+    """Whether ``ensure_pose`` would reuse an existing pose rather than estimate one."""
+
+    pose_dir = settings.pose_dir(request.run_name)
+    stamp = read_stamp(pose_dir, POSE_STAMP)
+    return (
+        stamp is not None
+        and stamp.get("fingerprint") == pose_key(request, weights)
+        and (pose_dir / POSE_NPZ).is_file()
+    )
+
+
+def ensure_pose(
+    settings: BridgeSettings,
+    request: RunRequest,
+    *,
+    weights: Path,
+    estimate: Callable[[Path, Path], object],
+    on_line: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[Path, bool]:
+    """Return ``(npz, reused)``: the SAM 3D Body pose of this request's clip.
+
+    Reuses the cached pose when the clip, its window and the weights are unchanged.
+    Otherwise 4DAnyone cuts the canonical clip (cheap, no GPU) and ``estimate`` --
+    supplied by the caller, because it runs inside ComfyUI -- writes the pose npz
+    for it. The stamp is written last, so an interrupted estimate is never trusted.
+    """
+
+    pose_dir = settings.pose_dir(request.run_name)
+    key = pose_key(request, weights)
+    npz = pose_dir / POSE_NPZ
+    if pose_is_cached(settings, request, weights):
+        LOGGER.info("Reusing the cached body pose at %s", npz)
+        return npz, True
+
+    # Only this pack's own files live here, so a stale pose is cleared by name.
+    for name in (POSE_NPZ, CANONICAL_CLIP, CANONICAL_CLIP_META, POSE_STAMP):
+        (pose_dir / name).unlink(missing_ok=True)
+    argv = build_prepare_argv(settings, request, pose_dir)
+    check_argv_against_checkout(settings, argv)
+    run_streaming(
+        argv,
+        cwd=settings.fdanyone_root,
+        env=build_env(settings),
+        on_line=on_line,
+        should_cancel=should_cancel,
+    )
+    clip = pose_dir / CANONICAL_CLIP
+    if not clip.is_file():
+        raise RuntimeError(
+            f"4DAnyone finished preparing the clip but wrote no {CANONICAL_CLIP} in {pose_dir}; "
+            "the pose cannot be estimated without it."
+        )
+    estimate(clip, npz)
+    if not npz.is_file():
+        raise RuntimeError(f"The pose estimate finished but wrote no {npz.name} in {pose_dir}.")
+    write_stamp(pose_dir, key, POSE_STAMP)
+    return npz, False
 
 
 @dataclass
@@ -655,6 +750,7 @@ def execute(
     settings: BridgeSettings,
     request: RunRequest,
     *,
+    sam3d_npz: Path,
     on_progress: Callable[[ProgressState], None] | None = None,
     on_line: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -667,7 +763,7 @@ def execute(
     settings.validate()
     check_video(settings, request)
     result_dir = settings.result_dir(request.run_name)
-    argv = build_argv(settings, request)
+    argv = build_argv(settings, request, sam3d_npz=sam3d_npz)
     check_argv_against_checkout(settings, argv)
     state = ProgressState(expected_views=request.num_target_views)
 
@@ -683,7 +779,6 @@ def execute(
         cwd=settings.fdanyone_root,
         env=build_env(settings, {
             "FDANYONE_LORA_PATH": request.lora_path,
-            "FDANYONE_PROMPT": request.prompt,
         }),
         on_line=handle,
         should_cancel=should_cancel,
@@ -818,14 +913,14 @@ def write_stamp(root: Path, fingerprint: str, filename: str = FINGERPRINT_FILE, 
     (Path(root) / filename).write_text(_json.dumps(payload, indent=1))
 
 
-#: What 4DAnyone leaves in a result directory before it publishes: the reusable
-#: motion solve, its private staging area and the saved request. It refuses any
-#: other entry, so a ring directory holding only these is an interrupted run of
-#: its own, not a foreign one.
+#: What 4DAnyone leaves in a result directory before it publishes: its motion
+#: record, its private staging area and the saved request. It refuses any other
+#: entry, so a ring directory holding only these is an interrupted run of its
+#: own, not a foreign one.
 RING_RUN_ENTRIES = frozenset({"gvhmr", ".inference", ".4danyone-request.json"})
 
 
-def prepare_artifact_dir(root: Path, fingerprint: str, *, keep: Sequence[str] = (),
+def prepare_artifact_dir(root: Path, fingerprint: str, *,
                          resumable: frozenset[str] = frozenset()) -> str:
     """Return ``"reuse"`` when the on-disk artifact matches the inputs, else
     clear the way and return ``"build"``.
@@ -835,11 +930,10 @@ def prepare_artifact_dir(root: Path, fingerprint: str, *, keep: Sequence[str] = 
     A directory that exists but carries no stamp was not produced by this
     bridge, and is never deleted -- that is the one case that still errors.
 
-    ``keep`` names entries that outlive a replacement (a ring's motion solve,
-    which has its own staleness rule). ``resumable`` names the entries a
-    producer leaves behind when it is interrupted: an unstamped directory that
-    holds only those is that producer's own unfinished run, so it is left for
-    the producer to resume rather than refused.
+    ``resumable`` names the entries a producer leaves behind when it is
+    interrupted: an unstamped directory that holds only those is that
+    producer's own unfinished run, so it is left for the producer to resume
+    rather than refused.
     """
 
     root = Path(root)
@@ -857,25 +951,27 @@ def prepare_artifact_dir(root: Path, fingerprint: str, *, keep: Sequence[str] = 
     if stamp.get("fingerprint") == fingerprint:
         return "reuse"
     LOGGER.info("Inputs changed; replacing stale artifact %s", root)
-    if not keep:
-        shutil.rmtree(root)
-        return "build"
-    for child in root.iterdir():
-        if child.name in keep:
-            continue
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+    shutil.rmtree(root)
     return "build"
+
+
+def _clip_identity(request: RunRequest) -> dict:
+    """The clip bytes and how they are windowed: everything the body pose depends on."""
+
+    return {
+        "video": file_identity(request.video_path),
+        "start_time": float(request.start_time),
+        "target_fps": str(request.target_fps),
+    }
 
 
 def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
     """Return ``(fingerprint, motion_key)`` for one ring request.
 
-    ``motion_key`` covers only what the GVHMR motion solve depends on (the
-    clip bytes and how it is windowed), so seed- or view-layout-only changes
-    keep the motion cache while still regenerating the ring.
+    ``motion_key`` covers only what the body pose depends on (the clip bytes, how
+    it is windowed and the pose method), so seed- or view-layout-only changes keep
+    the pose cache while still regenerating the ring. The pose method is part of it
+    so that a ring made with another pose method is never reused for this one.
     """
 
     lora = {}
@@ -883,13 +979,10 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         import hashlib
 
         lora = {"md5": hashlib.md5(Path(request.lora_path).read_bytes()).hexdigest()}
-    clip = {
-        "video": file_identity(request.video_path),
-        "start_time": float(request.start_time),
-        "target_fps": str(request.target_fps),
-    }
-    motion_key = compute_fingerprint(clip)
+    clip = _clip_identity(request)
+    motion_key = compute_fingerprint({"pose": POSE_METHOD, "clip": clip})
     full = compute_fingerprint({
+        "pose": POSE_METHOD,
         "clip": clip,
         "views_per_layer": request.views_per_layer,
         "layer_pitches": list(request.layer_pitches),
@@ -903,38 +996,6 @@ def ring_fingerprint(request: RunRequest) -> tuple[str, str]:
         "lora": lora,
     })
     return full, motion_key
-
-
-def clear_stale_motion(settings: BridgeSettings, request: RunRequest, motion_key: str,
-                       previous_stamp: dict | None) -> bool:
-    """Drop the GVHMR motion cache when the clip it solved no longer matches.
-
-    The pipeline hard-errors on a stale motion cache, so clearing it here turns
-    a confusing failure 45 minutes in into a clean re-solve. Returns True when
-    the cache was removed.
-    """
-
-    motion_dir = settings.motion_dir(request.run_name)
-    if not motion_dir.exists():
-        return False
-    if previous_stamp is not None:
-        if previous_stamp.get("motion_key") == motion_key:
-            return False
-        shutil.rmtree(motion_dir)
-        return True
-    # No stamp to compare against: fall back to the identity GVHMR itself records.
-    import json as _json
-
-    try:
-        meta = _json.loads((motion_dir / "motion.json").read_text())
-        stat = Path(request.video_path).stat()
-        if meta.get("source_size_bytes") == stat.st_size and meta.get("source_mtime_ns") == stat.st_mtime_ns:
-            return False
-    except (OSError, ValueError, KeyError):
-        pass
-    shutil.rmtree(motion_dir)
-    return True
-
 
 
 def discover_flipbooks(settings: BridgeSettings) -> list[str]:

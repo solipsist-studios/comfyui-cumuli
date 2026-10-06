@@ -16,7 +16,7 @@ working set of packages somewhere ComfyUI will never look.
 
 Four groups, all installed by default (``--groups core,bake,sfm,trainer``):
 
-  core     4DAnyone and its vendored GVHMR
+  core     4DAnyone's runtime dependencies
   bake     the ``.sogst`` container writer
   sfm      the rig solve behind Solve Rig (hloc, pycolmap, lightglue)
   trainer  the OMG4 rotor-4DGS trainer, including its CUDA extensions
@@ -27,7 +27,7 @@ silent when they happen by hand:
 * **pip upgrading torch out from under ComfyUI.** Several of these packages
   declare pinned dependencies older than a working ComfyUI carries. The affected
   installs pass ``--no-deps``, and the versions of torch, numpy, transformers,
-  timm and ultralytics are recorded before and compared after: if anything moved,
+  and timm are recorded before and compared after: if anything moved,
   the run fails loudly instead of leaving a broken ComfyUI to discover later.
 * **Building the trainer's CUDA extensions against the wrong nvcc.**
   ``/usr/bin/nvcc`` is often a distro CUDA too old to target the installed GPU.
@@ -79,7 +79,7 @@ TRAINER_EXTENSIONS = ("diff-gaussian-rasterization", "simple-knn", "pointops2")
 
 #: Packages whose version must not move. The additive-install promise is exactly
 #: this list holding still across the whole run.
-PINNED = ("torch", "numpy", "transformers", "timm", "ultralytics")
+PINNED = ("torch", "numpy", "transformers", "timm")
 
 
 class InstallError(RuntimeError):
@@ -138,7 +138,7 @@ def compare_pinned(before: dict[str, str | None], after: dict[str, str | None]) 
     """Describe any guarded package that changed version or disappeared.
 
     A package that was absent and is now present was pulled in as a dependency
-    -- numpy arrives with smplx, for instance -- which is an install, not a
+    -- numpy arrives with many packages, for instance -- which is an install, not a
     downgrade. Only a version moving under ComfyUI, or a package vanishing from
     beneath it, is the failure this guard exists to catch.
     """
@@ -235,9 +235,8 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
     return {
         "core": Group(
             name="core",
-            summary="4DAnyone and its vendored GVHMR",
+            summary="4DAnyone's runtime dependencies",
             requirements=[
-                ("smplx==0.1.28", "smplx"),
                 ("hydra-zen", "hydra-zen"),
                 ("hydra_colorlog", "hydra_colorlog"),
                 ("yacs", "yacs"),
@@ -389,25 +388,29 @@ def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
     argv = [sys.executable, "-c",
             "import sys; sys.path.insert(0, sys.argv[1]); "
             "from fdanyone.download import ensure_models; "
-            "ensure_models(model_dir=sys.argv[2], gvhmr_root=sys.argv[3])",
-            str(root), str(root / "models"), str(root / "third_party" / "GVHMR")]
+            "ensure_models(model_dir=sys.argv[2])",
+            str(root), str(root / "models")]
     _run(argv, cwd=root, dry_run=dry_run)
+
+
+#: The weights Generate Ring estimates the body pose with. They are gated behind
+#: Meta's SAM License on Hugging Face, so no installer may fetch them for you.
+SAM3D_WEIGHTS = "sam_3d_body_dinov3_bf16.safetensors"
 
 
 def missing_manual_assets(paths: dict[str, Path]) -> list[str]:
     """What no installer may fetch: licence-gated downloads.
 
-    SMPL-X is not in 4DAnyone's published model list. It is gated behind
-    registration at smpl-x.is.tue.mpg.de, and GVHMR needs it for the motion
-    solve -- so Generate Ring fails without it, however complete everything
-    else looks.
+    SAM 3D Body's weights live in ComfyUI's ``models/detection`` folder. With
+    ``--comfyui-root`` the check is exact; without it the installer cannot see
+    ComfyUI's model folders, so it names the file and says where it goes.
     """
 
-    root = paths.get("fdanyone_root")
-    if root is None:
-        return []
-    smplx = root / "models" / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
-    return [] if smplx.is_file() else [str(smplx)]
+    comfy = paths.get("comfyui_root")
+    if comfy is None:
+        return [f"ComfyUI/models/detection/{SAM3D_WEIGHTS}"]
+    target = Path(comfy) / "models" / "detection" / SAM3D_WEIGHTS
+    return [] if target.is_file() else [str(target)]
 
 
 # -- steps -----------------------------------------------------------------
@@ -602,6 +605,9 @@ def main() -> int:
                              + ", ".join(f"{n}@{r}" for n, _, r in CHECKOUTS.values()) + ").")
     parser.add_argument("--work-root", default=None,
                         help="Large drive for per-run intermediates (~20 GB/run). Written to config.json.")
+    parser.add_argument("--comfyui-root", type=Path, default=None,
+                        help="ComfyUI checkout; lets the installer check whether the SAM 3D Body "
+                             "weights are already in its models/detection folder")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Do not clone the checkouts; use whatever the config already points at.")
     parser.add_argument("--no-models", action="store_true",
@@ -721,16 +727,17 @@ def main() -> int:
     LOGGER.info("done -- %s installed, torch untouched", ", ".join(selected))
 
     # The one thing no installer may do for you.
-    manual = missing_manual_assets(checkouts)
+    manual = missing_manual_assets({**checkouts, **({"comfyui_root": args.comfyui_root} if args.comfyui_root else {})})
     if manual:
         LOGGER.info("")
-        LOGGER.info("ONE STEP LEFT -- SMPL-X body models are licence-gated and cannot be")
-        LOGGER.info("downloaded automatically. Generate Ring needs them for the motion solve.")
-        LOGGER.info("  1. register and accept the licence at https://smpl-x.is.tue.mpg.de/")
-        LOGGER.info("  2. download models_smplx_v1_1.zip")
-        LOGGER.info("  3. place SMPLX_NEUTRAL.npz at:")
+        LOGGER.info("ONE STEP LEFT -- the SAM 3D Body weights are gated behind Meta's SAM License and")
+        LOGGER.info("cannot be downloaded automatically. Generate Ring estimates the body pose with them.")
+        LOGGER.info("  1. accept the license and download %s", SAM3D_WEIGHTS)
+        LOGGER.info("     (Comfy-Org/sam-3d-body on Hugging Face)")
+        LOGGER.info("  2. place it at:")
         for path in manual:
             LOGGER.info("       %s", path)
+        LOGGER.info("  Needs a ComfyUI that ships the SAM 3D Body nodes (0.34 or newer).")
     LOGGER.info("")
     LOGGER.info("Restart ComfyUI to pick up the nodes.")
     return 0

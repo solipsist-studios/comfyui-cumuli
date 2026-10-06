@@ -63,7 +63,10 @@ DEFAULTS: dict[str, object] = {
     "python_exe": "",  # empty -> sys.executable, unless conda_env is set
     "data_dir": "data",  # relative paths are resolved against fdanyone_root
     "model_dir": "models",
-    "gvhmr_root": "third_party/GVHMR",
+    # SAM 3D Body weights, which estimate the body pose that conditions generation.
+    # A file name is looked up in ComfyUI's ``detection`` model folders; an absolute
+    # path is used as it is. Meta's gated SAM License covers these weights.
+    "sam3d_weights": "sam_3d_body_dinov3_bf16.safetensors",
     # ``sdpa`` on purpose. We run inside ComfyUI's environment, where
     # ``sageattention`` is installed for ComfyUI's own use, and 4DAnyone's
     # ``auto`` ranks backends by speed and would pick it. This pipeline is
@@ -108,7 +111,7 @@ _ENV_KEYS = {
     "python_exe": ("CUMULI_PYTHON",),
     "data_dir": ("CUMULI_DATA_DIR",),
     "model_dir": ("CUMULI_MODEL_DIR",),
-    "gvhmr_root": ("CUMULI_GVHMR_ROOT",),
+    "sam3d_weights": ("CUMULI_SAM3D_WEIGHTS",),
     "attention_backend": ("CUMULI_ATTENTION_BACKEND",),
     "device": ("CUMULI_DEVICE",),
     "min_free_vram_gb": ("CUMULI_MIN_FREE_VRAM_GB",),
@@ -214,10 +217,10 @@ class BridgeSettings:
     python_exe: str
     data_dir: Path
     model_dir: Path
-    gvhmr_root: Path
     device: str
     min_free_vram_gb: float
     attention_backend: str = "sdpa"
+    sam3d_weights: str = "sam_3d_body_dinov3_bf16.safetensors"
     work_root: str = ""
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
@@ -269,9 +272,9 @@ class BridgeSettings:
             python_exe=str(values["python_exe"]),
             data_dir=_resolve_under(fdanyone_root, str(values["data_dir"])),
             model_dir=_resolve_under(fdanyone_root, str(values["model_dir"])),
-            gvhmr_root=_resolve_under(fdanyone_root, str(values["gvhmr_root"])),
             device=str(values["device"]),
             min_free_vram_gb=min_free,
+            sam3d_weights=str(values["sam3d_weights"]).strip(),
             attention_backend=str(values["attention_backend"]).strip().lower() or "sdpa",
             work_root=str(values.get("work_root") or ""),
             dataset_roots=_roots(values.get("dataset_roots")),
@@ -309,11 +312,12 @@ class BridgeSettings:
     def result_dir(self, run_name: str) -> Path:
         return self.results_root / run_name
 
-    def motion_dir(self, run_name: str) -> Path:
-        """The reusable motion solve. 4DAnyone keeps it inside the result
-        directory, so it must survive a regeneration that wipes the rest."""
+    def pose_dir(self, run_name: str) -> Path:
+        """The reusable body-pose artifacts of one clip: its canonical frames and
+        the SAM 3D Body pose estimated on them. Deliberately outside the result
+        directory, which 4DAnyone owns and refuses to share."""
 
-        return self.result_dir(run_name) / "gvhmr"
+        return self.data_dir / "pose" / run_name
 
     # -- process launching -------------------------------------------------
     def find_conda(self) -> str:
