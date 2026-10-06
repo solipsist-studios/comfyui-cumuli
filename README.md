@@ -217,7 +217,7 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 
 | node | what it does |
 |---|---|
-| **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. The ring is described as `total_views` = `elevation_rows` x `views_per_row`: set any two and the third is worked out (0 = unset; nothing set is one row of 24). Rows are spaced evenly from `start_elevation` to `end_elevation` (degrees above the subject, -15 to 45; one row sits at the start), or listed explicitly in the advanced `pitch_list`. These are translated to 4DAnyone's `views_per_layer` and `layer_pitches`, and the report prints the resolved layout. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
+| **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. The ring is described as `total_views` = `elevation_rows` x `views_per_row`: set any two and the third is worked out (0 = unset; nothing set is one row of 24). Rows are spaced evenly from `start_elevation` to `end_elevation` (degrees above the subject, -15 to 45; one row sits at the start), rounded to whole degrees. These are translated to 4DAnyone's `views_per_layer` and `layer_pitches`, and the report prints the resolved layout. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
 | **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other loaders. |
 | **Ring Contact Sheet** | One frame from every view, tiled. The fastest way to spot cross-view identity drift. |
 | **Select View** | One view as VIDEO + IMAGE + its camera JSON. |
@@ -386,7 +386,7 @@ factor of ½.
   invents its own far side and the back of the ring will not reconstruct
   (measured: scene swaps, 1.6x saturation swings). The total ring must divide
   by 6: current 4DAnyone denoises views in fixed groups of six, so the old
-  `views_per_group` widget is ignored. *Memory figures from the previous
+  `views_per_group` widget is gone. *Memory figures from the previous
   4DAnyone release (group 4 + sdpa: ~28.6 GiB peak on a 32 GB card; group 6
   did not fit) predate its memory work and are not yet re-measured.*
 - **Input length.** 4DAnyone always generates exactly 121 frames. The clip must

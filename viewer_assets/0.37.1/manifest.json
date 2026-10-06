@@ -1,0 +1,19 @@
+{
+  "version": "0.37.1",
+  "tarball_integrity": "sha512-po+PoR60eb9O9lexMdFUlgNnfvtohuKeBlPCWQI/6I9XU9tQZpcptQb6R4ZKsXPntnSQEZrFAtGVqlI74+wUPQ==",
+  "source": "https://registry.npmjs.org/@rerun-io/web-viewer/-/web-viewer-0.37.1.tgz",
+  "files": {
+    "index.js": {
+      "size": 31845,
+      "sha256": "36befe6329660d3cd3bc353b168c9ecba144e8981ed1e6cbc5b21219984c6320"
+    },
+    "re_viewer.js": {
+      "size": 229426,
+      "sha256": "5bc7db48155a7e5ebde829f29a9276ef25511a57238e9824a8a1d8082e89a283"
+    },
+    "re_viewer_bg.wasm": {
+      "size": 49190202,
+      "sha256": "a5119572793205c35f682546b30882152fd3e2869b24c82226f852dfa6db7fe3"
+    }
+  }
+}

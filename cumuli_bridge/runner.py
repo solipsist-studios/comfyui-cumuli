@@ -87,21 +87,21 @@ def choose_canonical_fps(input_rate: Fraction) -> Fraction:
 
 
 def parse_layer_pitches(value: str | Sequence[int]) -> tuple[int, ...]:
-    """Accept ``"15"``, ``"-10,15,35"`` or ``"[-10, 15]"`` and return a tuple."""
+    """Accept ``"15"``, ``"-10,15,35"``, ``"[-10, 15]"`` or a sequence, and return a tuple of elevations."""
 
     if not isinstance(value, str):
         pitches = tuple(int(item) for item in value)
     else:
         cleaned = value.strip().strip("[]()")
         if not cleaned:
-            raise ValidationError("pitch_list must list at least one elevation in degrees, for example 15.")
+            raise ValidationError("At least one elevation in degrees is needed, for example 15.")
         parts = [part.strip() for part in cleaned.replace(";", ",").split(",") if part.strip()]
         try:
             pitches = tuple(int(part) for part in parts)
         except ValueError:
-            raise ValidationError(f"pitch_list must be whole degrees, got {value!r}.") from None
+            raise ValidationError(f"Elevations must be whole degrees, got {value!r}.") from None
     if not pitches:
-        raise ValidationError("pitch_list must list at least one elevation in degrees, for example 15.")
+        raise ValidationError("At least one elevation in degrees is needed, for example 15.")
     if len(set(pitches)) != len(pitches):
         raise ValidationError(f"Elevations must not repeat, got {list(pitches)}.")
     bad = [pitch for pitch in pitches if not MIN_PITCH <= pitch <= MAX_PITCH]
@@ -136,7 +136,6 @@ def resolve_ring_layout(
     views_per_row: int = 0,
     start_elevation: int = 15,
     end_elevation: int = 45,
-    pitch_list: str | Sequence[int] = "",
 ) -> RingLayout:
     """Turn the node's ring description into 4DAnyone's ``views_per_layer`` and
     ``layer_pitches``.
@@ -148,23 +147,12 @@ def resolve_ring_layout(
     is the stock 24-view single-row ring.
 
     Rows are spaced evenly from ``start_elevation`` to ``end_elevation`` (a
-    single row sits at ``start_elevation``). A non-empty ``pitch_list``
-    overrides that spacing and fixes the row count itself.
+    single row sits at ``start_elevation``), rounded to whole degrees.
     """
 
     total, rows, per_row = int(total_views), int(elevation_rows), int(views_per_row)
     if min(total, rows, per_row) < 0:
         raise ValidationError("total_views, elevation_rows and views_per_row cannot be negative; use 0 to leave one unset.")
-
-    explicit = None
-    if not isinstance(pitch_list, str) or pitch_list.strip():
-        explicit = parse_layer_pitches(pitch_list)
-        if rows and rows != len(explicit):
-            raise ValidationError(
-                f"elevation_rows is {rows} but pitch_list names {len(explicit)} pitches {list(explicit)}. "
-                "Clear one of them."
-            )
-        rows = len(explicit)
 
     if total and rows and per_row:
         if total != rows * per_row:
@@ -193,9 +181,6 @@ def resolve_ring_layout(
         per_row = per_row or DEFAULT_VIEWS_PER_ROW
     else:
         rows, per_row = 1, DEFAULT_VIEWS_PER_ROW
-
-    if explicit is not None:
-        return RingLayout(per_row, explicit)
 
     start, end = int(start_elevation), int(end_elevation)
     if rows == 1:
