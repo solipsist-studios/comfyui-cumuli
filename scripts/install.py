@@ -60,6 +60,8 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PACKAGE_ROOT))
 
+from cumuli_bridge import viewer_assets  # noqa: E402 - needs PACKAGE_ROOT on the path; plain Python, no ComfyUI
+
 LOGGER = logging.getLogger("cumuli-install")
 
 #: hloc must be an editable clone: its SuperPoint extractor reaches up to
@@ -96,6 +98,11 @@ class Group:
     #: decides "already installed", the requirement is what pip is given.
     requirements: list[tuple[str, str]] = field(default_factory=list)
     no_deps: bool = False
+    #: A ``name==version`` requirement counts as installed only at *that* version, and installing
+    #: it may change what is there. Off for every other group, whose pins are "install if absent".
+    exact: bool = False
+    #: Not part of the default install: it is asked for by name (``--groups viewer``).
+    optional: bool = False
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
@@ -266,6 +273,13 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
                 ("pycolmap==4.0.4", "pycolmap"),
                 (LIGHTGLUE_PIN, "lightglue"),
             ],
+        ),
+        "viewer": Group(
+            name="viewer",
+            summary=f"the Rerun ring viewer node: rerun-sdk {viewer_assets.VIEWER_VERSION}, matched to its bundled viewer files",
+            requirements=[(f"rerun-sdk=={viewer_assets.VIEWER_VERSION}", "rerun-sdk")],
+            exact=True,
+            optional=True,
         ),
         "trainer": Group(
             name="trainer",
@@ -446,12 +460,32 @@ def missing_manual_assets(paths: dict[str, Path]) -> list[str]:
 
 
 # -- steps -----------------------------------------------------------------
+def _wanted_version(req: str) -> str | None:
+    """The version of a plain ``name==version`` requirement, or ``None`` for anything else."""
+
+    if "==" not in req or "@" in req:
+        return None
+    return req.split("==", 1)[1].strip()
+
+
+def _satisfied(group: Group, req: str, have: str | None) -> bool:
+    if have is None:
+        return False
+    wanted = _wanted_version(req) if group.exact else None
+    return wanted is None or have == wanted
+
+
 def install_requirements(group: Group, *, force: bool, dry_run: bool) -> None:
-    pending = [req for req, dist in group.requirements
-               if force or installed_version(dist) is None]
+    pending = []
     for req, dist in group.requirements:
         have = installed_version(dist)
-        if have and not force:
+        if force or not _satisfied(group, req, have):
+            pending.append(req)
+            wanted = _wanted_version(req)
+            if group.exact and have and wanted and have != wanted:
+                LOGGER.warning("  changing %s %s -> %s (pinned: it must match the files this pack bundles)",
+                               dist, have, wanted)
+        else:
             LOGGER.info("  present  %-46s %s", dist, have)
     if not pending:
         LOGGER.info("  nothing to install")
@@ -461,6 +495,22 @@ def install_requirements(group: Group, *, force: bool, dry_run: bool) -> None:
         argv.append("--no-deps")
     argv.extend(pending)
     _run(argv, dry_run=dry_run)
+
+
+def fetch_viewer_assets(*, dry_run: bool = False) -> None:
+    """Fetch the pinned Rerun web viewer files (about 15 MB) and verify them, once, here."""
+
+    if viewer_assets.find_assets() is not None:
+        LOGGER.info("  present  %-46s %s", "rerun web viewer files", viewer_assets.VIEWER_VERSION)
+        return
+    if dry_run:
+        LOGGER.info("  $ fetch %s", viewer_assets.TARBALL_URL)
+        return
+    try:
+        directory = viewer_assets.ensure_assets()
+    except viewer_assets.ViewerAssetsError as exc:
+        raise InstallError(str(exc)) from None
+    LOGGER.info("  fetched  %-46s %s", "rerun web viewer files", directory)
 
 
 def install_hloc(hloc_dir: Path, *, force: bool, dry_run: bool) -> None:
@@ -570,11 +620,18 @@ def verify(groups: dict[str, Group], selected: list[str]) -> list[str]:
     for name in selected:
         group = groups[name]
         LOGGER.info("%s -- %s", name, group.summary)
-        for _req, dist in group.requirements:
+        for req, dist in group.requirements:
             have = installed_version(dist)
-            LOGGER.info("  %-8s %-44s %s", "ok" if have else "MISSING", dist, have or "-")
-            if not have:
-                missing.append(dist)
+            good = _satisfied(group, req, have)
+            label = "ok" if good else ("WRONG" if have else "MISSING")
+            LOGGER.info("  %-8s %-44s %s", label, dist, have or "-")
+            if not good:
+                missing.append(f"{dist} (installed {have}, need {_wanted_version(req)})" if have else dist)
+        if name == "viewer":
+            found = viewer_assets.find_assets()
+            LOGGER.info("  %-8s %-44s %s", "ok" if found else "MISSING", "rerun web viewer files", found or "-")
+            if not found:
+                missing.append("rerun web viewer files")
         if name == "sfm":
             have = installed_version("hloc")
             location = ""
@@ -615,7 +672,9 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--groups", default="core,bake,sfm,trainer",
-                        help="Comma-separated subset of core,bake,sfm,trainer. Default: all.")
+                        help="Comma-separated subset of core,bake,sfm,trainer,viewer. Default: core,bake,sfm,trainer. "
+                             "viewer (the Rerun ring viewer node) is opt-in: it pins rerun-sdk to the version of "
+                             "the viewer files it bundles, which may change an installed rerun-sdk.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print every command without running any of them.")
     parser.add_argument("--verify-only", action="store_true",
@@ -720,6 +779,8 @@ def main() -> int:
             if name == "trainer":
                 build_trainer_extensions(omg4, cuda_home, arch,
                                          force=args.force, dry_run=args.dry_run)
+            if name == "viewer":
+                fetch_viewer_assets(dry_run=args.dry_run)
             LOGGER.info("")
     except InstallError as exc:
         LOGGER.error("%s", exc)

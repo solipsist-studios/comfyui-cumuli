@@ -108,6 +108,27 @@ trainer:
 See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md). This is a summary
 of licence texts, not legal advice.
 
+## Ring viewer (optional)
+
+**Preview Ring (Rerun)** shows a ring's views playing on their cameras in one 3D scene, so camera
+placement and view consistency can be judged together. It is opt-in because it pins a package:
+
+```bash
+./install.sh --groups viewer
+```
+
+That installs `rerun-sdk` at exactly the version of the bundled viewer (currently 0.37.1; it warns
+before changing an installed one, because a recording written by a newer SDK may not load in an
+older viewer) and downloads the viewer's three files (about 15 MB) from the npm registry, checking
+them against a pinned checksum. Nothing is downloaded when a graph runs; the node tells you to run
+the installer if they are missing.
+
+The viewer is served from ComfyUI's own port, so there is no second port to open and no
+cross-origin setup, which matters when the browser is not on the machine running ComfyUI. The
+page is sent with a Content-Security-Policy that allows no other origin: the viewer would
+otherwise fetch web fonts, ask GitHub for its latest release and post usage telemetry, and none of
+that should come from a page embedded in a workflow.
+
 ## Requirements
 
 - A 4DAnyone checkout with its models (`~/Dev/github/4DAnyone` by default).
@@ -116,6 +137,7 @@ of licence texts, not legal advice.
 - A background-removal model in `models/background_removal/`
   (`birefnet.safetensors` ships with ComfyUI).
 - About 32 GB of VRAM for a 24-view ring.
+- Optional, for the ring viewer node: the `viewer` install group (see below).
 
 Everything runs in ComfyUI's environment. On top of a stock ComfyUI install it
 needs the packages below, all additive — no downgrade of torch, numpy,
@@ -220,6 +242,7 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | **Generate Ring** | Runs 4DAnyone. Takes a `VIDEO` socket (e.g. Load Video) — a file-backed, untrimmed video is used in place; trimmed or synthesized video is staged under `run_name`. The optional `MODEL` input folds the accumulated LoRA stack into the DiT weights inside the subprocess; `prompt` overrides the fixed prompt so trigger words reach cross-attention. The ring is described as `total_views` = `elevation_rows` x `views_per_row`: set any two and the third is worked out (0 = unset; nothing set is one row of 24). Rows are spaced evenly from `start_elevation` to `end_elevation` (degrees above the subject, -15 to 45; one row sits at the start), rounded to whole degrees. These are translated to 4DAnyone's `views_per_layer` and `layer_pitches`, and the report prints the resolved layout. Unloads ComfyUI's models and refuses to start below a free-VRAM floor. |
 | **Load Ring** | Opens a finished result directory, so the graph can be re-entered without regenerating. The widget is a discovery combo (the 4DAnyone data dir + config `ring_roots`) with a refresh button, like the other loaders. |
 | **Ring Contact Sheet** | One frame from every view, tiled. The fastest way to spot cross-view identity drift. |
+| **Preview Ring (Rerun)** | Plays the whole ring in 3D inside the node: every generated view on its own camera frustum, on one shared timeline, in the [Rerun](https://rerun.io) viewer. Optional — see [Ring viewer](#ring-viewer-optional). |
 | **Select View** | One view as VIDEO + IMAGE + its camera JSON. |
 | **Stage Ring** | Transposes 24 videos x 121 frames into 121 frame directories, with a per-frame `transforms.json`. |
 | **Solve Rig (HLOC)** | Solves a **real** multi-camera rig into poses, for footage that ships no calibration. Runs multi-timestamp HLOC/pycolmap over a directory of per-camera videos, sharing one COLMAP camera per physical camera. Emits a typed `RIG` plus a QA readout (registered cameras, reprojection error, per-camera pose repeatability). Reads the capture directory only. |
