@@ -179,6 +179,62 @@ def test_ref_override_beats_the_pin(tmp_path, monkeypatch):
     assert (paths["cumuli_root"] / "README").read_text() == "moved on"
 
 
+def _commit_second(repo: Path) -> str:
+    """Move the repo's branch on by one commit; return the *first* commit's hash."""
+
+    first = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                           capture_output=True, text=True).stdout.strip()
+    (repo / "README").write_text("moved on")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "second"], check=True, capture_output=True)
+    return first
+
+
+def test_a_full_commit_hash_pin_clones_exactly_that_commit(tmp_path, monkeypatch):
+    """A pin must keep meaning the same code even after the branch moves on."""
+
+    remotes = tmp_path / "remotes"
+    url = _repo(remotes, "pinned")
+    first = _commit_second(remotes / "pinned")
+    monkeypatch.setattr(install, "CHECKOUTS", {"fdanyone_root": ("pinned", url, first)})
+    paths = install.fetch_checkouts(tmp_path / "deps")
+    clone = paths["fdanyone_root"]
+    assert (clone / "README").read_text() == "pinned"
+    head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    assert head == first
+
+
+def test_only_a_full_forty_character_hash_counts_as_a_commit_pin():
+    assert install._is_commit_hash("f7af8697b282a3106e395b19ca8004dd35c20877")
+    for ref in ("v0.0.1", "main", "f7af869", "f7af8697b282a3106e395b19ca8004dd35c2087z"):
+        assert not install._is_commit_hash(ref)
+
+
+def test_the_4danyone_pin_is_a_full_commit_hash():
+    """The fork's SAM 3D Body branch is not tagged yet; a branch name would not stay pinned."""
+
+    _name, url, ref = install.CHECKOUTS["fdanyone_root"]
+    assert url.endswith("solipsist-studios/4DAnyone.git")
+    assert install._is_commit_hash(ref)
+
+
+@pytest.mark.parametrize("with_turbo, expected", [(False, "False"), (True, "True")])
+def test_the_turbo_lora_is_only_downloaded_when_asked_for(tmp_path, monkeypatch, with_turbo, expected):
+    """The Turbo adapter is CC BY-NC-SA 4.0, so a default install must not fetch it."""
+
+    root = tmp_path / "4DAnyone"
+    (root / "fdanyone").mkdir(parents=True)
+    (root / "fdanyone" / "download.py").write_text("")
+    calls = []
+    monkeypatch.setattr(install, "_run", lambda argv, **kwargs: calls.append(argv))
+    install.fetch_models({"fdanyone_root": root}, with_turbo=with_turbo)
+    (argv,) = calls
+    assert "enable_turbo=sys.argv[3] == 'True'" in argv[2]    # the -c program reads the flag
+    assert argv[-1] == expected
+
+
 def test_dry_run_clones_nothing(origins):
     paths = install.fetch_checkouts(origins, dry_run=True)
     assert not any(path.exists() for path in paths.values())

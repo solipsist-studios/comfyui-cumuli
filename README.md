@@ -29,9 +29,12 @@ new enough to target it.
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
    or `./install.sh` on Linux. It clones the three checkouts it drives at
-   pinned versions (4DAnyone `v0.0.1`, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs
-   the Python dependencies into ComfyUI's own environment, downloads the model
-   weights, and writes `config.json` pointing at all of it. Expect it to take a while and around 30 GB.
+   pinned versions (4DAnyone at a pinned commit of our fork's SAM 3D Body
+   branch, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs the Python dependencies
+   into ComfyUI's own environment, downloads the model weights, and writes
+   `config.json` pointing at all of it. Expect it to take a while and around
+   30 GB. The non-commercial Turbo LoRA is *not* downloaded unless you pass
+   `--with-turbo` (see [Commercial use](#commercial-use)).
 3. **Download the SAM 3D Body weights**, which are gated behind Meta's SAM
    License: accept it on Hugging Face (`Comfy-Org/sam-3d-body`), download
    `sam_3d_body_dinov3_bf16.safetensors`, and put it in
@@ -65,7 +68,8 @@ from one 121-frame clip:
 but its LoRA is licensed CC BY-NC-SA 4.0 — non-commercial — so the default is the
 Apache-2.0 base model: substantially slower (24 steps), and the configuration the
 older figures in this README were measured against. Turn it on only for
-non-commercial work.
+non-commercial work, after fetching the LoRA with `./install.sh --with-turbo
+--groups core` (or 4DAnyone's `scripts/download_model.py`).
 
 The `.sogst` and its interchange PLY land in ComfyUI's output gallery under
 `cumuli/`. Everything heavier lives under `<work_root>/<run_name>/`.
@@ -80,8 +84,10 @@ button. See [Caching](#caching) for when a stage re-runs.
 `./install.sh --help` breaks the run into parts: `--no-fetch` keeps checkouts
 you already have, `--no-models` and `--no-configure` skip those stages,
 `--deps-dir` moves the clones, `--work-root` sets the scratch drive, `--ref`
-overrides the pinned versions, and `--dry-run` prints every command without
-running any of it. The sections below
+overrides the pinned versions (a tag, a branch, or a full commit hash),
+`--with-turbo` also fetches the Turbo LoRA, `--comfyui-root` lets the final
+check see whether the SAM 3D Body weights are already in place, and `--dry-run`
+prints every command without running any of it. The sections below
 document what each stage does and why.
 
 ## Commercial use
