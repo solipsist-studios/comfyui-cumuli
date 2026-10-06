@@ -324,14 +324,6 @@ class CumuliGenerateRing(IO.ComfyNode):
                              tooltip="Evenly spaced azimuth (yaw) views in each elevation row. The total ring "
                                      "(rows x views per row) must divide by 6. 0 = work it out from "
                                      "total_views and elevation_rows (24 if neither is set)."),
-                IO.Combo.Input("views_per_group", options=["4", "6", "auto"], default="4",
-                               tooltip="Ignored. 4DAnyone now denoises views in fixed groups of six, so this no "
-                                       "longer does anything. The widget stays only so saved workflows keep "
-                                       "their other values in place."),
-                IO.String.Input("pitch_list", default="", advanced=True,
-                                tooltip="Advanced: an explicit elevation per row in degrees, comma separated "
-                                        "(for example -10,15,35), each between -15 and 45. Overrides "
-                                        "start_elevation/end_elevation and fixes the number of rows."),
                 IO.Int.Input("start_yaw", default=0, min=-180, max=180, step=1,
                              tooltip="First yaw in every row. 0 faces the person."),
                 IO.Int.Input("yaw_span", default=360, min=1, max=360, step=1,
@@ -401,8 +393,6 @@ class CumuliGenerateRing(IO.ComfyNode):
         model=None,
         run_name="",
         views_per_row=0,
-        views_per_group="4",
-        pitch_list="",
         start_yaw=0,
         yaw_span=360,
         enable_rcp=True,
@@ -430,7 +420,6 @@ class CumuliGenerateRing(IO.ComfyNode):
                 views_per_row=views_per_row,
                 start_elevation=start_elevation,
                 end_elevation=end_elevation,
-                pitch_list=pitch_list,
             )
             source = runner.materialize_video_source(video, run_name, settings.source_root)
             staged = runner.stage_source_video(settings, source, run_name)

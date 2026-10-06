@@ -223,7 +223,7 @@ def test_subprocess_env_drops_comfyui_python_paths(settings, monkeypatch):
         ({"views_per_layer": 8, "layer_pitches": "15,30"}, "does not split into groups of 6"),
         ({"layer_pitches": "60"}, "between -15 and 45"),
         ({"layer_pitches": "15,15"}, "must not repeat"),
-        ({"layer_pitches": ""}, "at least one elevation"),
+        ({"layer_pitches": ""}, "At least one elevation"),
         ({"yaw_span": 0}, "between 1 and 360"),
         ({"seed": -1}, "non-negative"),
         ({"start_time": -2.0}, "non-negative"),
@@ -1048,8 +1048,6 @@ def test_scales_are_delogged_and_sh_is_channel_major(tmp_path):
         ({"total_views": 72, "views_per_row": 24}, 24, (15, 30, 45)),
         ({"elevation_rows": 3, "views_per_row": 12, "start_elevation": -10, "end_elevation": 35}, 12, (-10, 12, 35)),
         ({"total_views": 72, "elevation_rows": 3, "views_per_row": 24}, 24, (15, 30, 45)),
-        ({"pitch_list": "-10,15,35", "views_per_row": 8}, 8, (-10, 15, 35)),
-        ({"pitch_list": "15", "views_per_row": 24}, 24, (15,)),
     ],
 )
 def test_ring_layout_deduces_the_missing_count(kwargs, per_row, pitches):
@@ -1064,7 +1062,6 @@ def test_ring_layout_deduces_the_missing_count(kwargs, per_row, pitches):
         ({"total_views": 50, "elevation_rows": 3}, "does not split into 3 equal rows"),
         ({"total_views": 50, "views_per_row": 24}, "whole number of rows"),
         ({"total_views": 70, "elevation_rows": 3, "views_per_row": 24}, "is not elevation_rows"),
-        ({"elevation_rows": 2, "pitch_list": "15,30,45"}, "names 3 pitches"),
         ({"elevation_rows": 3, "start_elevation": 15, "end_elevation": 15}, "must not repeat"),
         ({"elevation_rows": 2, "start_elevation": -20, "end_elevation": 15}, "between -15 and 45"),
         ({"views_per_row": -1}, "cannot be negative"),
