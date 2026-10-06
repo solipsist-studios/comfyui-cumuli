@@ -288,9 +288,18 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
 #: submodules belong to the wider pipeline, not to this pack.
 #: ``(directory, url, ref)``. The ref is pinned per repository so an archive
 #: shipped today installs the same code next year, and so one checkout can move
-#: without dragging the others. ``--ref`` overrides all three at once.
+#: without dragging the others. ``--ref`` overrides all three at once. A ref is a
+#: tag, a branch, or a full 40-character commit hash.
+#:
+#: 4DAnyone is pinned to a commit of the fork's ``sam3d-pose`` branch: the first
+#: version with SAM 3D Body pose in place of GVHMR and SMPL-X, and upstream's newer
+#: command line. Move it to a tag once that branch is merged and released.
 CHECKOUTS = {
-    "fdanyone_root": ("4DAnyone", "https://github.com/solipsist-studios/4DAnyone.git", "v0.0.1"),
+    "fdanyone_root": (
+        "4DAnyone",
+        "https://github.com/solipsist-studios/4DAnyone.git",
+        "f7af8697b282a3106e395b19ca8004dd35c20877",
+    ),
     "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
     "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
 }
@@ -323,11 +332,30 @@ def fetch_checkouts(deps_dir: Path, *, ref: str | None = None, dry_run: bool = F
                 "--deps-dir to put the checkouts somewhere else."
             )
         deps_dir.mkdir(parents=True, exist_ok=True)
-        wanted = ref or pinned
-        # --branch takes a tag as happily as a branch, and --depth 1 against a
-        # tag fetches exactly that commit.
-        _run([git, "clone", "--depth", "1", "--branch", wanted, url, str(target)], dry_run=dry_run)
+        _clone_at(git, url, ref or pinned, target, dry_run=dry_run)
     return resolved
+
+
+def _is_commit_hash(ref: str) -> bool:
+    return len(ref) == 40 and all(char in "0123456789abcdef" for char in ref.lower())
+
+
+def _clone_at(git: str, url: str, ref: str, target: Path, *, dry_run: bool = False) -> None:
+    """Shallow-clone ``url`` at ``ref``: a tag, a branch, or a full commit hash.
+
+    ``--branch`` takes a tag as happily as a branch, and ``--depth 1`` against a tag
+    fetches exactly that commit. It cannot take a commit hash, so that case is an
+    init plus a fetch of just that commit, which the server allows for any commit
+    reachable from one of its branches.
+    """
+
+    if not _is_commit_hash(ref):
+        _run([git, "clone", "--depth", "1", "--branch", ref, url, str(target)], dry_run=dry_run)
+        return
+    _run([git, "init", "-q", str(target)], dry_run=dry_run)
+    _run([git, "-C", str(target), "remote", "add", "origin", url], dry_run=dry_run)
+    _run([git, "-C", str(target), "fetch", "--depth", "1", "origin", ref], dry_run=dry_run)
+    _run([git, "-C", str(target), "-c", "advice.detachedHead=false", "checkout", "FETCH_HEAD"], dry_run=dry_run)
 
 
 def checkout_revisions(paths: dict[str, Path]) -> dict[str, str]:
@@ -378,8 +406,12 @@ def write_config(paths: dict[str, Path], work_root: str | None, *, dry_run: bool
     CONFIG_FILE.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
-    """Pull 4DAnyone's published weights using its own downloader."""
+def fetch_models(paths: dict[str, Path], *, with_turbo: bool = False, dry_run: bool = False) -> None:
+    """Pull 4DAnyone's published weights using its own downloader.
+
+    The Turbo LoRA is left out unless asked for: it is licensed CC BY-NC-SA 4.0, so a
+    default install must not put a non-commercial file where commercial use would find it.
+    """
 
     root = paths.get("fdanyone_root")
     if root is None or not (root / "fdanyone" / "download.py").is_file():
@@ -388,8 +420,8 @@ def fetch_models(paths: dict[str, Path], *, dry_run: bool = False) -> None:
     argv = [sys.executable, "-c",
             "import sys; sys.path.insert(0, sys.argv[1]); "
             "from fdanyone.download import ensure_models; "
-            "ensure_models(model_dir=sys.argv[2])",
-            str(root), str(root / "models")]
+            "ensure_models(model_dir=sys.argv[2], enable_turbo=sys.argv[3] == 'True')",
+            str(root), str(root / "models"), str(bool(with_turbo))]
     _run(argv, cwd=root, dry_run=dry_run)
 
 
@@ -602,7 +634,7 @@ def main() -> int:
                         help=f"Where to clone the three checkouts. Default: {PACKAGE_ROOT / 'deps'}")
     parser.add_argument("--ref", default=None,
                         help="Override the pinned ref for every checkout (default: each repo's own pin, "
-                             + ", ".join(f"{n}@{r}" for n, _, r in CHECKOUTS.values()) + ").")
+                             + ", ".join(f"{n}@{r[:10] if _is_commit_hash(r) else r}" for n, _, r in CHECKOUTS.values()) + ").")
     parser.add_argument("--work-root", default=None,
                         help="Large drive for per-run intermediates (~20 GB/run). Written to config.json.")
     parser.add_argument("--comfyui-root", type=Path, default=None,
@@ -610,6 +642,9 @@ def main() -> int:
                              "weights are already in its models/detection folder")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Do not clone the checkouts; use whatever the config already points at.")
+    parser.add_argument("--with-turbo", action="store_true",
+                        help="Also download the 4DAnyone-Turbo LoRA. It is CC BY-NC-SA 4.0 "
+                             "(non-commercial) and Generate Ring leaves it off by default.")
     parser.add_argument("--no-models", action="store_true",
                         help="Do not download 4DAnyone's published weights.")
     parser.add_argument("--no-configure", action="store_true",
@@ -706,7 +741,7 @@ def main() -> int:
     if not args.no_models and checkouts:
         LOGGER.info("models -- 4DAnyone's published weights")
         try:
-            fetch_models(checkouts, dry_run=args.dry_run)
+            fetch_models(checkouts, with_turbo=args.with_turbo, dry_run=args.dry_run)
         except InstallError as exc:
             LOGGER.error("%s", exc)
             LOGGER.error("The weights can be fetched later; everything else is installed.")
