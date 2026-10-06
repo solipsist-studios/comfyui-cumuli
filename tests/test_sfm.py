@@ -50,7 +50,6 @@ def bridge_settings(root: Path) -> BridgeSettings:
         python_exe=sys.executable,
         data_dir=root / "data",
         model_dir=root / "models",
-        gvhmr_root=root / "third_party" / "GVHMR",
         device="cuda:0",
         min_free_vram_gb=30.0,
     )

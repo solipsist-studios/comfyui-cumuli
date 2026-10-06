@@ -70,7 +70,6 @@ def settings(fake_repo: Path) -> BridgeSettings:
         python_exe=sys.executable,  # skips conda discovery
         data_dir=fake_repo / "data",
         model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0",
         min_free_vram_gb=30.0,
         subprocess_env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
@@ -116,7 +115,18 @@ def test_argv_is_the_known_good_command_line(settings, tmp_path):
     # and only then chokes on the leftover -- so a stale flag costs 90 minutes.
     assert flags["--gpu_ids"] == "[0]"
     assert "--device" not in flags
-    assert flags["--enable_turbo"] == "True"
+    # Off unless asked for: the Turbo adapter is CC BY-NC-SA, so the default must be the
+    # Apache-2.0 base model. Turning it on has to be a deliberate act.
+    assert flags["--enable_turbo"] == "False"
+
+
+def test_turbo_is_off_by_default_everywhere_it_is_declared(tmp_path):
+    import inspect
+
+    video = tmp_path / "clip.mp4"
+    video.touch()
+    assert runner.RunRequest(video_path=video).enable_turbo is False
+    assert inspect.signature(runner.build_request).parameters["enable_turbo"].default is False
 
 
 def test_turbo_changes_the_fingerprint(tmp_path):
@@ -311,46 +321,170 @@ def test_artifact_dir_never_deletes_foreign_directories(tmp_path):
     assert (root / "somebody-elses.data").exists()
 
 
-def test_replacing_a_ring_keeps_its_motion_solve(tmp_path):
-    """4DAnyone keeps the GVHMR solve inside the result directory, so a stale
-    ring must be replaced around it: a seed-only change reuses the motion."""
-
-    root = tmp_path / "result"
-    (root / "gvhmr").mkdir(parents=True)
-    (root / "gvhmr" / "motion.json").write_text("{}")
-    (root / "videos").mkdir()
-    (root / "videos" / "00.mp4").write_text("old")
-    (root / "metadata.json").write_text("{}")
-    runner.write_stamp(root, "abc")
-    decision = runner.prepare_artifact_dir(root, "def", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES)
-    assert decision == "build"
-    assert sorted(child.name for child in root.iterdir()) == ["gvhmr"]
-    assert (root / "gvhmr" / "motion.json").is_file()
-
-
 def test_an_interrupted_4danyone_run_is_not_a_foreign_directory(tmp_path):
-    """A failed run leaves its motion solve and staging dir behind, unstamped.
+    """A failed run leaves its motion record and staging dir behind, unstamped.
     That is 4DAnyone's own unfinished work, to be resumed, not refused."""
 
     root = tmp_path / "result"
     (root / "gvhmr").mkdir(parents=True)
     (root / ".inference").mkdir()
     (root / ".4danyone-request.json").write_text("{}")
-    assert runner.prepare_artifact_dir(root, "abc", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES) == "build"
+    assert runner.prepare_artifact_dir(root, "abc", resumable=runner.RING_RUN_ENTRIES) == "build"
     assert (root / "gvhmr").is_dir() and (root / ".inference").is_dir()
 
 
-def test_a_stranger_beside_the_motion_solve_is_still_refused(tmp_path):
+def test_a_stranger_beside_the_motion_record_is_still_refused(tmp_path):
     root = tmp_path / "result"
     (root / "gvhmr").mkdir(parents=True)
     (root / "notes.txt").write_text("keep me")
     with pytest.raises(runner.ValidationError, match="not produced by this bridge"):
-        runner.prepare_artifact_dir(root, "abc", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES)
+        runner.prepare_artifact_dir(root, "abc", resumable=runner.RING_RUN_ENTRIES)
     assert (root / "notes.txt").exists()
 
 
-def test_the_motion_solve_lives_inside_the_result_directory(settings):
-    assert settings.motion_dir("clip") == settings.result_dir("clip") / "gvhmr"
+def test_config_example_stays_in_sync_with_the_defaults():
+    import json
+
+    from cumuli_bridge.settings import DEFAULTS
+
+    example = json.loads((Path(__file__).resolve().parent.parent / "config.example.json").read_text())
+    example.pop("_comment", None)
+    assert example == DEFAULTS
+
+
+def test_the_pose_cache_lives_outside_the_result_directory(settings):
+    """4DAnyone refuses any entry it does not recognise inside its result directory."""
+
+    pose_dir = settings.pose_dir("clip")
+    assert pose_dir == settings.data_dir / "pose" / "clip"
+    assert settings.result_dir("clip") not in pose_dir.parents
+
+
+class _PoseHarness:
+    """A stand-in for the two halves of the pose stage: 4DAnyone cutting the canonical
+    clip (a child process) and SAM 3D Body estimating on it (in ComfyUI)."""
+
+    def __init__(self, monkeypatch, tmp_path):
+        self.prepared: list[list[str]] = []
+        self.estimated: list[Path] = []
+        self.fail_estimate = False
+        self.write_npz = True
+        self.weights = tmp_path / "sam3d.safetensors"
+        self.weights.write_bytes(b"weights")
+        self.video = tmp_path / "clip.mp4"
+        self.video.write_bytes(b"data")
+
+        def fake_run(argv, **kwargs):
+            self.prepared.append([str(part) for part in argv])
+            out = Path(next(part.split("=", 1)[1] for part in argv if str(part).startswith("--output_dir=")))
+            out.mkdir(parents=True, exist_ok=True)
+            (out / runner.CANONICAL_CLIP).write_bytes(b"clip")
+
+        monkeypatch.setattr(runner, "run_streaming", fake_run)
+
+    def estimate(self, clip: Path, npz: Path) -> None:
+        self.estimated.append(clip)
+        if self.fail_estimate:
+            raise RuntimeError("SAM 3D Body failed")
+        if self.write_npz:
+            npz.write_bytes(b"pose")
+
+    def request(self, **overrides):
+        import dataclasses
+
+        return dataclasses.replace(known_good_request(self.video), **overrides)
+
+    def ensure(self, settings, request):
+        return runner.ensure_pose(settings, request, weights=self.weights, estimate=self.estimate)
+
+
+def test_the_pose_is_prepared_estimated_and_then_reused(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    npz, reused = harness.ensure(settings, request)
+    assert not reused and npz == settings.pose_dir("clip") / runner.POSE_NPZ and npz.is_file()
+    prepare = harness.prepared[0]
+    assert "--prepare_only=True" in prepare
+    assert f"--output_dir={settings.pose_dir('clip')}" in prepare
+    assert not any(part.startswith("--sam3d_npz") for part in prepare)
+
+    again, reused = harness.ensure(settings, request)
+    assert reused and again == npz
+    assert len(harness.prepared) == 1 and len(harness.estimated) == 1   # nothing re-run
+
+
+def test_a_seed_or_layout_change_keeps_the_pose(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.ensure(settings, harness.request())
+    _, reused = harness.ensure(settings, harness.request(seed=7, views_per_layer=12, enable_turbo=False))
+    assert reused and len(harness.estimated) == 1
+
+
+@pytest.mark.parametrize("change", [{"start_time": 2.0}, {"target_fps": "12"}])
+def test_a_different_clip_window_estimates_the_pose_again(settings, monkeypatch, tmp_path, change):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.ensure(settings, harness.request())
+    _, reused = harness.ensure(settings, harness.request(**change))
+    assert not reused and len(harness.estimated) == 2 and len(harness.prepared) == 2
+
+
+def test_different_weights_estimate_the_pose_again(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    harness.ensure(settings, request)
+    harness.weights.write_bytes(b"different weights")
+    _, reused = harness.ensure(settings, request)
+    assert not reused and len(harness.estimated) == 2
+
+
+def test_a_failed_estimate_is_never_trusted(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    request = harness.request()
+    harness.fail_estimate = True
+    with pytest.raises(RuntimeError, match="SAM 3D Body failed"):
+        harness.ensure(settings, request)
+    assert not runner.pose_is_cached(settings, request, harness.weights)
+    harness.fail_estimate = False
+    _, reused = harness.ensure(settings, request)
+    assert not reused and runner.pose_is_cached(settings, request, harness.weights)
+
+
+def test_an_estimate_that_writes_no_pose_is_an_error(settings, monkeypatch, tmp_path):
+    harness = _PoseHarness(monkeypatch, tmp_path)
+    harness.write_npz = False
+    with pytest.raises(RuntimeError, match="wrote no sam3d_mhr70.npz"):
+        harness.ensure(settings, harness.request())
+
+
+def test_the_generation_command_names_the_pose(settings, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"data")
+    npz = settings.pose_dir("clip") / runner.POSE_NPZ
+    argv = runner.build_argv(settings, known_good_request(video), sam3d_npz=npz)
+    assert f"--sam3d_npz={npz}" in argv
+    assert not any(part.startswith("--gvhmr_root") for part in argv)
+
+
+def test_pose_weights_resolve_from_an_absolute_path_or_comfys_detection_folder(monkeypatch, tmp_path):
+    import types
+
+    from cumuli_bridge import pose
+
+    weights = tmp_path / "sam.safetensors"
+    weights.write_bytes(b"w")
+    assert pose.resolve_weights(str(weights)) == weights
+    with pytest.raises(pose.PoseError, match="not found at"):
+        pose.resolve_weights(str(tmp_path / "missing.safetensors"))
+
+    folders = types.SimpleNamespace(
+        get_full_path=lambda folder, name: str(weights) if (folder, name) == ("detection", "sam.safetensors") else None
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", folders)
+    assert pose.resolve_weights("sam.safetensors") == weights
+    with pytest.raises(pose.PoseError, match="models/detection"):
+        pose.resolve_weights("other.safetensors")
+    with pytest.raises(pose.PoseError, match="setting is empty"):
+        pose.resolve_weights("  ")
 
 
 def test_attention_backend_is_a_setting_not_an_environment_variable(settings, monkeypatch):
@@ -1079,7 +1213,6 @@ def test_work_dir_nests_the_run_name(fake_repo):
         fdanyone_root=fake_repo,
         conda_env="", conda_exe="", python_exe=sys.executable,
         data_dir=fake_repo / "data", model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0", min_free_vram_gb=0.0,
         work_root="/big/drive/comfy",
     )
@@ -1205,7 +1338,6 @@ def _settings_with_roots(fake_repo, **kw):
     return BridgeSettings(
         fdanyone_root=fake_repo, conda_env="", conda_exe="", python_exe=sys.executable,
         data_dir=fake_repo / "data", model_dir=fake_repo / "models",
-        gvhmr_root=fake_repo / "third_party" / "GVHMR",
         device="cuda:0", min_free_vram_gb=0.0, **kw,
     )
 

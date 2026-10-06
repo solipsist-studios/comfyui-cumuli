@@ -32,6 +32,7 @@ from comfy.model_management import InterruptProcessingException, processing_inte
 from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, InputImpl, IO
 
+from . import pose as pose_module
 from . import runner
 from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset, slice_dataset_window
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
@@ -251,9 +252,15 @@ class CumuliGenerateRing(IO.ComfyNode):
 
     The input is a **file on disk**, not an IMAGE batch, for three reasons:
     4DAnyone re-decodes the clip itself against a canonical presentation clock;
-    the file stem is the cache key for the reusable GVHMR motion solve and the
-    name of the published result directory; and the job runs in a separate
-    interpreter, so any in-memory batch would have to be re-encoded anyway.
+    the file stem is the cache key for the reusable body pose and the name of
+    the published result directory; and the job runs in a separate process, so
+    any in-memory batch would have to be re-encoded anyway.
+
+    Three stages run in order: 4DAnyone cuts the canonical 121-frame clip (a
+    cheap child process); SAM 3D Body estimates the body pose on it *inside
+    ComfyUI*, using ComfyUI's own model machinery; then 4DAnyone generates the
+    views from that pose in a child process. The pose is cached per clip, so a
+    seed or layout change does not estimate it again.
     """
 
     @classmethod
@@ -293,7 +300,7 @@ class CumuliGenerateRing(IO.ComfyNode):
                     default="",
                     tooltip=(
                         "Optional name for this run. Empty uses the video's filename stem. "
-                        "The name keys both the result directory and the reusable GVHMR motion cache."
+                        "The name keys both the result directory and the reusable body-pose cache."
                     ),
                     optional=True,
                 ),
@@ -340,12 +347,13 @@ class CumuliGenerateRing(IO.ComfyNode):
                 # Appended last on purpose: a saved workflow stores widget values
                 # positionally, so inserting anywhere earlier shifts every value
                 # after it.
-                IO.Boolean.Input("enable_turbo", default=True,
+                IO.Boolean.Input("enable_turbo", default=False,
                                  tooltip="Use 4DAnyone-Turbo (a distilled LoRA over the same base "
-                                         "checkpoint) for accelerated denoising. Off runs the base "
-                                         "model: slower, and the configuration the pack's empirical "
-                                         "settings were measured against. Part of the ring "
-                                         "fingerprint, so switching regenerates.",
+                                         "checkpoint) for 4-step denoising, several times faster. OFF by "
+                                         "default because the Turbo adapter is licensed CC BY-NC-SA 4.0 "
+                                         "(non-commercial); off runs the Apache-2.0 base model, which is "
+                                         "slower. Turn it on only for non-commercial work. Part of the "
+                                         "ring fingerprint, so switching regenerates.",
                                  advanced=True),
                 IO.Int.Input("total_views", default=0, min=0, max=384, step=1,
                              tooltip="Total views in the ring = elevation_rows x views_per_row. Set any two of "
@@ -390,7 +398,7 @@ class CumuliGenerateRing(IO.ComfyNode):
         prompt="",
         min_free_vram_gb=-1.0,
         dry_run=False,
-        enable_turbo=True,
+        enable_turbo=False,
         total_views=0,
         elevation_rows=0,
         start_elevation=15,
@@ -447,17 +455,27 @@ class CumuliGenerateRing(IO.ComfyNode):
             requirements = runner.check_video(settings, request)
             result_dir = settings.result_dir(request.run_name)
             fingerprint, motion_key = runner.ring_fingerprint(request)
-            previous_stamp = runner.read_stamp(result_dir)
-            # The motion solve lives inside the result directory and has its own
-            # staleness rule (clear_stale_motion below), so a replaced ring keeps it.
             decision = runner.prepare_artifact_dir(
-                result_dir, fingerprint, keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES
+                result_dir, fingerprint, resumable=runner.RING_RUN_ENTRIES
             )
-            argv = runner.build_argv(settings, request)
+            pose_npz = settings.pose_dir(request.run_name) / runner.POSE_NPZ
+            argv = runner.build_argv(settings, request, sam3d_npz=pose_npz)
+            # Resolved up front for the report, but only *required* below: a cached ring
+            # needs neither the weights nor the pose.
+            try:
+                weights = pose_module.resolve_weights(settings.sam3d_weights)
+                weights_problem = pose_module.host_problem()
+            except pose_module.PoseError as exc:
+                weights, weights_problem = None, str(exc)
         except (SettingsError, runner.ValidationError) as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
 
-        cached_motion = runner.motion_is_cached(settings, request)
+        if weights is not None and runner.pose_is_cached(settings, request, weights):
+            pose_line = f"pose: SAM 3D Body, reused ({pose_npz})"
+        elif weights_problem:
+            pose_line = f"pose: SAM 3D Body UNAVAILABLE -- {weights_problem}"
+        else:
+            pose_line = f"pose: SAM 3D Body, will be estimated ({settings.sam3d_weights})"
         header = [
             f"run_name: {request.run_name}",
             f"input: {requirements.probe.width}x{requirements.probe.height} "
@@ -468,8 +486,7 @@ class CumuliGenerateRing(IO.ComfyNode):
             f"{request.views_per_layer} per row, elevations {list(request.layer_pitches)} deg, "
             f"groups of {runner.VIEW_GROUP_SIZE}, rcp={request.enable_rcp})",
             f"result_dir: {result_dir}",
-            f"gvhmr motion cache: {'reused' if cached_motion else 'will be solved'} "
-            f"({settings.motion_dir(request.run_name)})",
+            pose_line,
             "command: " + " ".join(argv),
         ]
         if lora_note:
@@ -485,8 +502,24 @@ class CumuliGenerateRing(IO.ComfyNode):
             ring = RingResult.load(result_dir)
             _send_text(node_id, "cached result (inputs unchanged)")
             return IO.NodeOutput(ring, str(result_dir), "CACHED RESULT\n" + "\n".join(header))
-        if runner.clear_stale_motion(settings, request, motion_key, previous_stamp):
-            header.append("gvhmr motion cache: cleared (clip changed)")
+
+        if weights_problem:
+            raise RuntimeError(f"Cumuli: cannot estimate the body pose: {weights_problem}")
+
+        def estimate(clip: Path, npz: Path) -> None:
+            _send_text(node_id, "estimating body pose (SAM 3D Body)")
+            pose_module.estimate_pose(clip, npz, weights=weights)
+
+        _send_text(node_id, "preparing the clip")
+        try:
+            pose_npz, pose_reused = runner.ensure_pose(
+                settings, request, weights=weights, estimate=estimate, should_cancel=_cancelled
+            )
+        except SubprocessCancelled:
+            raise InterruptProcessingException() from None
+        except (SubprocessError, runner.ValidationError, pose_module.PoseError) as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        header.append(f"pose: {'reused' if pose_reused else 'estimated'} -> {pose_npz}")
 
         minimum = settings.min_free_vram_gb if min_free_vram_gb < 0 else float(min_free_vram_gb)
         try:
@@ -505,6 +538,7 @@ class CumuliGenerateRing(IO.ComfyNode):
             outcome = runner.execute(
                 settings,
                 request,
+                sam3d_npz=pose_npz,
                 on_progress=on_progress,
                 should_cancel=_cancelled,
             )

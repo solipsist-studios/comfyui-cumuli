@@ -198,7 +198,7 @@ def test_discover_models_finds_windowed_and_single_runs(tmp_path):
     (tmp_path / "work" / "not_a_run").mkdir()
     scoped = BridgeSettings(
         fdanyone_root=tmp_path, conda_env="", conda_exe="", python_exe="", data_dir=tmp_path,
-        model_dir=tmp_path, gvhmr_root=tmp_path, device="cpu", min_free_vram_gb=0.0,
+        model_dir=tmp_path, device="cpu", min_free_vram_gb=0.0,
         work_root=str(tmp_path / "work"),
     )
     found = runner.discover_models(scoped)

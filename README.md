@@ -32,10 +32,11 @@ new enough to target it.
    pinned versions (4DAnyone `v0.0.1`, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs
    the Python dependencies into ComfyUI's own environment, downloads the model
    weights, and writes `config.json` pointing at all of it. Expect it to take a while and around 30 GB.
-3. **Download SMPL-X** models that require manual registration at
-   [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/), download
-   `models_smplx_v1_1.zip`, and extract `SMPLX_NEUTRAL.npz` under
-   `deps/4DAnyone/models/body_models/smplx/`.
+3. **Download the SAM 3D Body weights**, which are gated behind Meta's SAM
+   License: accept it on Hugging Face (`Comfy-Org/sam-3d-body`), download
+   `sam_3d_body_dinov3_bf16.safetensors`, and put it in
+   `<ComfyUI>/models/detection/`. This needs a ComfyUI that ships the SAM 3D
+   Body nodes (0.34 or newer). Generate Ring uses it to estimate the body pose.
 4. **Restart ComfyUI** if it was running — custom nodes load at startup.
 5. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.
@@ -49,8 +50,9 @@ front rather than failing an hour in.
 
 ### What to expect
 
-Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
-`enable_turbo`, from one 121-frame clip:
+Measured on an RTX 5090 (32 GB), 24 views with RCP on and `enable_turbo` **on**
+(the Generate Ring row below is Turbo's; the stages after it do not depend on it),
+from one 121-frame clip:
 
 | stage | time | peak VRAM |
 |---|---|---|
@@ -59,9 +61,11 @@ Measured on an RTX 5090 (32 GB), 24 views with RCP on and the default
 | Train 4DGS | ~1 h (30000 iterations) | whole card |
 | Bake SOGST | ~1 min | — |
 
-`enable_turbo` is on by default and does the ring in 4 denoising steps. Turning
-it off runs the base model — substantially slower, and the configuration the
-older figures in this README were measured against.
+`enable_turbo` is **off by default**. Turbo does the ring in 4 denoising steps,
+but its LoRA is licensed CC BY-NC-SA 4.0 — non-commercial — so the default is the
+Apache-2.0 base model: substantially slower (24 steps), and the configuration the
+older figures in this README were measured against. Turn it on only for
+non-commercial work.
 
 The `.sogst` and its interchange PLY land in ComfyUI's output gallery under
 `cumuli/`. Everything heavier lives under `<work_root>/<run_name>/`.
@@ -80,6 +84,24 @@ overrides the pinned versions, and `--dry-run` prints every command without
 running any of it. The sections below
 document what each stage does and why.
 
+## Commercial use
+
+The code in this repository is PolyForm-Noncommercial; a commercial licence is
+available separately. Whether a *pipeline* can be used commercially also depends on
+the third-party models it runs, and as of this writing that holds only up to the
+trainer:
+
+| stage | status |
+|---|---|
+| Body pose (SAM 3D Body, MHR) | Replaces GVHMR and SMPL-X, which were research-only and non-commercial. SAM 3D Body is under Meta's SAM License, which allows commercial use but excludes ITAR and military or warfare uses, lets Meta amend the terms, and carries an indemnity. Read it. |
+| Ring generation | 4DAnyone and the Wan2.2 base model are Apache-2.0. **`enable_turbo` is off by default**: the Turbo adapter is CC BY-NC-SA 4.0. Leave it off for commercial use. |
+| Masks (BiRefNet) | MIT. |
+| Real-capture rig solve | `feature_type` defaults to `aliked` (BSD). `superpoint`'s weights are non-commercial research use only. |
+| **4DGS training (OMG4)** | **Not cleared.** The trainer builds Inria's `diff-gaussian-rasterization` and `simple-knn`, which carry a non-commercial research licence, and OMG4 itself has no licence file. Until that is resolved with the rights holders or replaced, this stage is non-commercial. |
+
+See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md). This is a summary
+of licence texts, not legal advice.
+
 ## Requirements
 
 - A 4DAnyone checkout with its models (`~/Dev/github/4DAnyone` by default).
@@ -91,11 +113,11 @@ document what each stage does and why.
 
 Everything runs in ComfyUI's environment. On top of a stock ComfyUI install it
 needs the packages below, all additive — no downgrade of torch, numpy,
-transformers, timm or ultralytics.
+transformers or timm.
 
 **`install.sh` / `install.bat` do all of it** — see [Quickstart](#quickstart).
 It is idempotent (already-installed packages are skipped), auto-detects the CUDA
-toolkit and GPU arch for the extension builds, and records the five pinned
+toolkit and GPU arch for the extension builds, and records the four pinned
 packages before and after: if pip moves one, the run fails loudly instead of
 leaving a broken ComfyUI to discover an hour later. `--force` reinstalls and
 rebuilds, which is what you want after a torch upgrade. The interpreter is the
@@ -106,8 +128,8 @@ interpreter it picked has no torch.
 The rest of this section is what the script does, for anyone doing it by hand:
 
 ```bash
-# 4DAnyone + vendored GVHMR
-pip install smplx==0.1.28 hydra-zen hydra_colorlog yacs lapx ftfy \
+# 4DAnyone
+pip install hydra-zen hydra_colorlog yacs lapx ftfy \
             sentencepiece fire colorlog ffmpeg-python
 # the .sogst bake
 pip install dahuffman
@@ -216,7 +238,7 @@ after a server restart reuses the 90-minute ring and the 1-hour checkpoint
 instantly, and a changed input replaces the stale artifact automatically.
 Two deliberate exceptions: a directory the bridge did not stamp is never
 deleted (foreign results error with guidance instead), and seed-only changes
-keep the GVHMR motion cache, which does not depend on the seed.
+keep the cached body pose, which does not depend on the seed.
 
 ### LoRA identity
 
