@@ -298,11 +298,13 @@ class CumuliGenerateRing(IO.ComfyNode):
                     optional=True,
                 ),
                 IO.Int.Input("views_per_row", default=0, min=0, max=96, step=1,
-                             tooltip="Evenly spaced azimuth (yaw) views in each elevation row. Must divide by "
-                                     "4 or 6. 0 = work it out from total_views and elevation_rows "
-                                     "(24 if neither is set)."),
+                             tooltip="Evenly spaced azimuth (yaw) views in each elevation row. The total ring "
+                                     "(rows x views per row) must divide by 6. 0 = work it out from "
+                                     "total_views and elevation_rows (24 if neither is set)."),
                 IO.Combo.Input("views_per_group", options=["4", "6", "auto"], default="4",
-                               tooltip="Target views denoised together. 6 overruns 32 GB; 4 is the safe value."),
+                               tooltip="Ignored. 4DAnyone now denoises views in fixed groups of six, so this no "
+                                       "longer does anything. The widget stays only so saved workflows keep "
+                                       "their other values in place."),
                 IO.String.Input("pitch_list", default="", advanced=True,
                                 tooltip="Advanced: an explicit elevation per row in degrees, comma separated "
                                         "(for example -10,15,35), each between -15 and 45. Overrides "
@@ -414,7 +416,6 @@ class CumuliGenerateRing(IO.ComfyNode):
                 layer_pitches=layout.pitches,
                 start_yaw=start_yaw,
                 yaw_span=yaw_span,
-                views_per_group=views_per_group,
                 enable_rcp=enable_rcp,
                 enable_tcr=enable_tcr,
                 start_time=start_time,
@@ -447,7 +448,11 @@ class CumuliGenerateRing(IO.ComfyNode):
             result_dir = settings.result_dir(request.run_name)
             fingerprint, motion_key = runner.ring_fingerprint(request)
             previous_stamp = runner.read_stamp(result_dir)
-            decision = runner.prepare_artifact_dir(result_dir, fingerprint)
+            # The motion solve lives inside the result directory and has its own
+            # staleness rule (clear_stale_motion below), so a replaced ring keeps it.
+            decision = runner.prepare_artifact_dir(
+                result_dir, fingerprint, keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES
+            )
             argv = runner.build_argv(settings, request)
         except (SettingsError, runner.ValidationError) as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
@@ -461,7 +466,7 @@ class CumuliGenerateRing(IO.ComfyNode):
             f"from {request.start_time:.2f}s",
             f"views: {request.num_target_views} ({len(request.layer_pitches)} row(s) x "
             f"{request.views_per_layer} per row, elevations {list(request.layer_pitches)} deg, "
-            f"group {request.views_per_group}, rcp={request.enable_rcp})",
+            f"groups of {runner.VIEW_GROUP_SIZE}, rcp={request.enable_rcp})",
             f"result_dir: {result_dir}",
             f"gvhmr motion cache: {'reused' if cached_motion else 'will be solved'} "
             f"({settings.motion_dir(request.run_name)})",

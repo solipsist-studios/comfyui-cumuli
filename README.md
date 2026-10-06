@@ -173,11 +173,11 @@ staging, the 4DGS dataset, trainer checkpoints — ~20 GB per run) land under
 The generation and training stages run as *child processes of that same
 interpreter*, not of another env: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 only takes effect before a process's first CUDA allocation, and both stages
-want the whole device. The subprocess env also pins
-`FDANYONE_ATTENTION_BACKEND=sdpa` — 4DAnyone's auto policy would pick
-sageattention when ComfyUI has it installed, and at this model's shapes
-sageattn peaks at exactly **2x** SDPA's memory, which is the difference between
-RCP fitting a 32 GB card and not.
+want the whole device. The `attention_backend` setting (default `sdpa`, passed
+as 4DAnyone's `--attention_backend`) pins the attention implementation —
+4DAnyone's `auto` policy would pick sageattention when ComfyUI has it
+installed, and at this model's shapes sageattn peaks at exactly **2x** SDPA's
+memory, which is the difference between RCP fitting a 32 GB card and not.
 
 ## The nodes
 
@@ -353,11 +353,14 @@ factor of ½.
 
 ### Settings that matter
 
-- **`enable_rcp True` (the default) with `views_per_group 4`** on Generate Ring.
-  RCP generates four anchor views the whole ring is conditioned on; without it
-  each denoising group invents its own far side and the back of the ring will
-  not reconstruct (measured: scene swaps, 1.6x saturation swings). With group 4
-  and the sdpa pin it peaks at ~28.6 GiB on a 32 GB card; group 6 does not fit.
+- **`enable_rcp True` (the default)** on Generate Ring. RCP generates anchor
+  views the whole ring is conditioned on; without it each denoising group
+  invents its own far side and the back of the ring will not reconstruct
+  (measured: scene swaps, 1.6x saturation swings). The total ring must divide
+  by 6: current 4DAnyone denoises views in fixed groups of six, so the old
+  `views_per_group` widget is ignored. *Memory figures from the previous
+  4DAnyone release (group 4 + sdpa: ~28.6 GiB peak on a 32 GB card; group 6
+  did not fit) predate its memory work and are not yet re-measured.*
 - **Input length.** 4DAnyone always generates exactly 121 frames. The clip must
   supply that many after `start_time` — about 5 s at 24 fps — at 720p or better.
   The node checks this and says what is missing rather than failing an hour in.

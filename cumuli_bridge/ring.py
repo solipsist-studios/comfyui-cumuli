@@ -7,8 +7,11 @@ A result directory (``<data_dir>/fdanyone/<video_stem>/``) contains::
     cameras.json        OpenCV rig for every generated view
     metadata.json       input/output/generation provenance
     skeletons/NN.mp4    conditioning skeleton render per view
-    videos/dense/NN.mp4 generated target view (704x1280, 121 frames)
-    videos/sparse/NN.mp4 optional RCP proposal views
+    videos/NN.mp4       generated target view (704x1280, 121 frames)
+
+Results written by earlier 4DAnyone versions keep their views in
+``videos/dense/NN.mp4`` and may carry ``videos/sparse/NN.mp4`` RCP proposal
+views; both still load, because each view's path comes from ``cameras.json``.
 
 Everything downstream of the runner talks to this class rather than to the
 directory layout directly.
@@ -23,13 +26,22 @@ from pathlib import Path
 
 CAMERAS_JSON = "cameras.json"
 METADATA_JSON = "metadata.json"
-DENSE_DIR = "videos/dense"
+VIDEOS_DIR = "videos"
+DENSE_DIR = "videos/dense"  # the layout before 4DAnyone moved views to videos/NN.mp4
 SPARSE_DIR = "videos/sparse"
 SKELETON_DIR = "skeletons"
 
 
 class RingError(RuntimeError):
     """Raised when a result directory is absent or does not match its manifest."""
+
+
+def _default_video(root: Path, camera_id: int) -> str:
+    """Where a view's video is when ``cameras.json`` does not say. Current
+    4DAnyone writes ``videos/NN.mp4``; earlier results used ``videos/dense/``."""
+
+    current = f"{VIDEOS_DIR}/{camera_id:02d}.mp4"
+    return current if (root / current).is_file() else f"{DENSE_DIR}/{camera_id:02d}.mp4"
 
 
 def _load_json(path: Path) -> dict:
@@ -134,7 +146,7 @@ class RingResult:
                     camera_to_world=record["camera_to_world"],
                     width=int(record.get("image_width", 0)),
                     height=int(record.get("image_height", 0)),
-                    video=str(record.get("video", f"{DENSE_DIR}/{camera_id:02d}.mp4")),
+                    video=str(record.get("video") or _default_video(root, camera_id)),
                     skeleton_video=str(record.get("skeleton_video", f"{SKELETON_DIR}/{camera_id:02d}.mp4")),
                 )
             )

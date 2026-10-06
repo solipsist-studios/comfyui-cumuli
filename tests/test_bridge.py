@@ -84,7 +84,6 @@ def known_good_request(video: Path) -> runner.RunRequest:
         layer_pitches="15",
         start_yaw=0,
         yaw_span=360,
-        views_per_group="4",
         enable_rcp=False,
         enable_tcr=True,
         start_time=0.0,
@@ -103,12 +102,15 @@ def test_argv_is_the_known_good_command_line(settings, tmp_path):
     flags = dict(part.split("=", 1) for part in argv[2:])
     # The empirically safe configuration for a 32 GB card.
     assert flags["--views_per_layer"] == "24"
-    assert flags["--views_per_group"] == "4"
+    assert "--views_per_group" not in flags      # groups are fixed at six upstream
     assert flags["--enable_rcp"] == "False"
     assert flags["--enable_tcr"] == "True"
     assert flags["--layer_pitches"] == "[15]"
     assert flags["--seed"] == "42"
-    assert flags["--data_dir"] == str(settings.data_dir)
+    # 4DAnyone no longer takes a data_dir: the result directory is named outright.
+    assert "--data_dir" not in flags
+    assert flags["--output_dir"] == str(settings.result_dir("clip"))
+    assert flags["--attention_backend"] == "sdpa"
     # inference() takes gpu_ids, not device: it dropped the latter when it
     # gained multi-GPU view stages. fire binds what it knows, runs the job,
     # and only then chokes on the leftover -- so a stale flag costs 90 minutes.
@@ -123,7 +125,7 @@ def test_turbo_changes_the_fingerprint(tmp_path):
     video = tmp_path / "clip.mp4"
     video.touch()
     common = dict(video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0,
-                  yaw_span=360, views_per_group=4, enable_rcp=True, enable_tcr=True,
+                  yaw_span=360, enable_rcp=True, enable_tcr=True,
                   start_time=0.0, target_fps="auto", seed=42, device="cuda:0")
     turbo = runner.build_request(**common, enable_turbo=True)
     base = runner.build_request(**common, enable_turbo=False)
@@ -207,8 +209,8 @@ def test_subprocess_env_drops_comfyui_python_paths(settings, monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, fragment",
     [
-        ({"views_per_group": "5"}, "must be 'auto', 4 or 6"),
-        ({"views_per_layer": 10, "views_per_group": "4"}, "divisible"),
+        ({"views_per_layer": 10}, "does not split into groups of 6"),
+        ({"views_per_layer": 8, "layer_pitches": "15,30"}, "does not split into groups of 6"),
         ({"layer_pitches": "60"}, "between -15 and 45"),
         ({"layer_pitches": "15,15"}, "must not repeat"),
         ({"layer_pitches": ""}, "at least one elevation"),
@@ -223,7 +225,7 @@ def test_bad_settings_are_refused_before_any_gpu_work(tmp_path, kwargs, fragment
     video.touch()
     base = dict(
         video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
-        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=42, device="cuda:0",
     )
     with pytest.raises(runner.ValidationError, match=fragment):
@@ -235,11 +237,10 @@ def test_start_yaw_wraps_into_minus180_180(tmp_path):
     video.touch()
     request = runner.build_request(
         video_path=video, views_per_layer=24, layer_pitches="15", start_yaw=270, yaw_span=360,
-        views_per_group="auto", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=0, device="cuda:0",
     )
     assert request.start_yaw == -90
-    assert request.views_per_group == "auto"
 
 
 @pytest.mark.parametrize(
@@ -310,11 +311,103 @@ def test_artifact_dir_never_deletes_foreign_directories(tmp_path):
     assert (root / "somebody-elses.data").exists()
 
 
+def test_replacing_a_ring_keeps_its_motion_solve(tmp_path):
+    """4DAnyone keeps the GVHMR solve inside the result directory, so a stale
+    ring must be replaced around it: a seed-only change reuses the motion."""
+
+    root = tmp_path / "result"
+    (root / "gvhmr").mkdir(parents=True)
+    (root / "gvhmr" / "motion.json").write_text("{}")
+    (root / "videos").mkdir()
+    (root / "videos" / "00.mp4").write_text("old")
+    (root / "metadata.json").write_text("{}")
+    runner.write_stamp(root, "abc")
+    decision = runner.prepare_artifact_dir(root, "def", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES)
+    assert decision == "build"
+    assert sorted(child.name for child in root.iterdir()) == ["gvhmr"]
+    assert (root / "gvhmr" / "motion.json").is_file()
+
+
+def test_an_interrupted_4danyone_run_is_not_a_foreign_directory(tmp_path):
+    """A failed run leaves its motion solve and staging dir behind, unstamped.
+    That is 4DAnyone's own unfinished work, to be resumed, not refused."""
+
+    root = tmp_path / "result"
+    (root / "gvhmr").mkdir(parents=True)
+    (root / ".inference").mkdir()
+    (root / ".4danyone-request.json").write_text("{}")
+    assert runner.prepare_artifact_dir(root, "abc", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES) == "build"
+    assert (root / "gvhmr").is_dir() and (root / ".inference").is_dir()
+
+
+def test_a_stranger_beside_the_motion_solve_is_still_refused(tmp_path):
+    root = tmp_path / "result"
+    (root / "gvhmr").mkdir(parents=True)
+    (root / "notes.txt").write_text("keep me")
+    with pytest.raises(runner.ValidationError, match="not produced by this bridge"):
+        runner.prepare_artifact_dir(root, "abc", keep=("gvhmr",), resumable=runner.RING_RUN_ENTRIES)
+    assert (root / "notes.txt").exists()
+
+
+def test_the_motion_solve_lives_inside_the_result_directory(settings):
+    assert settings.motion_dir("clip") == settings.result_dir("clip") / "gvhmr"
+
+
+def test_attention_backend_is_a_setting_not_an_environment_variable(settings, monkeypatch):
+    assert settings.attention_backend == "sdpa"
+    assert "FDANYONE_ATTENTION_BACKEND" not in settings.subprocess_env
+    monkeypatch.setenv("CUMULI_ATTENTION_BACKEND", "Flash_Attn_3")
+    from cumuli_bridge.settings import BridgeSettings
+
+    assert BridgeSettings.load().attention_backend == "flash_attn_3"
+
+
+def _write_ring(root, layout: str, count: int = 2) -> None:
+    import json
+
+    cameras = []
+    for index in range(count):
+        record = {"camera_id": index, "K": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                  "camera_to_world": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}
+        directory = root / ("videos" if layout == "new" else "videos/dense")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{index:02d}.mp4").write_bytes(b"x")
+        if layout != "nameless":
+            record["video"] = f"videos/{index:02d}.mp4" if layout == "new" else f"videos/dense/{index:02d}.mp4"
+        cameras.append(record)
+    (root / "cameras.json").write_text(json.dumps({"cameras": cameras}))
+    (root / "metadata.json").write_text("{}")
+
+
+@pytest.mark.parametrize("layout", ["new", "old"])
+def test_a_ring_loads_from_either_result_layout(tmp_path, layout):
+    from cumuli_bridge.ring import RingResult
+
+    _write_ring(tmp_path, layout)
+    ring = RingResult.load(tmp_path)
+    assert ring.num_views == 2
+    assert ring.video_path(1).is_file()
+    assert ring.sparse_paths() == ()          # videos/sparse is simply absent now
+
+
+def test_a_camera_without_a_video_field_finds_whichever_layout_exists(tmp_path):
+    import json
+
+    from cumuli_bridge.ring import RingResult
+
+    _write_ring(tmp_path, "new")
+    rig = json.loads((tmp_path / "cameras.json").read_text())
+    for record in rig["cameras"]:
+        record.pop("video", None)
+    (tmp_path / "cameras.json").write_text(json.dumps(rig))
+    assert RingResult.load(tmp_path).video_path(0) == tmp_path / "videos" / "00.mp4"
+
+
 def test_ring_fingerprint_tracks_seed_but_motion_key_does_not(tmp_path):
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"data")
     a = runner.build_request(video_path=video, views_per_layer=24, layer_pitches="15",
-                             start_yaw=0, yaw_span=360, views_per_group="4", enable_rcp=True,
+                             start_yaw=0, yaw_span=360, enable_rcp=True,
                              enable_tcr=True, start_time=0.0, target_fps="auto", seed=42, device="cuda:0")
     import dataclasses
     b = dataclasses.replace(a, seed=43)
@@ -352,7 +445,7 @@ def test_a_staged_run_name_survives_into_the_request(settings, tmp_path):
     staged = runner.stage_source_video(settings, video, "take07")
     request = runner.build_request(
         video_path=staged, views_per_layer=24, layer_pitches="15", start_yaw=0, yaw_span=360,
-        views_per_group="4", enable_rcp=False, enable_tcr=True, start_time=0.0,
+        enable_rcp=False, enable_tcr=True, start_time=0.0,
         target_fps="auto", seed=42, device="cuda:0",
     )
     assert request.run_name == "take07", "the staging symlink was resolved away"
