@@ -1615,6 +1615,24 @@
           "link": null
         },
         {
+          "localized_name": "trainer",
+          "name": "trainer",
+          "type": "COMBO",
+          "widget": {
+            "name": "trainer"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "export_min_contribution",
+          "name": "export_min_contribution",
+          "type": "FLOAT",
+          "widget": {
+            "name": "export_min_contribution"
+          },
+          "link": null
+        },
+        {
           "localized_name": "out_dir",
           "name": "out_dir",
           "shape": 7,
@@ -1667,6 +1685,8 @@
         1,
         0,
         false,
+        "omg4",
+        2.0,
         ""
       ],
       "widgets_values_named": {
@@ -1685,6 +1705,8 @@
         "max_parallel_windows": 1,
         "min_free_vram_gb": 0,
         "dry_run": false,
+        "trainer": "omg4",
+        "export_min_contribution": 2.0,
         "out_dir": ""
       }
     },
@@ -1782,6 +1804,24 @@
           "link": null
         },
         {
+          "localized_name": "smooth_px",
+          "name": "smooth_px",
+          "type": "FLOAT",
+          "widget": {
+            "name": "smooth_px"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "smooth_frames",
+          "name": "smooth_frames",
+          "type": "INT",
+          "widget": {
+            "name": "smooth_frames"
+          },
+          "link": null
+        },
+        {
           "localized_name": "windows",
           "name": "windows",
           "shape": 7,
@@ -1845,6 +1885,8 @@
         true,
         "fade",
         0.35,
+        0.5,
+        2,
         "",
         "cumuli/splat_4d"
       ],
@@ -1857,6 +1899,8 @@
         "emit_ply": true,
         "merge_mode": "fade",
         "merge_fade_seconds": 0.35,
+        "smooth_px": 0.5,
+        "smooth_frames": 2,
         "windows": "",
         "filename_prefix": "cumuli/splat_4d"
       }

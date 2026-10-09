@@ -28,6 +28,8 @@ trainer:
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.util
+import json
 import logging
 import os
 import re
@@ -45,6 +47,9 @@ LOGGER = logging.getLogger("comfyui-cumuli")
 CONFIG_NAME = "gs4d_config.yaml"
 MODEL_DIRNAME = "train4d_output"
 SOGST_NAME = "splat_4d.sogst"
+#: The cumuli trainer's output, the 4D interchange PLY (OMG4 writes ``chkpnt<N>.pth``).
+CUMULI_PLY_NAME = "splat_4d.ply"
+TRAINERS = ("omg4", "cumuli")
 
 #: ``Training progress:  33%|###   | 10000/30000 [12:34<25:08, 13.3it/s, Loss=…, PSNR=…]``
 _TRAIN_BAR = re.compile(r"Training progress:\s*\d{1,3}%\|.*?\|\s*(\d+)\s*/\s*(\d+)")
@@ -177,6 +182,14 @@ class TrainOptions:
     #: viewer shows plainly.
     lambda_opa_mask: float = 0.005
     trainer_config: Path | None = None
+    #: ``omg4`` is the rotor trainer above; ``cumuli`` is cumuli-trainer, which
+    #: takes only the knobs ``write_cumuli_config`` writes -- num_pts,
+    #: batch_size, densify_until_*, white_background and lambda_opa_mask belong
+    #: to OMG4 and are ignored.
+    trainer: str = "omg4"
+    #: cumuli-trainer only: drop Gaussians whose largest contribution to any
+    #: training view is below this many pixels. 0 keeps them all.
+    export_min_contribution: float = 2.0
 
     @property
     def model_dir(self) -> Path:
@@ -188,9 +201,15 @@ class TrainOptions:
 
     @property
     def checkpoint(self) -> Path:
+        if self.trainer == "cumuli":
+            return self.model_dir / CUMULI_PLY_NAME
         return self.model_dir / f"chkpnt{self.iterations}.pth"
 
     def validate(self) -> None:
+        if self.trainer not in TRAINERS:
+            raise TrainingError(f"trainer must be one of {', '.join(TRAINERS)}, got {self.trainer!r}.")
+        if self.export_min_contribution < 0:
+            raise TrainingError(f"export_min_contribution must not be negative, got {self.export_min_contribution}.")
         if self.iterations < 1:
             raise TrainingError(f"iterations must be positive, got {self.iterations}.")
         if self.duration_seconds <= 0:
@@ -226,12 +245,58 @@ def find_template(settings: BridgeSettings) -> Path:
     )
 
 
+def check_cumuli_trainer(settings: BridgeSettings) -> None:
+    """Fail before the GPU job if cumuli-trainer cannot be imported.
+
+    Only checkable when the child will run in this interpreter; with
+    ``conda_env``/``python_exe`` set, the child's own import error is reported.
+    """
+
+    try:
+        settings.launcher()  # validates python_exe
+    except SettingsError as exc:
+        raise TrainingError(str(exc)) from None
+    if settings.runs_in_this_environment and importlib.util.find_spec("cumuli_trainer") is None:
+        raise TrainingError(
+            "The cumuli trainer is not installed in ComfyUI's environment (no module named "
+            "cumuli_trainer). Install it with --no-deps (e.g. `pip install --no-deps -e "
+            "<cumuli-trainer checkout>`) together with gsplat, or choose the omg4 trainer."
+        )
+
+
+def write_cumuli_config(options: TrainOptions) -> Path:
+    """cumuli-trainer's config: JSON, which is valid YAML, and cannot misquote a path.
+
+    Written under the same name as OMG4's so Load Model reads both alike.
+    """
+
+    options.out_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "source_path": str(options.dataset_dir.resolve()),
+        "model_path": str(options.model_dir.resolve()),
+        "time_duration": [0.0, round(options.duration_seconds, 6)],
+        "fps": options.fps,
+        "iterations": options.iterations,
+        "sh_degree": options.sh_degree,
+        "test_iterations": [options.iterations],
+        "save_iterations": [options.iterations],
+        "export_min_contribution": options.export_min_contribution,
+    }
+    if options.t_init_div:
+        config["t_init_div"] = options.t_init_div
+    options.config_path.write_text(json.dumps(config, indent=2) + "\n")
+    LOGGER.info("Wrote trainer config %s", options.config_path)
+    return options.config_path
+
+
 def write_config(settings: BridgeSettings, options: TrainOptions) -> Path:
     """Fill cumuli's template. Kept as text substitution, as upstream does."""
 
     if options.trainer_config is not None:
         LOGGER.info("Using caller-supplied trainer config %s", options.trainer_config)
         return Path(options.trainer_config)
+    if options.trainer == "cumuli":
+        return write_cumuli_config(options)
     template = find_template(settings).read_text()
     options.out_dir.mkdir(parents=True, exist_ok=True)
     options.config_path.write_text(
@@ -275,6 +340,8 @@ def write_config(settings: BridgeSettings, options: TrainOptions) -> Path:
 
 
 def build_train_argv(settings: BridgeSettings, options: TrainOptions, config: Path) -> list[str]:
+    if options.trainer == "cumuli":
+        return list(settings.launcher()) + ["-m", "cumuli_trainer", "--config", str(config)]
     return list(settings.launcher()) + [
         str(settings.trainer_entrypoint),
         "--config",
@@ -320,6 +387,8 @@ def build_train_env(settings: BridgeSettings, options: TrainOptions) -> dict[str
     for name in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(name, None)
     env.update(cuda_toolchain_env())
+    if options.trainer == "cumuli":
+        return env  # t_init_div travels in the config; trainer_env is OMG4's
     if options.t_init_div:
         # Initial temporal sigma is sqrt(duration / div). Upstream's default of 5
         # bakes several frames of motion smear into the starting sigma.
@@ -349,10 +418,13 @@ def train(
     """Train to ``options.iterations``, or skip if that checkpoint already exists."""
 
     options.validate()
-    try:
-        settings.validate_trainer()
-    except SettingsError as exc:
-        raise TrainingError(str(exc)) from None
+    if options.trainer == "cumuli":
+        check_cumuli_trainer(settings)
+    else:
+        try:
+            settings.validate_trainer()
+        except SettingsError as exc:
+            raise TrainingError(str(exc)) from None
 
     config = write_config(settings, options)
     argv = build_train_argv(settings, options, config)
@@ -365,7 +437,8 @@ def train(
 
     result = run_streaming(
         argv,
-        cwd=settings.trainer_root,  # the trainer imports scene/ utils/ as top-level packages
+        # OMG4 imports scene/ utils/ as top-level packages; cumuli-trainer is an installed module.
+        cwd=options.out_dir if options.trainer == "cumuli" else settings.trainer_root,
         env=build_train_env(settings, options),
         on_line=handle,
         should_cancel=should_cancel,
@@ -399,6 +472,11 @@ class BakeOptions:
     #: arrays as the container, so the two cannot disagree, and it is what the
     #: preview node reads.
     emit_ply: Path | None = None
+    #: Used for a cumuli-trainer PLY input only (``checkpoint`` ends in
+    #: ``.ply``); an OMG4 checkpoint bakes exactly as it always has.
+    sh_chroma_clamp: float = 0.02
+    smooth_px: float = 0.5
+    smooth_frames: int = 2
 
 
 def find_bake_script(settings: BridgeSettings) -> Path:
@@ -412,8 +490,46 @@ def find_bake_script(settings: BridgeSettings) -> Path:
         raise TrainingError(str(exc)) from None
 
 
+def _build_ply_bake_argv(settings: BridgeSettings, options: BakeOptions, script: Path) -> list[str]:
+    """Bake a cumuli-trainer PLY. The PLY carries its own clip times and frame
+    rate, so passing them could only make them disagree with it, and the
+    script refuses the OMG4-only flags for this input."""
+
+    if options.smooth_px > 0 and options.mask_filter_root is None:
+        raise TrainingError(
+            "smooth_px needs the mask filter's dataset (the training cameras). Turn mask_filter on, "
+            "or set smooth_px to 0."
+        )
+    argv = list(settings.launcher()) + [
+        str(script),
+        "--input",
+        str(options.checkpoint),
+        "--output",
+        str(options.output),
+        "--sh_chroma_clamp",
+        str(options.sh_chroma_clamp),
+        "--shn_count",
+        str(options.shn_count),
+        "--segment_duration",
+        str(options.segment_duration),
+        "--webp_method",
+        str(options.webp_method),
+    ]
+    if options.smooth_px > 0:
+        argv += ["--smooth_px", str(options.smooth_px)]
+    if options.smooth_frames > 0:
+        argv += ["--smooth_frames", str(options.smooth_frames)]
+    if options.mask_filter_root is not None:
+        argv += ["--mask_filter_root", str(options.mask_filter_root)]
+    if options.emit_ply is not None:
+        argv += ["--emit_ply", str(options.emit_ply)]
+    return argv
+
+
 def build_bake_argv(settings: BridgeSettings, options: BakeOptions) -> list[str]:
     script = find_bake_script(settings)
+    if options.checkpoint.suffix == ".ply":
+        return _build_ply_bake_argv(settings, options, script)
     argv = list(settings.launcher()) + [
         str(script),
         "--input",

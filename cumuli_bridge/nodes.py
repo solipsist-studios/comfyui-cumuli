@@ -46,11 +46,13 @@ from .sogst import SogstError, frame_count, frame_time, load_interchange_ply, to
 from .train import (
     CONFIG_NAME,
     BakeOptions,
+    TRAINERS,
     MergeOptions,
     TrainOptions,
     TrainingError,
     WindowTrainSpec,
     bake,
+    check_cumuli_trainer,
     merge_windows,
     train,
     train_windows,
@@ -1692,6 +1694,16 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 IO.Boolean.Input("dry_run", default=False,
                                  tooltip="Write the config and report the command without training.",
                                  advanced=True),
+                IO.Combo.Input("trainer", options=list(TRAINERS), default="omg4",
+                               tooltip="omg4 is the rotor 4DGS trainer. cumuli is the cumuli-trainer "
+                                       "package. With cumuli, num_pts, batch_size, densify_until_*, "
+                                       "background and lambda_opa_mask are ignored (the trainer's own "
+                                       "defaults apply); iterations, sh_degree, t_init_div and the "
+                                       "duration and fps still are used."),
+                IO.Float.Input("export_min_contribution", default=2.0, min=0.0, max=100.0, step=0.5,
+                               tooltip="cumuli trainer only: drop Gaussians whose largest contribution "
+                                       "to any training view is below this many pixels. 0 keeps them all.",
+                               advanced=True),
             ],
             outputs=[
                 ModelIO.Output(display_name="model"),
@@ -1720,6 +1732,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
         max_parallel_windows=1,
         min_free_vram_gb=0.0,
         dry_run=False,
+        trainer="omg4",
+        export_min_contribution=2.0,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         if dataset is None:
@@ -1740,8 +1754,11 @@ class CumuliTrain4DGS(IO.ComfyNode):
 
         try:
             settings = load_settings()
-            settings.validate_trainer()
-        except SettingsError as exc:
+            if trainer == "cumuli":
+                check_cumuli_trainer(settings)
+            else:
+                settings.validate_trainer()
+        except (SettingsError, TrainingError) as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
 
         base_out_dir = Path((out_dir or "").strip()).expanduser() if out_dir.strip() else dataset.parent
@@ -1765,8 +1782,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 sh_degree=int(sh_degree),
                 white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
+                trainer=trainer,
+                export_min_contribution=float(export_min_contribution),
             )
-            train_fingerprint = runner.compute_fingerprint({
+            train_fingerprint = runner.compute_fingerprint(runner.train_fingerprint_fields({
                 "dataset": handle.fingerprint
                 if handle.fingerprint
                 else runner.file_identity(dataset / "transforms_train.json"),
@@ -1777,13 +1796,22 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 "densify_until_num_points": int(densify_until_num_points),
                 "t_init_div": int(t_init_div), "white_background": white_bg,
                 "lambda_opa_mask": float(lambda_opa_mask),
-            })
+            }, trainer, float(export_min_contribution)))
+            if trainer == "cumuli":
+                settings_line = (
+                    f"trainer: cumuli  iterations: {options.iterations}  sh_degree: {options.sh_degree}  "
+                    f"t_init_div: {options.t_init_div}  export_min_contribution: {options.export_min_contribution:g}"
+                )
+            else:
+                settings_line = (
+                    f"iterations: {options.iterations}  num_pts: {options.num_pts}  "
+                    f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}  "
+                    f"background: {resolved_background}  lambda_opa_mask: {options.lambda_opa_mask}"
+                )
             header = [
                 f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {rate:.3f} fps)",
                 f"model_dir: {options.model_dir}",
-                f"iterations: {options.iterations}  num_pts: {options.num_pts}  "
-                f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}  "
-                f"background: {resolved_background}  lambda_opa_mask: {options.lambda_opa_mask}",
+                settings_line,
                 f"checkpoint: {options.checkpoint}",
             ]
 
@@ -1857,7 +1885,9 @@ class CumuliTrain4DGS(IO.ComfyNode):
             f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {dataset_fps:.3f} fps)",
             f"windowed: {len(windows)} windows of "
             f"{[w.frame_count for w in windows]} frames (max_window_frames={int(max_window_frames)})",
-            f"background: {resolved_background}  lambda_opa_mask: {float(lambda_opa_mask)}",
+            (f"trainer: cumuli  export_min_contribution: {float(export_min_contribution):g}"
+             if trainer == "cumuli"
+             else f"background: {resolved_background}  lambda_opa_mask: {float(lambda_opa_mask)}"),
         ]
 
         if dry_run:
@@ -1871,6 +1901,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 densify_until_num_points=int(densify_until_num_points),
                 t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
+                trainer=trainer, export_min_contribution=float(export_min_contribution),
             )
             try:
                 from .train import build_train_argv, write_config
@@ -1905,8 +1936,9 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 densify_until_num_points=int(densify_until_num_points),
                 t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
+                trainer=trainer, export_min_contribution=float(export_min_contribution),
             )
-            window_fingerprint = runner.compute_fingerprint({
+            window_fingerprint = runner.compute_fingerprint(runner.train_fingerprint_fields({
                 "dataset": dataset_identity,
                 "window_index": window.index, "frame_start": window.frame_start,
                 "frame_count": window.frame_count, "dataset_fps": dataset_fps,
@@ -1916,7 +1948,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 "densify_until_num_points": int(densify_until_num_points),
                 "t_init_div": int(t_init_div), "white_background": white_bg,
                 "lambda_opa_mask": float(lambda_opa_mask),
-            })
+            }, trainer, float(export_min_contribution)))
             try:
                 decision = runner.prepare_artifact_dir(window_options.model_dir, window_fingerprint)
             except runner.ValidationError as exc:
@@ -2099,10 +2131,11 @@ class CumuliBakeSogst(IO.ComfyNode):
                 IO.Float.Input("sh_clamp", default=3.0, min=0.0, max=10.0, step=0.1,
                                tooltip="Attenuate higher SH bands above this bare DC. 1.5 is the "
                                        "upstream default and is too aggressive for explicit-SH "
-                                       "checkpoints.", advanced=True),
+                                       "checkpoints. OMG4 models only.", advanced=True),
                 IO.Boolean.Input("filter_corrupted", default=False,
                                  tooltip="Upstream's bad-colour filters. Calibrated for the legacy "
-                                         "SVQ path; they delete healthy splats here.", advanced=True),
+                                         "SVQ path; they delete healthy splats here. OMG4 models only.",
+                                 advanced=True),
                 IO.Int.Input("shn_count", default=65536, min=256, max=262144, step=256, advanced=True),
                 IO.Float.Input("segment_duration", default=0.1, min=0.0, max=5.0, step=0.01,
                                tooltip="Temporal segment length for streaming. 0 disables segmentation.",
@@ -2117,6 +2150,15 @@ class CumuliBakeSogst(IO.ComfyNode):
                                tooltip="Fade-zone width at each seam (merge_mode=fade only). 0.35s "
                                        "measured LPIPS-best; PSNR keeps improving out to 1.00s, which "
                                        "is a wide fade blurring across the seam."),
+                IO.Float.Input("smooth_px", default=0.5, min=0.0, max=4.0, step=0.1,
+                               tooltip="Models from the cumuli trainer only: blur every splat by this many "
+                                       "pixels at the training cameras, for a calmer, slightly softer "
+                                       "bake. 0 off. Needs mask_filter on (it reads the training cameras "
+                                       "from each window's dataset).", advanced=True),
+                IO.Int.Input("smooth_frames", default=2, min=0, max=30, step=1,
+                             tooltip="Models from the cumuli trainer only: widen every splat's lifetime "
+                                     "by this many frames, for gentler fade in and out. 0 off.",
+                             advanced=True),
             ],
             outputs=[
                 IO.String.Output(display_name="sogst_path"),
@@ -2140,6 +2182,8 @@ class CumuliBakeSogst(IO.ComfyNode):
         emit_ply=True,
         merge_mode="fade",
         merge_fade_seconds=0.35,
+        smooth_px=0.5,
+        smooth_frames=2,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
         if model is None:
@@ -2181,6 +2225,8 @@ class CumuliBakeSogst(IO.ComfyNode):
                 shn_count=int(shn_count),
                 segment_duration=float(segment_duration),
                 emit_ply=ply,
+                smooth_px=float(smooth_px),
+                smooth_frames=int(smooth_frames),
             )
 
         progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)

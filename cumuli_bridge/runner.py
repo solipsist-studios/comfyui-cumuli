@@ -891,6 +891,26 @@ FINGERPRINT_FILE = ".bridge_fingerprint.json"
 MASKS_FINGERPRINT_FILE = ".bridge_fingerprint.masks.json"
 
 
+#: Settings only the OMG4 trainer reads; left out of a cumuli run's fingerprint so
+#: changing them does not retrain it.
+_OMG4_ONLY_TRAIN_FIELDS = (
+    "num_pts", "batch_size", "densify_until_iter", "densify_until_num_points",
+    "white_background", "lambda_opa_mask",
+)
+
+
+def train_fingerprint_fields(fields: dict, trainer: str, export_min_contribution: float) -> dict:
+    """The fingerprint inputs for the chosen trainer. OMG4's are returned unchanged,
+    so artifacts trained before the trainer choice existed stay valid."""
+
+    if trainer != "cumuli":
+        return fields
+    kept = {key: value for key, value in fields.items() if key not in _OMG4_ONLY_TRAIN_FIELDS}
+    kept["trainer"] = "cumuli"
+    kept["export_min_contribution"] = export_min_contribution
+    return kept
+
+
 def compute_fingerprint(parts: dict) -> str:
     """Stable digest of a dict of JSON-able parts (Paths become strings)."""
 

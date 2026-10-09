@@ -12,6 +12,7 @@ subprocess tests drive a fake ``python -c`` child that replays real tqdm output.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import sys
@@ -988,6 +989,134 @@ def test_training_needs_a_built_dataset(tmp_path):
     options = TrainOptions(out_dir=tmp_path, dataset_dir=tmp_path / "nothing", duration_seconds=1.0)
     with pytest.raises(TrainingError, match="transforms_train.json"):
         options.validate()
+
+
+# --------------------------------------------------------------------------
+# the cumuli trainer, beside OMG4
+# --------------------------------------------------------------------------
+def _cumuli_options(tmp_path: Path, dataset: Path, **overrides) -> TrainOptions:
+    options = _train_options(tmp_path, dataset)
+    options.trainer = "cumuli"
+    options.sh_degree = 2
+    for name, value in overrides.items():
+        setattr(options, name, value)
+    return options
+
+
+def test_cumuli_trainer_runs_as_a_module_of_the_launcher(settings, tmp_path):
+    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"))
+    argv = build_train_argv(settings, options, options.config_path)
+    assert argv == [sys.executable, "-m", "cumuli_trainer", "--config", str(options.config_path)]
+    assert options.checkpoint == options.model_dir / "splat_4d.ply"
+
+
+def test_cumuli_config_carries_only_keys_the_trainer_knows(settings, tmp_path):
+    import json
+
+    from cumuli_bridge.train import write_config
+
+    dataset = _write_dataset(tmp_path / "ds")
+    options = _cumuli_options(tmp_path, dataset, export_min_contribution=0.0)
+    config = json.loads(write_config(settings, options).read_text())
+    assert config == {
+        "source_path": str(dataset.resolve()),
+        "model_path": str(options.model_dir.resolve()),
+        "time_duration": [0.0, 4.004],
+        "fps": 29.97,
+        "iterations": 30000,
+        "sh_degree": 2,
+        "test_iterations": [30000],
+        "save_iterations": [30000],
+        "export_min_contribution": 0.0,
+        "t_init_div": 100,
+    }
+    # Nothing of OMG4's reaches it: the trainer rejects unknown keys.
+    for omg4_only in ("num_pts", "batch_size", "densify_until_iter", "white_background", "lambda_opa_mask"):
+        assert omg4_only not in config
+
+
+def test_cumuli_trainer_gets_no_omg4_environment(settings, tmp_path):
+    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"))
+    settings = dataclasses.replace(settings, trainer_env={"OMG4_ONLY": "1"})
+    env = build_train_env(settings, options)
+    assert "GS4D_T_INIT_DIV" not in env and "OMG4_ONLY" not in env
+
+
+def test_an_unknown_trainer_is_refused(tmp_path):
+    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"), trainer="gsplat")
+    with pytest.raises(TrainingError, match="trainer must be one of"):
+        options.validate()
+
+
+def test_cumuli_trainer_missing_from_this_environment_is_reported_before_the_gpu_job(settings, monkeypatch):
+    from cumuli_bridge.train import check_cumuli_trainer
+
+    settings = dataclasses.replace(settings, python_exe="", conda_env="")
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(TrainingError, match="not installed in ComfyUI's environment"):
+        check_cumuli_trainer(settings)
+    # Another environment is the child's to report.
+    settings = dataclasses.replace(settings, python_exe=sys.executable)
+    check_cumuli_trainer(settings)
+
+
+def test_cumuli_bake_input_is_the_ply_and_carries_no_clip_flags(settings, tmp_path, monkeypatch):
+    script = tmp_path / "bake_sogst.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
+    argv = build_bake_argv(
+        settings,
+        BakeOptions(
+            checkpoint=tmp_path / "train4d_output" / "splat_4d.ply",
+            output=tmp_path / "out.sogst",
+            duration_seconds=4.004,
+            fps=29.97,
+            mask_filter_root=tmp_path / "ds",
+        ),
+    )
+    flags = argv[argv.index(str(script)) + 1 :]
+    assert flags[flags.index("--input") + 1].endswith("splat_4d.ply")
+    assert flags[flags.index("--sh_chroma_clamp") + 1] == "0.02"
+    assert flags[flags.index("--smooth_px") + 1] == "0.5"
+    assert flags[flags.index("--smooth_frames") + 1] == "2"
+    assert flags[flags.index("--mask_filter_root") + 1] == str(tmp_path / "ds")
+    # The PLY carries these; a disagreeing value is an error in the script, and
+    # the OMG4-only ones are rejected for this input.
+    for refused in ("--time_min", "--time_max", "--fps", "--sh_clamp", "--scale_boost", "--aniso_boost",
+                    "--cov2d_scale", "--extra_keep_mask", "--no_filter_corrupted"):
+        assert refused not in flags
+
+
+def test_cumuli_bake_smoothing_needs_the_mask_filter_dataset(settings, tmp_path, monkeypatch):
+    script = tmp_path / "bake_sogst.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
+    options = BakeOptions(checkpoint=tmp_path / "splat_4d.ply", output=tmp_path / "o.sogst", duration_seconds=1.0)
+    with pytest.raises(TrainingError, match="smooth_px needs"):
+        build_bake_argv(settings, options)
+    options.smooth_px = 0.0
+    assert "--smooth_px" not in build_bake_argv(settings, options)
+
+
+def test_omg4_bake_ignores_the_cumuli_only_smoothing(settings, tmp_path, monkeypatch):
+    script = tmp_path / "bake_sogst.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
+    argv = build_bake_argv(
+        settings, BakeOptions(checkpoint=tmp_path / "chkpnt200.pth", output=tmp_path / "o.sogst", duration_seconds=1.0)
+    )
+    assert "--smooth_px" not in argv and "--sh_chroma_clamp" not in argv
+
+
+def test_cumuli_fingerprint_ignores_omg4_knobs_and_omg4_fingerprints_are_untouched():
+    from cumuli_bridge.runner import train_fingerprint_fields
+
+    fields = {"dataset": "d", "iterations": 100, "num_pts": 1, "batch_size": 2, "densify_until_iter": 3,
+              "densify_until_num_points": 4, "white_background": False, "lambda_opa_mask": 0.005, "sh_degree": 2}
+    assert train_fingerprint_fields(fields, "omg4", 2.0) == fields  # cached OMG4 runs stay valid
+    cumuli = train_fingerprint_fields(fields, "cumuli", 2.0)
+    assert cumuli == {"dataset": "d", "iterations": 100, "sh_degree": 2, "trainer": "cumuli",
+                      "export_min_contribution": 2.0}
 
 
 # --------------------------------------------------------------------------

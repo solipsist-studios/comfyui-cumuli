@@ -31,7 +31,7 @@ from pathlib import Path
 
 import yaml
 
-from .train import CONFIG_NAME, MODEL_DIRNAME
+from .train import CONFIG_NAME, CUMULI_PLY_NAME, MODEL_DIRNAME
 
 #: The plan file, named as plan_temporal_windows.py's documentation names it.
 PLAN_NAME = "window_plan.json"
@@ -77,7 +77,7 @@ class TrainedModel:
         path = Path(path).expanduser()
         if path.is_file() and path.suffix == ".json":
             return cls._from_plan(path)
-        if path.is_file() and path.suffix == ".pth":
+        if path.is_file() and (path.suffix == ".pth" or path.name == CUMULI_PLY_NAME):
             return cls._from_checkpoint(path)
         if path.is_dir():
             if (path / PLAN_NAME).is_file():
@@ -290,14 +290,20 @@ def _read_window(index: int, out_dir: Path, offset: float, checkpoint: Path | No
             f"window {index}: {config_path} has no time_duration or iterations, so it is not a "
             "4DGS trainer config."
         ) from None
-    sh_degree = int(_lookup(config, "sh_degree", 3))
 
     # The config's paths are absolute; a run directory moved since training
     # keeps its contents under the standard names, so fall back to those.
     model_dir = _existing_dir(_lookup(config, "model_path", None)) or out_dir / MODEL_DIRNAME
     dataset_dir = _existing_dir(_lookup(config, "source_path", None)) or _existing_dir(out_dir / DATASET_DIRNAME)
 
-    checkpoint = checkpoint or model_dir / f"chkpnt{iterations}.pth"
+    # cumuli-trainer writes splat_4d.ply and a flat config; OMG4 writes
+    # chkpnt<N>.pth and nests its config in sections.
+    cumuli = (model_dir / CUMULI_PLY_NAME).is_file() or not any(isinstance(v, dict) for v in config.values())
+    sh_degree = int(_lookup(config, "sh_degree", 2 if cumuli else 3))
+    if cumuli:
+        checkpoint = checkpoint or model_dir / CUMULI_PLY_NAME
+    else:
+        checkpoint = checkpoint or model_dir / f"chkpnt{iterations}.pth"
     if not checkpoint.is_file():
         raise ModelError(
             f"window {index}: {checkpoint} does not exist, so training did not finish there. "
