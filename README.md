@@ -255,6 +255,20 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. Takes a `MODEL`; for a windowed one it bakes every window and stitches them into one archive, and its `windows` widget (`"0"`, `"1-2"`, empty for all) picks a contiguous subset. |
 | **Preview SOGST** | Evaluates the baked clip at one instant and outputs ComfyUI's native `SPLAT`. |
 
+**Choosing the trainer.** Train 4DGS's `trainer` widget is `omg4` (the default) or
+`cumuli`. The cumuli trainer is the `cumuli_trainer` Python package, started as
+`python -m cumuli_trainer --config <run>/gs4d_config.yaml` with the same interpreter
+as everything else here (so it and `gsplat` must be installed in ComfyUI's
+environment, `--no-deps`; Train 4DGS says so before it starts if they are not). It
+writes `train4d_output/splat_4d.ply`, which Bake SOGST bakes directly. With it,
+`num_pts`, `batch_size`, `densify_until_*`, `background` and `lambda_opa_mask` are
+ignored; `iterations`, `sh_degree`, `t_init_div`, the clip duration/fps and
+`export_min_contribution` are used. Bake SOGST's `smooth_px` and `smooth_frames`
+apply to such models only (`smooth_px` needs `mask_filter` on), and its `sh_clamp`
+and `filter_corrupted` to OMG4 models only. Load Model opens either kind. The bake
+needs a `bake_sogst.py` that accepts a PLY input, so point `cumuli_root` at a cumuli
+checkout that has it.
+
 ### Caching
 
 There are **no cache toggles** — no `on_existing`, no `overwrite`, no
