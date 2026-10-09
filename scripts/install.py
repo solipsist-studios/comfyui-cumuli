@@ -29,10 +29,14 @@ silent when they happen by hand:
   installs pass ``--no-deps``, and the versions of torch, numpy, transformers,
   and timm are recorded before and compared after: if anything moved,
   the run fails loudly instead of leaving a broken ComfyUI to discover later.
-* **The trainer's CUDA kernels need an nvcc that knows the GPU.** gsplat
-  compiles them on first use, and ``/usr/bin/nvcc`` is often a distro CUDA too old
-  to target the installed GPU. Train 4DGS points the build at the newest
-  ``/usr/local/cuda-*`` itself; ``CUDA_HOME`` overrides it.
+* **The trainer's CUDA kernels need a compiler that knows the GPU.** gsplat
+  compiles them on first use, which would otherwise be a surprise of several
+  minutes in the middle of a graph. The installer builds them once, up front, with
+  the toolchain found for it: the newest installed CUDA toolkit (``CUDA_HOME``
+  overrides; ``/usr/bin/nvcc`` is often a distro CUDA too old for the GPU) and, on
+  Windows, the Visual Studio C++ tools, located with ``vswhere``. No special shell is
+  needed. A failed or skipped (``--skip-kernels``) build is not fatal: Train 4DGS
+  finds the same toolchain and builds them on its first run instead.
 
 Examples
 --------
@@ -60,7 +64,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from cumuli_bridge import viewer_assets  # noqa: E402 - needs PACKAGE_ROOT on the path; plain Python, no ComfyUI
+from cumuli_bridge import buildenv, viewer_assets  # noqa: E402 - need PACKAGE_ROOT on the path; plain Python, no ComfyUI
 
 LOGGER = logging.getLogger("cumuli-install")
 
@@ -426,6 +430,29 @@ def fetch_viewer_assets(*, dry_run: bool = False) -> None:
     LOGGER.info("  fetched  %-46s %s", "rerun web viewer files", directory)
 
 
+def prebuild_kernels(*, dry_run: bool) -> bool:
+    """Compile gsplat's CUDA kernels now, so the first Train 4DGS does not.
+
+    Returns whether it built. Failure is reported, not raised: the kernels are cached
+    where the trainer will look for them, and if they are missing then Train 4DGS builds
+    them itself with the same toolchain, so the install is still usable.
+    """
+
+    LOGGER.info("  building gsplat's CUDA kernels (a few minutes the first time; cached afterwards)")
+    env = buildenv.toolchain_env()
+    if "CUDA_HOME" in env:
+        LOGGER.info("    CUDA_HOME=%s", env["CUDA_HOME"])
+    try:
+        _run([sys.executable, "-c", buildenv.BUILD_SNIPPET], env=env, dry_run=dry_run)
+    except InstallError as exc:
+        LOGGER.warning("  the kernel build failed: %s", exc)
+        LOGGER.warning("  Everything else is installed. Train 4DGS will try again on its first run, with the same toolchain;")
+        LOGGER.warning("  if it fails there too, it needs a CUDA toolkit that knows your GPU%s.",
+                       " and Visual Studio's C++ build tools" if platform.system() == "Windows" else "")
+        return False
+    return True
+
+
 def install_hloc(hloc_dir: Path, *, force: bool, dry_run: bool) -> None:
     """Clone (with submodules), pin the commit, install editable."""
 
@@ -537,6 +564,8 @@ def main() -> int:
     parser.add_argument("--comfyui-root", type=Path, default=None,
                         help="ComfyUI checkout; lets the installer check whether the SAM 3D Body "
                              "weights are already in its models/detection folder")
+    parser.add_argument("--skip-kernels", action="store_true",
+                        help="Do not build gsplat's CUDA kernels now. Train 4DGS builds them on its first run instead.")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Do not clone the checkouts; use whatever the config already points at.")
     parser.add_argument("--with-turbo", action="store_true",
@@ -609,6 +638,8 @@ def main() -> int:
             install_requirements(group, force=args.force, dry_run=args.dry_run)
             if name == "sfm":
                 install_hloc(hloc_dir, force=args.force, dry_run=args.dry_run)
+            if name == "trainer" and not args.skip_kernels:
+                prebuild_kernels(dry_run=args.dry_run)
             if name == "viewer":
                 fetch_viewer_assets(dry_run=args.dry_run)
             LOGGER.info("")

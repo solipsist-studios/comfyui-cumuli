@@ -169,11 +169,12 @@ pip install --no-deps h5py narwhals plotly pycolmap==4.0.4 \
 git clone --recurse-submodules https://github.com/cvg/Hierarchical-Localization.git \
     -b master <somewhere> && git -C <somewhere> checkout c13273bd0ecc2917a35910fd843712a1c6243193
 pip install --no-deps -e <somewhere>
-# the trainer: gsplat compiles its CUDA kernels on first use, so it needs an nvcc
-# that knows your GPU (see below). --no-deps again, for the same reason as above.
+# the trainer. --no-deps again, for the same reason as above.
 pip install --no-deps gsplat==1.5.3 lpips \
     "cumuli-core @ git+https://github.com/solipsist-studios/cumuli-core.git@v0.1.0" \
     "cumuli-trainer @ git+https://github.com/solipsist-studios/cumuli-trainer.git@v0.1.0"
+# gsplat compiles its CUDA kernels on first use; do it now rather than mid-graph
+python -c "from gsplat.cuda._backend import _C"
 ```
 
 `hloc` **must** be an editable install: its SuperPoint extractor reaches up to
@@ -183,12 +184,20 @@ weights live in the `SuperGluePretrainedNetwork` submodule, which a plain
 `pip install git+URL` never fetches. `aliked` (BSD) needs neither and is the
 node's default; `superpoint`'s weights are non-commercial research use only.
 
-gsplat builds its CUDA kernels the first time the trainer runs, which takes a few
-minutes and is cached after that. The build needs an `nvcc` that knows your GPU:
-`/usr/bin/nvcc` is often a stale distro CUDA that cannot target Blackwell. Train 4DGS
-points the build at the newest `/usr/local/cuda-*` that has one, and `CUDA_HOME`
-overrides that. The kernels are ABI-bound to the torch version, so `--force` the
-trainer group after a torch upgrade.
+**The CUDA kernels are built at install time.** gsplat compiles them from source, which takes a few
+minutes and is cached afterwards, so the installer does it once, up front, instead of in the middle
+of your first graph. It finds the tools itself and needs no special shell:
+
+- **CUDA:** the newest installed toolkit (`/usr/local/cuda-*`, or
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*`), because `/usr/bin/nvcc` is often a stale
+  distro CUDA that cannot target Blackwell. `CUDA_HOME` overrides the choice.
+- **Windows C++:** the compiler comes from *Build Tools for Visual Studio* (the "Desktop development
+  with C++" workload). The installer locates it with `vswhere` and loads its environment for the
+  build, so you do not need a Developer Command Prompt; the Build Tools just have to be installed.
+
+If the build fails, or you pass `--skip-kernels`, the install still completes and Train 4DGS builds
+the kernels on its first run, finding the same tools. The kernels are tied to the torch version, so
+re-run the installer with `--force` after a torch upgrade.
 
 ## Configuration
 

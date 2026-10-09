@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import buildenv
 from .process import CommandResult, SubprocessCancelled, run_streaming
 from .settings import BridgeSettings, SettingsError
 from .vram import free_bytes, require_free_vram
@@ -285,36 +286,13 @@ def build_train_argv(settings: BridgeSettings, options: TrainOptions, config: Pa
     return list(settings.launcher()) + ["-m", "cumuli_trainer", "--config", str(config)]
 
 
-def cuda_toolchain_env(base: Path = Path("/usr/local"), environ: dict | None = None) -> dict[str, str]:
-    """CUDA_HOME/PATH for torch's JIT extension builds.
-
-    gsplat compiles its CUDA kernels on first use. torch falls back to
-    ``which nvcc`` when CUDA_HOME is unset, and on many distros that is a
-    stale apt CUDA that cannot target current GPUs. Prefer an explicit
-    CUDA_HOME; otherwise pick the newest ``<base>/cuda-*`` that has nvcc.
-    """
-
-    environ = os.environ if environ is None else environ
-    if environ.get("CUDA_HOME"):
-        return {}
-
-    def version_key(path: Path) -> list[int]:
-        return [int(part) for part in re.findall(r"\d+", path.name)]
-
-    for candidate in sorted(base.glob("cuda-*"), key=version_key, reverse=True):
-        if (candidate / "bin" / "nvcc").is_file():
-            return {
-                "CUDA_HOME": str(candidate),
-                "PATH": f"{candidate / 'bin'}:{environ.get('PATH', '')}",
-            }
-    return {}
-
-
 def build_train_env(settings: BridgeSettings, options: TrainOptions) -> dict[str, str]:
     env = os.environ.copy()
     for name in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(name, None)
-    env.update(cuda_toolchain_env())
+    # gsplat builds its CUDA kernels on first use; the installer normally has already, and this
+    # makes a skipped or stale build work too, with no particular shell required.
+    env.update(buildenv.toolchain_env(env))
     return env
 
 

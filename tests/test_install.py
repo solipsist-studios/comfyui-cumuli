@@ -220,6 +220,42 @@ def test_the_trainer_group_changes_only_what_is_absent_or_the_wrong_gsplat(monke
     assert not any("cumuli-core" in arg for arg in calls[0])  # present: left alone, e.g. an editable install
 
 
+def test_the_kernel_build_runs_the_backend_import_with_the_discovered_toolchain(monkeypatch):
+    calls = []
+    monkeypatch.setattr(install, "_run", lambda argv, **kwargs: calls.append((list(argv), kwargs)))
+    monkeypatch.setattr(install.buildenv, "toolchain_env", lambda: {"CUDA_HOME": "/usr/local/cuda-13.2", "PATH": "x"})
+    assert install.prebuild_kernels(dry_run=False) is True
+    ((argv, kwargs),) = calls
+    assert argv == [sys.executable, "-c", "from gsplat.cuda._backend import _C"]
+    assert kwargs["env"]["CUDA_HOME"] == "/usr/local/cuda-13.2" and kwargs["dry_run"] is False
+
+
+def test_a_failed_kernel_build_warns_and_does_not_fail_the_install(monkeypatch, caplog):
+    def broken(argv, **kwargs):
+        raise install.InstallError("Command failed with status 1")
+
+    monkeypatch.setattr(install, "_run", broken)
+    monkeypatch.setattr(install.buildenv, "toolchain_env", lambda: {})
+    with caplog.at_level("WARNING", logger="cumuli-install"):
+        assert install.prebuild_kernels(dry_run=False) is False
+    assert "Train 4DGS will try again on its first run" in caplog.text
+
+
+def test_skip_kernels_leaves_the_build_to_the_first_run(monkeypatch):
+    built = []
+    monkeypatch.setattr(install, "prebuild_kernels", lambda **kw: built.append(kw))
+    monkeypatch.setattr(install, "install_requirements", lambda *a, **k: None)
+    monkeypatch.setattr(install, "check_interpreter", lambda: None)
+    monkeypatch.setattr(install, "snapshot_pinned", lambda: {})
+    monkeypatch.setattr(install, "verify", lambda *a, **k: [])
+    monkeypatch.setattr(install, "missing_manual_assets", lambda paths: [])
+    base = ["install.py", "--groups", "trainer", "--no-fetch", "--no-models", "--dry-run"]
+    monkeypatch.setattr(sys, "argv", base + ["--skip-kernels"])
+    assert install.main() == 0 and built == []
+    monkeypatch.setattr(sys, "argv", base)
+    assert install.main() == 0 and built == [{"dry_run": True}]
+
+
 def test_cumuli_is_pinned_to_the_release_tag_and_omg4_is_not_fetched():
     assert set(install.CHECKOUTS) == {"fdanyone_root", "cumuli_root"}
     assert install.CHECKOUTS["cumuli_root"][2] == install.TRAINER_TAG

@@ -1619,28 +1619,6 @@ def test_roots_accept_lists_and_comma_strings():
     assert _roots(None) == ()
 
 
-# --- CUDA toolchain selection ------------------------------------------------------
-
-def test_toolchain_prefers_newest_cuda(tmp_path):
-    from cumuli_bridge.train import cuda_toolchain_env
-    for version in ("cuda-12.0", "cuda-13.2"):
-        (tmp_path / version / "bin").mkdir(parents=True)
-        (tmp_path / version / "bin" / "nvcc").write_text("")
-    env = cuda_toolchain_env(base=tmp_path, environ={"PATH": "/usr/bin"})
-    assert env["CUDA_HOME"].endswith("cuda-13.2")
-    assert env["PATH"].startswith(str(tmp_path / "cuda-13.2" / "bin"))
-
-
-def test_toolchain_respects_existing_cuda_home(tmp_path):
-    from cumuli_bridge.train import cuda_toolchain_env
-    assert cuda_toolchain_env(base=tmp_path, environ={"CUDA_HOME": "/opt/cuda"}) == {}
-
-
-def test_toolchain_empty_when_nothing_found(tmp_path):
-    from cumuli_bridge.train import cuda_toolchain_env
-    assert cuda_toolchain_env(base=tmp_path, environ={}) == {}
-
-
 def test_discover_rings_finds_published_results(settings, tmp_path):
     """A ring is a directory with cameras.json and videos/ -- nothing else counts."""
 
