@@ -56,10 +56,11 @@ SOFTWARE.
 | BiRefNet | Foreground masks | MIT (**read**) | Yes |
 | HLOC, LightGlue, ALIKED, pycolmap/COLMAP | Real-capture rig solve | Apache-2.0, Apache-2.0, BSD-3, BSD-3 (**read**) | Yes |
 | SuperPoint (weights and code) | Optional `feature_type` | Magic Leap: academic / non-profit non-commercial research only (**read**) | **No.** Not the default. |
-| OMG4 (`solipsist-studios/OMG4`, fork of MinShirley/OMG4) | 4DGS trainer | **No licence file** in either repository (**read**); several source files carry Inria's non-commercial header | **No / not cleared** |
-| `diff-gaussian-rasterization`, `simple-knn` (Inria) | Trainer CUDA extensions | Inria/MPII non-commercial research licence (**read**) | **No** |
-| `pointops2` | Trainer CUDA op | No licence or header in the local copy; likely MIT upstream | **Unverified** |
+| cumuli-trainer, cumuli-core (Solipsist Studios) | 4DGS trainer and the format library it shares with the bake | PolyForm-Noncommercial-1.0.0, the same as this pack (**read**: each repository's `LICENSE.md`); a commercial licence is available separately. Each repository's `PROVENANCE.md` records what it was written from. | Under that commercial licence |
+| gsplat (nerfstudio-project) | The trainer's rasterizer, installed unmodified; its CUDA kernels are compiled on first use | Apache-2.0 (**read**: the installed distribution's `LICENSE`) | Yes |
+| lpips | The trainer's perceptual metric | BSD-style: copyright notice and "all rights reserved" terms (**read**: the installed distribution's `LICENSE`) | Yes, keeping the notice |
 | GVHMR, SMPL-X, ultralytics | Former pose path (removed) | Research-only; non-commercial; AGPL-3.0 | Not used by this pack any more |
+| OMG4, `diff-gaussian-rasterization`, `simple-knn`, `pointops2` | Former 4DGS trainer and its CUDA extensions (removed) | No licence file (OMG4); Inria/MPII non-commercial research licence (the rasterizer and `simple-knn`) | Not used by this pack any more |
 | Rerun web viewer (`@rerun-io/web-viewer` 0.37.1) and `rerun-sdk` | Optional ring viewer node: the viewer's JS/WASM is fetched at install time, not shipped here | MIT, with Apache-2.0 also listed (**read**: the package's `package.json` and registry metadata) | Yes. The viewer's own requests to fonts, GitHub and telemetry are blocked by the page's Content-Security-Policy, not by a viewer setting. |
 | ComfyUI | Host process | GPL-3.0 (**read**) | The pack imports `comfy.*`; how that sits with a non-GPL licence is **unverified**, ask counsel |
 
@@ -86,8 +87,10 @@ judgement, not something this file can settle.
 
 ## Open items before commercial use
 
-1. **The 4DGS training stage (OMG4 with Inria's rasterizer)** is not cleared. Options are commercial
-   terms from the rights holders, or a trainer built on a permissive rasterizer.
+1. **The 4DGS training stage** no longer depends on OMG4 or Inria's code: it runs the cumuli trainer on
+   gsplat (Apache-2.0). The trainer is Solipsist Studios' own code under the same licence as this pack,
+   so commercial use of it is through the commercial licence. Patents on 3D Gaussian splatting were not
+   checked and need counsel.
 2. Read Meta's SAM License as shipped with the weights you actually download.
 3. Counsel's view on Sapiens2's use restrictions, and on ComfyUI's GPL-3.0 with this pack.
 4. Provenance of the 4DAnyone checkpoint's training data (its SMPL-X-to-MHR70 regressor was trained on

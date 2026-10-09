@@ -5,7 +5,7 @@
 The only ComfyUI-aware module in the pack. Every node is registered in the
 ``Cumuli`` category with a ``Cumuli*`` id, and user-facing errors carry a
 ``Cumuli:`` prefix -- 4DAnyone names only the external checkout the ring
-generator drives, one of three (with the OMG4 trainer and cumuli's
+generator drives, one of three (with the cumuli trainer and cumuli's
 ``bake_sogst.py``).
 
 Everything here runs inside ``comfyenv``. Ring generation and training shell
@@ -46,13 +46,12 @@ from .sogst import SogstError, frame_count, frame_time, load_interchange_ply, to
 from .train import (
     CONFIG_NAME,
     BakeOptions,
-    TRAINERS,
     MergeOptions,
     TrainOptions,
     TrainingError,
     WindowTrainSpec,
     bake,
-    check_cumuli_trainer,
+    check_trainer,
     merge_windows,
     train,
     train_windows,
@@ -1342,7 +1341,7 @@ class CumuliBuildDataset(IO.ComfyNode):
             description=(
                 "Carves a time-stamped visual-hull init cloud, bakes RGBA frames with the mattes in "
                 "alpha, and writes transforms_train.json / transforms_test.json with per-camera "
-                "intrinsics. The result trains directly in a rotor 4DGS trainer."
+                "intrinsics. The result trains directly in the 4DGS trainer."
             ),
             inputs=[
                 FlipbookIO.Input("flipbook"),
@@ -1368,7 +1367,7 @@ class CumuliBuildDataset(IO.ComfyNode):
                                tooltip="Pick the colour of wherever the .sogst will be embedded. Held-out "
                                        "eval frames composite onto it, and Train 4DGS's background (which "
                                        "reads it back from here automatically) optimises against it too. "
-                                       "OMG4 itself only supports pure black or white, so this snaps to "
+                                       "The trainer only supports pure black or white, so this snaps to "
                                        "whichever is closer by luminance -- the picker is for matching your "
                                        "destination by eye, not for a literal colour reaching the trainer."),
                 IO.Boolean.Input("validate", default=True,
@@ -1614,12 +1613,11 @@ class CumuliLoadDataset(IO.ComfyNode):
 
 
 class CumuliTrain4DGS(IO.ComfyNode):
-    """Train a rotor 4D Gaussian Splatting model on the generated ring.
+    """Train a 4D Gaussian Splatting model on the generated ring.
 
-    This is a long node on purpose: 30k iterations is roughly an hour on a
-    5090. It reports the trainer's own iteration count and PSNR to the progress
-    bar, and it keeps the upstream resume rule -- a finished checkpoint for the
-    requested iteration count is reused instead of retrained.
+    This is a long node on purpose: tens of minutes for the default 30000
+    iterations. It reports the trainer's own iteration count and PSNR to the
+    progress bar, and it re-runs only when its inputs change.
     """
 
     @classmethod
@@ -1629,9 +1627,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
             display_name="Cumuli Train 4DGS",
             category=CATEGORY,
             description=(
-                "Trains the rotor 4DGS model on a dataset built from the ring. Runs as a child "
-                "process of ComfyUI's own interpreter and needs the whole GPU, so ComfyUI's models "
-                "are unloaded first. Expect roughly an hour for the default 30000 iterations."
+                "Trains a 4D Gaussian splat (the cumuli trainer) on a dataset built from the ring. "
+                "Runs as a child process of ComfyUI's own interpreter and needs the whole GPU, so "
+                "ComfyUI's models are unloaded first. Expect tens of minutes for the default 30000 "
+                "iterations."
             ),
             is_experimental=True,
             inputs=[
@@ -1646,34 +1645,38 @@ class CumuliTrain4DGS(IO.ComfyNode):
                                 tooltip="Run directory for the config and checkpoints. "
                                         "Empty uses the dataset's parent.", optional=True),
                 IO.Int.Input("iterations", default=30000, min=100, max=200000, step=100),
-                IO.Int.Input("num_pts", default=100000, min=1000, max=2000000, step=1000),
-                IO.Int.Input("batch_size", default=2, min=1, max=16, step=1),
+                IO.Int.Input("num_pts", default=0, min=0, max=2000000, step=1000,
+                             tooltip="Start from this many randomly chosen points of the dataset's "
+                                     "points3d.ply. 0 starts from all of them."),
+                IO.Int.Input("batch_size", default=2, min=1, max=16, step=1,
+                             tooltip="Cameras rendered per step, all at one instant."),
                 IO.Combo.Input("sh_degree", options=["3", "2", "1", "0"], default="2",
                                tooltip="Spherical-harmonic degree. 2 measured better than 3 on "
                                        "subject captures (30.87 vs 30.04 dB). 0 is view-independent "
                                        "colour only, and bakes to a much smaller .sogst."),
                 IO.Int.Input("densify_until_iter", default=25000, min=100, max=200000, step=100,
+                             tooltip="The step after which Gaussians are no longer relocated or added.",
                              advanced=True),
-                IO.Int.Input("densify_until_num_points", default=3000000, min=10000, max=20000000,
-                             step=10000, advanced=True),
+                IO.Int.Input("densify_until_num_points", default=300000, min=10000, max=20000000,
+                             step=10000,
+                             tooltip="The most Gaussians the trainer grows to. 300000 is the trainer's "
+                                     "own cap; a cap ten times higher measured worse.",
+                             advanced=True),
                 IO.Int.Input("t_init_div", default=100, min=0, max=1000, step=1,
                              tooltip="Initial temporal sigma is sqrt(duration/div). 0 keeps the "
-                                     "trainer's own default of 5, which smears short clips.",
+                                     "trainer's own default (100).",
                              advanced=True),
                 IO.Combo.Input("background", options=["auto", "black", "white"], default="auto",
-                               tooltip="Photometric background OMG4 optimises against. 'auto' reads back "
-                                       "whatever Build 4DGS Dataset composited its held-out eval GT onto, "
-                                       "so this never has to be set twice; override only for a Load 4DGS "
-                                       "Dataset input with no provenance, or a deliberate mismatch test. "
-                                       "Binary only -- OMG4's own background is [1,1,1] or [0,0,0] and "
-                                       "nothing else."),
+                               tooltip="Photometric background the trainer optimises against. 'auto' reads "
+                                       "back whatever Build 4DGS Dataset composited its held-out eval GT "
+                                       "onto, so this never has to be set twice; override only for a Load "
+                                       "4DGS Dataset input with no provenance, or a deliberate mismatch "
+                                       "test. Black or white only."),
                 IO.Float.Input("lambda_opa_mask", default=0.005, min=0.0, max=0.1, step=0.001,
                                tooltip="Charges rendered opacity wherever the silhouette says background, "
                                        "regardless of colour, so it prunes floaters of any shade -- unlike "
                                        "background matching, which only changes what colour they are. "
-                                       "Measured +2.91 dB held-out PSNR and floater coverage down from "
-                                       "39.9% to near zero. 0 disables (pre-existing behaviour); 0.005 is "
-                                       "the measured production value."),
+                                       "0 disables; 0.005 is the measured production value."),
                 IO.Int.Input("max_window_frames", default=31, min=8, max=100000, step=1,
                              tooltip="Clips longer than this train as several short, independently "
                                      "trained windows stitched together instead of one wide fit -- "
@@ -1694,15 +1697,10 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 IO.Boolean.Input("dry_run", default=False,
                                  tooltip="Write the config and report the command without training.",
                                  advanced=True),
-                IO.Combo.Input("trainer", options=list(TRAINERS), default="omg4",
-                               tooltip="omg4 is the rotor 4DGS trainer. cumuli is the cumuli-trainer "
-                                       "package. With cumuli, num_pts, batch_size, densify_until_*, "
-                                       "background and lambda_opa_mask are ignored (the trainer's own "
-                                       "defaults apply); iterations, sh_degree, t_init_div and the "
-                                       "duration and fps still are used."),
                 IO.Float.Input("export_min_contribution", default=2.0, min=0.0, max=100.0, step=0.5,
-                               tooltip="cumuli trainer only: drop Gaussians whose largest contribution "
-                                       "to any training view is below this many pixels. 0 keeps them all.",
+                               tooltip="Drop Gaussians whose largest contribution to any training view "
+                                       "is below this many pixels: hidden ones get no colour correction and "
+                                       "glint from new viewpoints. 0 keeps them all.",
                                advanced=True),
             ],
             outputs=[
@@ -1720,11 +1718,11 @@ class CumuliTrain4DGS(IO.ComfyNode):
         fps=0.0,
         out_dir="",
         iterations=30000,
-        num_pts=100000,
+        num_pts=0,
         batch_size=2,
         sh_degree="2",
         densify_until_iter=25000,
-        densify_until_num_points=3000000,
+        densify_until_num_points=300000,
         t_init_div=100,
         background="auto",
         lambda_opa_mask=0.005,
@@ -1732,7 +1730,6 @@ class CumuliTrain4DGS(IO.ComfyNode):
         max_parallel_windows=1,
         min_free_vram_gb=0.0,
         dry_run=False,
-        trainer="omg4",
         export_min_contribution=2.0,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
@@ -1754,10 +1751,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
 
         try:
             settings = load_settings()
-            if trainer == "cumuli":
-                check_cumuli_trainer(settings)
-            else:
-                settings.validate_trainer()
+            check_trainer(settings)
         except (SettingsError, TrainingError) as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
 
@@ -1782,10 +1776,9 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 sh_degree=int(sh_degree),
                 white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
-                trainer=trainer,
                 export_min_contribution=float(export_min_contribution),
             )
-            train_fingerprint = runner.compute_fingerprint(runner.train_fingerprint_fields({
+            train_fingerprint = runner.compute_fingerprint({
                 "dataset": handle.fingerprint
                 if handle.fingerprint
                 else runner.file_identity(dataset / "transforms_train.json"),
@@ -1796,23 +1789,16 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 "densify_until_num_points": int(densify_until_num_points),
                 "t_init_div": int(t_init_div), "white_background": white_bg,
                 "lambda_opa_mask": float(lambda_opa_mask),
-            }, trainer, float(export_min_contribution)))
-            if trainer == "cumuli":
-                settings_line = (
-                    f"trainer: cumuli  iterations: {options.iterations}  sh_degree: {options.sh_degree}  "
-                    f"t_init_div: {options.t_init_div}  export_min_contribution: {options.export_min_contribution:g}"
-                )
-            else:
-                settings_line = (
-                    f"iterations: {options.iterations}  num_pts: {options.num_pts}  "
-                    f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}  "
-                    f"background: {resolved_background}  lambda_opa_mask: {options.lambda_opa_mask}"
-                )
+                "export_min_contribution": float(export_min_contribution),
+            })
             header = [
                 f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {rate:.3f} fps)",
                 f"model_dir: {options.model_dir}",
-                settings_line,
-                f"checkpoint: {options.checkpoint}",
+                f"iterations: {options.iterations}  num_pts: {options.num_pts or 'all'}  "
+                f"batch_size: {options.batch_size}  sh_degree: {options.sh_degree}  "
+                f"background: {resolved_background}  lambda_opa_mask: {options.lambda_opa_mask}  "
+                f"export_min_contribution: {options.export_min_contribution:g}",
+                f"output: {options.checkpoint}",
             ]
 
             if dry_run:
@@ -1885,9 +1871,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
             f"dataset: {dataset} ({frames} timestamps, {duration:.3f}s @ {dataset_fps:.3f} fps)",
             f"windowed: {len(windows)} windows of "
             f"{[w.frame_count for w in windows]} frames (max_window_frames={int(max_window_frames)})",
-            (f"trainer: cumuli  export_min_contribution: {float(export_min_contribution):g}"
-             if trainer == "cumuli"
-             else f"background: {resolved_background}  lambda_opa_mask: {float(lambda_opa_mask)}"),
+            f"background: {resolved_background}  lambda_opa_mask: {float(lambda_opa_mask)}  "
+            f"export_min_contribution: {float(export_min_contribution):g}",
         ]
 
         if dry_run:
@@ -1901,7 +1886,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 densify_until_num_points=int(densify_until_num_points),
                 t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
-                trainer=trainer, export_min_contribution=float(export_min_contribution),
+                export_min_contribution=float(export_min_contribution),
             )
             try:
                 from .train import build_train_argv, write_config
@@ -1936,9 +1921,9 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 densify_until_num_points=int(densify_until_num_points),
                 t_init_div=int(t_init_div), sh_degree=int(sh_degree), white_background=white_bg,
                 lambda_opa_mask=float(lambda_opa_mask),
-                trainer=trainer, export_min_contribution=float(export_min_contribution),
+                export_min_contribution=float(export_min_contribution),
             )
-            window_fingerprint = runner.compute_fingerprint(runner.train_fingerprint_fields({
+            window_fingerprint = runner.compute_fingerprint({
                 "dataset": dataset_identity,
                 "window_index": window.index, "frame_start": window.frame_start,
                 "frame_count": window.frame_count, "dataset_fps": dataset_fps,
@@ -1948,7 +1933,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 "densify_until_num_points": int(densify_until_num_points),
                 "t_init_div": int(t_init_div), "white_background": white_bg,
                 "lambda_opa_mask": float(lambda_opa_mask),
-            }, trainer, float(export_min_contribution)))
+                "export_min_contribution": float(export_min_contribution),
+            })
             try:
                 decision = runner.prepare_artifact_dir(window_options.model_dir, window_fingerprint)
             except runner.ValidationError as exc:
@@ -2131,10 +2117,12 @@ class CumuliBakeSogst(IO.ComfyNode):
                 IO.Float.Input("sh_clamp", default=3.0, min=0.0, max=10.0, step=0.1,
                                tooltip="Attenuate higher SH bands above this bare DC. 1.5 is the "
                                        "upstream default and is too aggressive for explicit-SH "
-                                       "checkpoints. OMG4 models only.", advanced=True),
+                                       "checkpoints. No longer used: kept so saved workflows load.",
+                               advanced=True),
                 IO.Boolean.Input("filter_corrupted", default=False,
                                  tooltip="Upstream's bad-colour filters. Calibrated for the legacy "
-                                         "SVQ path; they delete healthy splats here. OMG4 models only.",
+                                         "SVQ path; they delete healthy splats here. No longer used: "
+                                         "kept so saved workflows load.",
                                  advanced=True),
                 IO.Int.Input("shn_count", default=65536, min=256, max=262144, step=256, advanced=True),
                 IO.Float.Input("segment_duration", default=0.1, min=0.0, max=5.0, step=0.01,
@@ -2151,12 +2139,12 @@ class CumuliBakeSogst(IO.ComfyNode):
                                        "measured LPIPS-best; PSNR keeps improving out to 1.00s, which "
                                        "is a wide fade blurring across the seam."),
                 IO.Float.Input("smooth_px", default=0.5, min=0.0, max=4.0, step=0.1,
-                               tooltip="Models from the cumuli trainer only: blur every splat by this many "
+                               tooltip="Blur every splat by this many "
                                        "pixels at the training cameras, for a calmer, slightly softer "
                                        "bake. 0 off. Needs mask_filter on (it reads the training cameras "
                                        "from each window's dataset).", advanced=True),
                 IO.Int.Input("smooth_frames", default=2, min=0, max=30, step=1,
-                             tooltip="Models from the cumuli trainer only: widen every splat's lifetime "
+                             tooltip="Widen every splat's lifetime "
                                      "by this many frames, for gentler fade in and out. 0 off.",
                              advanced=True),
             ],
@@ -2217,11 +2205,7 @@ class CumuliBakeSogst(IO.ComfyNode):
             return BakeOptions(
                 checkpoint=window.checkpoint,
                 output=output,
-                duration_seconds=window.duration_seconds,
-                fps=selected.fps,
                 mask_filter_root=window.dataset_dir if mask_filter else None,
-                sh_clamp=float(sh_clamp),
-                filter_corrupted=bool(filter_corrupted),
                 shn_count=int(shn_count),
                 segment_duration=float(segment_duration),
                 emit_ply=ply,
@@ -2409,16 +2393,13 @@ def _record_model(root: Path, dataset: Path, fps: float, windows) -> TrainedMode
 
 
 def _snap_background_hex(value: str) -> str:
-    """The nearer of OMG4's only two backgrounds, by perceptual (Rec. 709)
-    luminance.
+    """The nearer of the trainer's two backgrounds, black and white, by
+    perceptual (Rec. 709) luminance.
 
     Build 4DGS Dataset's background input is a real colour picker, for
-    matching an embed destination by eye, but OMG4's own background is a
-    hard binary -- every place it appears in the trainer (train.py,
-    scene/__init__.py, dataset_readers.py, the renderer's bg_color) is
-    [1,1,1] or [0,0,0] and nothing else. This is where a picked colour
-    actually becomes one of the two values the trainer can be told to
-    optimise against.
+    matching an embed destination by eye, but the trainer's photometric
+    background is binary. This is where a picked colour actually becomes one
+    of the two values the trainer can be told to optimise against.
     """
 
     text = (value or "").strip().lstrip("#")

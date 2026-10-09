@@ -1615,15 +1615,6 @@
           "link": null
         },
         {
-          "localized_name": "trainer",
-          "name": "trainer",
-          "type": "COMBO",
-          "widget": {
-            "name": "trainer"
-          },
-          "link": null
-        },
-        {
           "localized_name": "export_min_contribution",
           "name": "export_min_contribution",
           "type": "FLOAT",
@@ -1673,11 +1664,11 @@
         0,
         0,
         30000,
-        100000,
+        0,
         2,
         "3",
         25000,
-        3000000,
+        300000,
         100,
         "auto",
         0.005,
@@ -1685,7 +1676,6 @@
         1,
         0,
         false,
-        "omg4",
         2.0,
         ""
       ],
@@ -1693,11 +1683,11 @@
         "duration_seconds": 0,
         "fps": 0,
         "iterations": 30000,
-        "num_pts": 100000,
+        "num_pts": 0,
         "batch_size": 2,
         "sh_degree": "3",
         "densify_until_iter": 25000,
-        "densify_until_num_points": 3000000,
+        "densify_until_num_points": 300000,
         "t_init_div": 100,
         "background": "auto",
         "lambda_opa_mask": 0.005,
@@ -1705,7 +1695,6 @@
         "max_parallel_windows": 1,
         "min_free_vram_gb": 0,
         "dry_run": false,
-        "trainer": "omg4",
         "export_min_contribution": 2.0,
         "out_dir": ""
       }

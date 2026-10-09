@@ -49,7 +49,7 @@ def origins(tmp_path, monkeypatch):
 
 def test_fetch_clones_every_checkout(origins):
     paths = install.fetch_checkouts(origins)
-    assert set(paths) == {"fdanyone_root", "trainer_root", "cumuli_root"}
+    assert set(paths) == {"fdanyone_root", "cumuli_root"}
     for path in paths.values():
         assert (path / ".git").is_dir()
 
@@ -65,12 +65,12 @@ def test_fetch_is_idempotent(origins):
 def test_fetch_refuses_to_clobber_a_foreign_directory(origins):
     """A non-git directory in the way is never deleted; the user is told."""
 
-    (origins / "OMG4").mkdir(parents=True)
-    (origins / "OMG4" / "important.txt").write_text("not ours")
+    (origins / "cumuli").mkdir(parents=True)
+    (origins / "cumuli" / "important.txt").write_text("not ours")
     with pytest.raises(install.InstallError) as exc:
         install.fetch_checkouts(origins)
     assert "--deps-dir" in str(exc.value)
-    assert (origins / "OMG4" / "important.txt").is_file()
+    assert (origins / "cumuli" / "important.txt").is_file()
 
 
 def test_revisions_report_what_was_fetched(origins):
@@ -124,7 +124,7 @@ def test_only_real_drift_fails_the_run(before, after, expected):
 def test_neither_smplx_nor_ultralytics_is_installed_or_guarded():
     """GVHMR's dependencies are gone; reintroducing them would bring back their licences."""
 
-    groups = install.build_groups("13")
+    groups = install.build_groups()
     requirements = [req for group in groups.values() for req, _dist in group.requirements]
     assert not any(req.startswith(("smplx", "ultralytics")) for req in requirements)
     assert "ultralytics" not in install.PINNED
@@ -196,6 +196,35 @@ def test_only_a_full_forty_character_hash_counts_as_a_commit_pin():
         assert not install._is_commit_hash(ref)
 
 
+def test_the_trainer_group_installs_gsplat_and_the_tagged_trainer_without_touching_torch():
+    group = install.build_groups()["trainer"]
+    requirements = dict(group.requirements)
+    assert requirements[f"gsplat=={install.GSPLAT_VERSION}"] == "gsplat"
+    for dist, repo in (("cumuli-core", "cumuli-core"), ("cumuli-trainer", "cumuli-trainer")):
+        (pin,) = [req for req, name in group.requirements if name == dist]
+        assert pin.endswith(f"solipsist-studios/{repo}.git@{install.TRAINER_TAG}")
+    assert group.no_deps and group.exact and not group.optional
+    # None of the old trainer's dependencies come back with it.
+    assert not any(req.startswith(("cupy", "cuml", "omegaconf")) for req, _dist in group.requirements)
+
+
+def test_the_trainer_group_changes_only_what_is_absent_or_the_wrong_gsplat(monkeypatch):
+    group = install.build_groups()["trainer"]
+    installed = {"gsplat": "1.5.3", "lpips": "0.1.4", "cumuli-core": "0.1.0", "cumuli-trainer": "0.1.0"}
+    calls = _pip_calls(monkeypatch, installed)
+    install.install_requirements(group, force=False, dry_run=False)
+    assert calls == []
+    calls = _pip_calls(monkeypatch, {**installed, "gsplat": "1.4.0"})
+    install.install_requirements(group, force=False, dry_run=False)
+    assert len(calls) == 1 and "--no-deps" in calls[0] and f"gsplat=={install.GSPLAT_VERSION}" in calls[0]
+    assert not any("cumuli-core" in arg for arg in calls[0])  # present: left alone, e.g. an editable install
+
+
+def test_cumuli_is_pinned_to_the_release_tag_and_omg4_is_not_fetched():
+    assert set(install.CHECKOUTS) == {"fdanyone_root", "cumuli_root"}
+    assert install.CHECKOUTS["cumuli_root"][2] == install.TRAINER_TAG
+
+
 def test_the_4danyone_pin_is_a_full_commit_hash():
     """The fork's SAM 3D Body branch is not tagged yet; a branch name would not stay pinned."""
 
@@ -214,17 +243,17 @@ def _pip_calls(monkeypatch, installed: dict[str, str]):
 def test_the_viewer_group_is_opt_in_and_pinned_to_the_bundled_viewer():
     from cumuli_bridge import viewer_assets
 
-    group = install.build_groups("13")["viewer"]
+    group = install.build_groups()["viewer"]
     assert group.optional and group.exact
     assert group.requirements == [(f"rerun-sdk=={viewer_assets.VIEWER_VERSION}", "rerun-sdk")]
-    assert not any(other.optional for name, other in install.build_groups("13").items() if name != "viewer")
+    assert not any(other.optional for name, other in install.build_groups().items() if name != "viewer")
 
 
 def test_a_mismatched_rerun_sdk_is_changed_with_a_warning(monkeypatch, caplog):
     from cumuli_bridge import viewer_assets
 
     calls = _pip_calls(monkeypatch, {"rerun-sdk": "0.38.1"})
-    group = install.build_groups("13")["viewer"]
+    group = install.build_groups()["viewer"]
     with caplog.at_level("WARNING", logger="cumuli-install"):
         install.install_requirements(group, force=False, dry_run=False)
     assert [call[-1] for call in calls] == [f"rerun-sdk=={viewer_assets.VIEWER_VERSION}"]
@@ -234,7 +263,7 @@ def test_a_mismatched_rerun_sdk_is_changed_with_a_warning(monkeypatch, caplog):
 def test_a_matching_or_absent_rerun_sdk_needs_no_change_or_just_an_install(monkeypatch, caplog):
     from cumuli_bridge import viewer_assets
 
-    group = install.build_groups("13")["viewer"]
+    group = install.build_groups()["viewer"]
     calls = _pip_calls(monkeypatch, {"rerun-sdk": viewer_assets.VIEWER_VERSION})
     install.install_requirements(group, force=False, dry_run=False)
     assert calls == []
@@ -245,7 +274,7 @@ def test_a_matching_or_absent_rerun_sdk_needs_no_change_or_just_an_install(monke
 
 
 def test_other_groups_keep_their_install_if_absent_behaviour(monkeypatch):
-    """The exact-version rule is the viewer's alone: a differently-versioned pin elsewhere stays put."""
+    """The exact-version rule is for the groups that ask for it (viewer, trainer): a differently-versioned pin elsewhere stays put."""
 
     group = install.Group(name="x", summary="x", requirements=[("pycolmap==4.0.4", "pycolmap")])
     calls = _pip_calls(monkeypatch, {"pycolmap": "4.0.5"})
@@ -258,7 +287,7 @@ def test_verify_reports_a_wrong_rerun_version_and_missing_viewer_files(monkeypat
 
     monkeypatch.setattr(install, "installed_version", lambda dist: "0.38.1" if dist == "rerun-sdk" else None)
     monkeypatch.setattr(viewer_assets, "assets_root", lambda: tmp_path / "none")
-    groups = install.build_groups("13")
+    groups = install.build_groups()
     missing = install.verify(groups, ["viewer"])
     assert any("rerun-sdk (installed 0.38.1" in item for item in missing)
     assert "rerun web viewer files" in missing

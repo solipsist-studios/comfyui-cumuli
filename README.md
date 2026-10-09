@@ -15,7 +15,7 @@ Load Video ──VIDEO──┐        Model Loader ─▶ LoRA loaders (stock) 
       └─ Stage Ring         transpose to one directory per frame
           └─ Ring Masks         BiRefNet mattes, via ComfyUI's own model
               └─ Build 4DGS Dataset   visual-hull init cloud + RGBA training frames
-                  └─ Train 4DGS           rotor 4D gaussian splatting  (~1 h)   ◀─DATASET── Load 4DGS Dataset
+                  └─ Train 4DGS           4D gaussian splatting  (cumuli trainer)   ◀─DATASET── Load 4DGS Dataset
                       └─ Bake SOGST           splat_4d.sogst, in the output gallery
                           └─ Preview SOGST        → SPLAT → stock Render Splat
 ```
@@ -28,10 +28,11 @@ new enough to target it.
 1. **Extract the zip** into `<ComfyUI>/custom_nodes/`, so you have
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
-   or `./install.sh` on Linux. It clones the three checkouts it drives at
+   or `./install.sh` on Linux. It clones the two checkouts it drives at
    pinned versions (4DAnyone at a pinned commit of our fork's SAM 3D Body
-   branch, OMG4 `v0.0.2`, cumuli `v0.0.2`), installs the Python dependencies
-   into ComfyUI's own environment, downloads the model weights, and writes
+   branch, cumuli `v0.1.0`), installs the Python dependencies (the trainer's
+   gsplat and cumuli packages included) into ComfyUI's own environment,
+   downloads the model weights, and writes
    `config.json` pointing at all of it. Expect it to take a while and around
    30 GB. The non-commercial Turbo LoRA is *not* downloaded unless you pass
    `--with-turbo` (see [Commercial use](#commercial-use)).
@@ -60,7 +61,7 @@ from one 121-frame clip:
 |---|---|---|
 | Generate Ring | ~23 min | 29.5 GiB reserved |
 | Stage + Masks + Dataset | a few minutes | modest |
-| Train 4DGS | ~1 h (30000 iterations) | whole card |
+| Train 4DGS | tens of minutes (30000 iterations; see [The trainer](#the-trainer)) | whole card |
 | Bake SOGST | ~1 min | — |
 
 `enable_turbo` is **off by default**. Turbo does the ring in 4 denoising steps,
@@ -93,8 +94,9 @@ document what each stage does and why.
 
 The code in this repository is PolyForm-Noncommercial; a commercial licence is
 available separately. Whether a *pipeline* can be used commercially also depends on
-the third-party models it runs, and as of this writing that holds only up to the
-trainer:
+the third-party models it runs. The code of every stage below is this pack's or the
+cumuli packages' (a commercial licence covers them) or carries a licence that allows
+commercial use, subject to the conditions in the table:
 
 | stage | status |
 |---|---|
@@ -102,7 +104,7 @@ trainer:
 | Ring generation | 4DAnyone and the Wan2.2 base model are Apache-2.0. **`enable_turbo` is off by default**: the Turbo adapter is CC BY-NC-SA 4.0. Leave it off for commercial use. |
 | Masks (BiRefNet) | MIT. |
 | Real-capture rig solve | `feature_type` defaults to `aliked` (BSD). `superpoint`'s weights are non-commercial research use only. |
-| **4DGS training (OMG4)** | **Not cleared.** The trainer builds Inria's `diff-gaussian-rasterization` and `simple-knn`, which carry a non-commercial research licence, and OMG4 itself has no licence file. Until that is resolved with the rights holders or replaced, this stage is non-commercial. |
+| 4DGS training (cumuli trainer) | Solipsist Studios' own code, under the same PolyForm-Noncommercial licence as this pack, so commercial use is through the commercial licence. It renders with gsplat (Apache-2.0), installed unmodified. The earlier OMG4 trainer, and with it Inria's non-commercial rasterizer, is no longer used. Patents were not checked. |
 
 See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md). This is a summary
 of licence texts, not legal advice.
@@ -131,8 +133,8 @@ that should come from a page embedded in a workflow.
 ## Requirements
 
 - A 4DAnyone checkout with its models (`~/Dev/github/4DAnyone` by default).
-- An OMG4 rotor-4DGS checkout for training, and cumuli's `scripts/bake_sogst.py`
-  for the bake (`~/Dev/github/cumuli/deps/OMG4` by default).
+- A cumuli checkout (`~/Dev/github/cumuli` by default), whose `scripts/bake_sogst.py` does the
+  bake. The trainer itself is the `cumuli-trainer` package, installed into ComfyUI's environment.
 - A background-removal model in `models/background_removal/`
   (`birefnet.safetensors` ships with ComfyUI).
 - About 32 GB of VRAM for a 24-view ring.
@@ -143,11 +145,10 @@ needs the packages below, all additive — no downgrade of torch, numpy,
 transformers or timm.
 
 **`install.sh` / `install.bat` do all of it** — see [Quickstart](#quickstart).
-It is idempotent (already-installed packages are skipped), auto-detects the CUDA
-toolkit and GPU arch for the extension builds, and records the four pinned
+It is idempotent (already-installed packages are skipped), and records the four pinned
 packages before and after: if pip moves one, the run fails loudly instead of
-leaving a broken ComfyUI to discover an hour later. `--force` reinstalls and
-rebuilds, which is what you want after a torch upgrade. The interpreter is the
+leaving a broken ComfyUI to discover an hour later. `--force` reinstalls, which
+is what you want after a torch upgrade. The interpreter is the
 one thing it cannot guess reliably: it prefers `--python`, then
 `$COMFYUI_PYTHON`, then an activated venv/conda env, and refuses outright if the
 interpreter it picked has no torch.
@@ -168,12 +169,11 @@ pip install --no-deps h5py narwhals plotly pycolmap==4.0.4 \
 git clone --recurse-submodules https://github.com/cvg/Hierarchical-Localization.git \
     -b master <somewhere> && git -C <somewhere> checkout c13273bd0ecc2917a35910fd843712a1c6243193
 pip install --no-deps -e <somewhere>
-# the trainer
-pip install cupy-cuda13x cuml-cu13 omegaconf imagesize
-CUDA_HOME=/usr/local/cuda-13.2 PATH=/usr/local/cuda-13.2/bin:$PATH \
-TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" \
-pip install <OMG4>/diff-gaussian-rasterization <OMG4>/simple-knn <OMG4>/pointops2 \
-            --no-build-isolation --no-deps
+# the trainer: gsplat compiles its CUDA kernels on first use, so it needs an nvcc
+# that knows your GPU (see below). --no-deps again, for the same reason as above.
+pip install --no-deps gsplat==1.5.3 lpips \
+    "cumuli-core @ git+https://github.com/solipsist-studios/cumuli-core.git@v0.1.0" \
+    "cumuli-trainer @ git+https://github.com/solipsist-studios/cumuli-trainer.git@v0.1.0"
 ```
 
 `hloc` **must** be an editable install: its SuperPoint extractor reaches up to
@@ -183,13 +183,12 @@ weights live in the `SuperGluePretrainedNetwork` submodule, which a plain
 `pip install git+URL` never fetches. `aliked` (BSD) needs neither and is the
 node's default; `superpoint`'s weights are non-commercial research use only.
 
-The last line pre-builds OMG4's CUDA extensions into this environment, so the
-trainer never JIT-compiles at run time. Three hard-won details: point
-`CUDA_HOME` at an nvcc that knows your GPU (`/usr/bin/nvcc` is often a stale
-distro CUDA that cannot target Blackwell); pass `--no-deps`, or pip will
-"helpfully" upgrade torch out from under ComfyUI while resolving the
-extensions' requirements; and the builds are ABI-bound to the torch version,
-so redo them if torch changes.
+gsplat builds its CUDA kernels the first time the trainer runs, which takes a few
+minutes and is cached after that. The build needs an `nvcc` that knows your GPU:
+`/usr/bin/nvcc` is often a stale distro CUDA that cannot target Blackwell. Train 4DGS
+points the build at the newest `/usr/local/cuda-*` that has one, and `CUDA_HOME`
+overrides that. The kernels are ABI-bound to the torch version, so `--force` the
+trainer group after a torch upgrade.
 
 ## Configuration
 
@@ -199,14 +198,12 @@ registered there and stored as `cumuli.*` keys in the per-user
 `comfy.settings.json`, exactly like other packs' settings. For headless or
 per-checkout overrides, `config.json` next to `config.example.json` (or a file
 named by `CUMULI_CONFIG`) beats the UI values, and environment variables
-(`CUMULI_FDANYONE_ROOT`, `CUMULI_TRAINER_ROOT`, `CUMULI_PIPELINE_ROOT`,
+(`CUMULI_FDANYONE_ROOT`, `CUMULI_PIPELINE_ROOT`,
 `CUMULI_WORK_ROOT`, ...) beat everything. All layers are re-read on every node
 run, so edits need no restart.
 
-The three checkout paths are **`fdanyone_root`** (ring generation),
-**`trainer_root`** (the OMG4 entry point) and **`cumuli_root`** (the scripts
-Bake SOGST and Solve Rig drive in place). They are independent: OMG4 does not
-have to be cumuli's submodule.
+The two checkout paths are **`fdanyone_root`** (ring generation) and
+**`cumuli_root`** (the scripts Bake SOGST and Solve Rig drive in place).
 
 Set **`dataset_roots`** / **`flipbook_roots`** / **`ring_roots`** / **`model_roots`** to the
 directories where your external captures live; the loader nodes scan them (plus
@@ -232,7 +229,7 @@ memory, which is the difference between RCP fitting a 32 GB card and not.
 
 Every node lives in the **Cumuli** category and is named `Cumuli <something>`;
 the table below drops the prefix. 4DAnyone is one external model this pack
-drives, alongside the OMG4 trainer and cumuli's own `bake_sogst.py` — only
+drives, alongside the cumuli trainer and cumuli's own `bake_sogst.py` — only
 **Generate Ring** is 4DAnyone, which is why it alone carries the model's name
 in its label (`Cumuli Generate Ring (4DAnyone)`).
 
@@ -250,24 +247,51 @@ in its label (`Cumuli Generate Ring (4DAnyone)`).
 | **Ring Masks** | Mattes every staged frame. Takes a `BACKGROUND_REMOVAL` model, so ComfyUI's stock loader (or any substitute) drives it. Reports foreground coverage, because empty masks collapse the visual hull much later and confusingly. |
 | **Build 4DGS Dataset** | Carves a time-stamped visual-hull init cloud, bakes the mattes into RGBA alpha, writes `transforms_train/test.json` with per-camera intrinsics, and checks the result against the trainer's contract. Emits a typed `DATASET`. |
 | **Load 4DGS Dataset** | Validates and describes an existing dataset directory (D-NeRF layout) — the entry point for **finished external datasets** and real-capture exports. The widget is a discovery combo (work_root + config `dataset_roots`) with a refresh button. |
-| **Train 4DGS** | Trains the rotor 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. Clips longer than `max_window_frames` train as several short windows instead (see [Windowed training](#windowed-training) below). Emits a typed `MODEL` either way, and records it on disk as a cumuli `window_plan.json`. |
-| **Load Model** | Opens a trained run so it can be baked without retraining: a Train 4DGS output directory, a run trained by cumuli's own `run_window_plan.py` (its `window_plan.json`), or a single cumuli run directory (`gs4d_config.yaml` + `train4d_output/`). The widget is a discovery combo (work_root + config `model_roots`) with a refresh button. |
+| **Train 4DGS** | Trains the 4DGS model from a `DATASET` socket (Build or Load — never a raw path), reporting the trainer's own iteration count and PSNR. Clips longer than `max_window_frames` train as several short windows instead (see [Windowed training](#windowed-training) below). Emits a typed `MODEL` either way, and records it on disk as a cumuli `window_plan.json`. |
+| **Load Model** | Opens a trained run so it can be baked without retraining: a Train 4DGS output directory, a run trained by cumuli's own `run_window_plan.py` (its `window_plan.json`), or a single cumuli run directory (`gs4d_config.yaml` + `train4d_output/splat_4d.ply`). The widget is a discovery combo (work_root + config `model_roots`) with a refresh button. |
 | **Bake SOGST** | Slices the 4D gaussians into the `.sogst` container and writes it to the output folder as a downloadable artifact. Also emits the 4D interchange PLY, which the preview reads. Takes a `MODEL`; for a windowed one it bakes every window and stitches them into one archive, and its `windows` widget (`"0"`, `"1-2"`, empty for all) picks a contiguous subset. |
 | **Preview SOGST** | Evaluates the baked clip at one instant and outputs ComfyUI's native `SPLAT`. |
 
-**Choosing the trainer.** Train 4DGS's `trainer` widget is `omg4` (the default) or
-`cumuli`. The cumuli trainer is the `cumuli_trainer` Python package, started as
-`python -m cumuli_trainer --config <run>/gs4d_config.yaml` with the same interpreter
-as everything else here (so it and `gsplat` must be installed in ComfyUI's
-environment, `--no-deps`; Train 4DGS says so before it starts if they are not). It
-writes `train4d_output/splat_4d.ply`, which Bake SOGST bakes directly. With it,
-`num_pts`, `batch_size`, `densify_until_*`, `background` and `lambda_opa_mask` are
-ignored; `iterations`, `sh_degree`, `t_init_div`, the clip duration/fps and
-`export_min_contribution` are used. Bake SOGST's `smooth_px` and `smooth_frames`
-apply to such models only (`smooth_px` needs `mask_filter` on), and its `sh_clamp`
-and `filter_corrupted` to OMG4 models only. Load Model opens either kind. The bake
-needs a `bake_sogst.py` that accepts a PLY input, so point `cumuli_root` at a cumuli
-checkout that has it.
+### The trainer
+
+Train 4DGS runs the `cumuli_trainer` Python package as
+`python -m cumuli_trainer --config <run>/gs4d_config.yaml`, with the same interpreter as
+everything else here. It writes `train4d_output/splat_4d.ply`, which Bake SOGST bakes
+directly; Train 4DGS says so before it starts if `cumuli_trainer` or `gsplat` is not
+installed in ComfyUI's environment (`./install.sh` installs both). The widgets become
+config keys one for one, and the defaults are the trainer's own:
+
+| widget | trainer config key | default |
+|---|---|---|
+| `iterations` | `iterations` | 30000 |
+| `sh_degree` | `sh_degree` | 2 |
+| `t_init_div` | `t_init_div` (0 leaves the trainer's own) | 100 |
+| `num_pts` | `representation.max_init_points` (0 starts from every point of `points3d.ply`) | 0 |
+| `batch_size` | `cameras_per_step` | 2 |
+| `densify_until_iter` | `strategy.refine_stop` | 25000 |
+| `densify_until_num_points` | `strategy.cap_max` | 300000 |
+| `background` | `background` (`black` or `white`; `auto` follows the dataset) | auto |
+| `lambda_opa_mask` | `losses.opacity_mask` | 0.005 |
+| `export_min_contribution` | `export_min_contribution` | 2.0 |
+
+As a reference point, a 10-camera, 61-frame capture trains for 30000 iterations in about 8 minutes
+on an RTX 5090, including the one-time kernel build, and scores 36.2 dB PSNR / 0.011 LPIPS on a
+held-out camera. Bigger rings and longer clips take longer.
+
+The trainer rejects unknown config keys, so nothing else is written. A cap ten times
+higher than the default measured worse, which is why `densify_until_num_points` starts at
+300000.
+
+Bake SOGST's `smooth_px` (default 0.5) blurs every splat by that many pixels at the training
+cameras and `smooth_frames` (default 2) widens every splat's lifetime by that many frames;
+together they give a calmer, slightly softer bake, and 0 turns either off. `smooth_px` reads the
+training cameras from each window's dataset, so it needs `mask_filter` on. Bake SOGST's
+`sh_clamp` and `filter_corrupted` are not used any more and stay only so saved workflows load.
+The bake needs a `bake_sogst.py` that accepts a PLY input, so `cumuli_root` has to be a cumuli
+checkout that has it (the pinned `v0.1.0`).
+
+A run trained with the former rotor trainer (a `chkpnt*.pth` and no `splat_4d.ply`) cannot be
+baked here; Load Model says so and asks for a retrain.
 
 ### Caching
 
@@ -433,8 +457,7 @@ factor of ½.
   and not a held-out score.
 - **`sh_degree`** on Train 4DGS: content-dependent. 2 measured better on one
   real subject capture (30.87 vs 30.04 dB); 3 measured better on a generated
-  ring (23.2 vs 21.0 dB held-out). When in doubt, try both — the runs are an
-  hour each and the fingerprint cache keeps whichever you keep. 0 trains view-independent colour only (no
+  ring (23.2 vs 21.0 dB held-out). When in doubt, try both — the fingerprint cache keeps whichever you keep. 0 trains view-independent colour only (no
   `f_rest` columns), for the smallest bake.
 - **`mask_filter`** on Bake SOGST (on by default) runs the lifetime
   mask-consistency filter against each window's own dataset, which drops
@@ -491,12 +514,9 @@ back-to-back, safely, regardless of what this is set to. It only raises real
 concurrency on multiple GPUs, or a `min_free_vram_gb`/`num_pts` combination
 small enough to leave headroom for more than one window's training at a time.
 
-**Background and floaters.** OMG4's own photometric background is a hard
-binary — every place it appears in the trainer (`train.py`,
-`scene/__init__.py`, `dataset_readers.py`, the renderer's `bg_color`) is
-`[1,1,1]` or `[0,0,0]` and nothing else, so this pack exposes exactly that,
-not an arbitrary colour. It matters because a splat at the alpha boundary
-gets fit to blend into whichever background it trained against, and reads as
+**Background and floaters.** The trainer's photometric background is binary, `black` or
+`white`, so this pack exposes exactly that, not an arbitrary colour. It matters because a splat at
+the alpha boundary gets fit to blend into whichever background it trained against, and reads as
 a fringe — or the "evil cloud" `bake_sogst.py`'s own `black_floater_mask`
 docstring names — against a *different*-coloured embed destination. Set
 `background` on **Build 4DGS Dataset** to whichever is closer to where the
@@ -517,21 +537,10 @@ to 3.53%) — **whatever colour the background is, that colour is free**.
 `lambda_opa_mask` charges for rendered opacity wherever the per-view
 silhouette mask says background, which is colour-independent, so it prunes
 floaters of any shade: measured **+2.91 dB held-out PSNR** on top of the RGBA
-dataset switch alone. `0` reproduces every run trained before this option
-existed; `0.005` is the measured production value (a metric-derived `0.002`
-left junk attached to the subject's own silhouette, invisible to automated
-floater metrics — they merge it into the subject's connected component — but
-plainly visible in a viewer).
-
-This needs a trainer checkout with the opacity-mask patch (declaring
-`lambda_opa_mask` in `arguments.OptimizationParams`, and threading the
-ground-truth silhouette through `utils/data_utils.py`'s dataloader path into
-`Camera.gt_alpha_mask` — upstream's own loss code already existed but was
-unreachable with `dataloader: True`, which every config here uses). Point
-`trainer_root` at a patched fork or apply that patch yourself; on an
-unpatched checkout, setting this above `0` raises `AssertionError:
-lambda_opa_mask` at config merge, a clear and immediate failure rather than a
-silent no-op.
+dataset switch alone. `0` turns it off; `0.005` is the measured production
+value (a metric-derived `0.002` left junk attached to the subject's own
+silhouette, invisible to automated floater metrics — they merge it into the
+subject's connected component — but plainly visible in a viewer).
 
 ## Command line
 

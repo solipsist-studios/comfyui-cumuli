@@ -2,9 +2,10 @@
 # Required Notice: Copyright 2026 Solipsist Studios Inc. (https://solipsist.studio)
 """Unit tests for the trained-model read model (``CUMULI_MODEL``).
 
-The on-disk format is cumuli's window plan plus each window's trainer config,
-so these tests build both the way the trainer and plan_temporal_windows.py
-write them, and pin the numbers against cumuli's own documented example.
+The on-disk format is cumuli's window plan plus each window's trainer config
+and ``splat_4d.ply``, so these tests build them the way the trainer and
+plan_temporal_windows.py write them, and pin the numbers against cumuli's own
+documented example.
 
     ~/miniconda3/envs/comfyenv/bin/python -m pytest tests/ -q -k model
 """
@@ -29,29 +30,10 @@ from cumuli_bridge.model import (  # noqa: E402
 from cumuli_bridge.settings import BridgeSettings  # noqa: E402
 from cumuli_bridge.windowing import even_windows  # noqa: E402
 
-# The shape the trainer template renders to: OptimizationParams is nested
-# under ModelParams by indentation, and the paths are absolute.
-CONFIG = """\
-gaussian_dim: 4
-time_duration: [0.0, {duration:.6f}]
-num_pts: 100000
-rot_4d: True
-
-ModelParams:
-  sh_degree: {sh_degree}
-  source_path: "{source}"
-  model_path: "{model}"
-  white_background: False
-
-  OptimizationParams:
-    iterations: {iterations}
-    lambda_dssim: 0.2
-"""
-
-
 def make_run(out_dir: Path, *, frames: int = 31, fps: float = 24.0, iterations: int = 100,
-             sh_degree: int = 3, dataset: Path | None = None, checkpoint: bool = True) -> Path:
-    """A finished run as the trainer leaves it: config, dataset, checkpoint."""
+             sh_degree: int | None = 2, dataset: Path | None = None, checkpoint: bool = True) -> Path:
+    """A finished run as the trainer leaves it: a flat JSON config (valid YAML), the
+    dataset, and ``train4d_output/splat_4d.ply``."""
 
     dataset = dataset or out_dir / "dataset_4dgs"
     dataset.mkdir(parents=True, exist_ok=True)
@@ -60,11 +42,15 @@ def make_run(out_dir: Path, *, frames: int = 31, fps: float = 24.0, iterations: 
     model_dir = out_dir / "train4d_output"
     model_dir.mkdir(parents=True, exist_ok=True)
     if checkpoint:
-        (model_dir / f"chkpnt{iterations}.pth").write_bytes(b"")
-    (out_dir / "gs4d_config.yaml").write_text(CONFIG.format(
-        duration=(frames - 1) / fps, sh_degree=sh_degree, source=dataset, model=model_dir,
-        iterations=iterations,
-    ))
+        (model_dir / "splat_4d.ply").write_bytes(b"")
+    config = {
+        "source_path": str(dataset), "model_path": str(model_dir),
+        "time_duration": [0.0, (frames - 1) / fps], "fps": fps, "iterations": iterations,
+        "test_iterations": [iterations], "save_iterations": [iterations],
+    }
+    if sh_degree is not None:
+        config["sh_degree"] = sh_degree
+    (out_dir / "gs4d_config.yaml").write_text(json.dumps(config, indent=2))
     return out_dir
 
 
@@ -96,7 +82,7 @@ def test_windowed_run_loads_from_its_directory(tmp_path):
     assert model.windows[0].duration_seconds == pytest.approx(30 / 24)
     assert model.windows[1].duration_seconds == pytest.approx(29 / 24)
     assert model.duration_seconds == pytest.approx(5.0)
-    assert model.windows[2].checkpoint == tmp_path / "windows" / "win_02" / "train4d_output" / "chkpnt100.pth"
+    assert model.windows[2].checkpoint == tmp_path / "windows" / "win_02" / "train4d_output" / "splat_4d.ply"
     assert model.windows[2].dataset_dir == tmp_path / "windows" / "win_02" / "dataset_4dgs"
 
 
@@ -141,34 +127,41 @@ def test_a_single_run_reads_its_frame_rate_from_the_dataset(tmp_path):
     assert model.windows[0].sh_degree == 2
 
 
-def test_a_bare_checkpoint_loads_its_run_and_keeps_that_checkpoint(tmp_path):
+def test_a_bare_ply_loads_its_run(tmp_path):
     make_run(tmp_path, iterations=30000)
-    earlier = tmp_path / "train4d_output" / "chkpnt7000.pth"
-    earlier.write_bytes(b"")
-    model = TrainedModel.load(earlier)
-    assert model.windows[0].checkpoint == earlier
+    ply = tmp_path / "train4d_output" / "splat_4d.ply"
+    model = TrainedModel.load(ply)
+    assert model.windows[0].checkpoint == ply
+    assert model.windows[0].out_dir == tmp_path
 
 
 def test_a_windows_checkpoint_is_refused_on_its_own(tmp_path):
     # The failure this type exists for: one window baked as if it were the
     # whole clip, silently writing 1.25 s of a 5 s take.
     make_windowed(tmp_path)
-    checkpoint = tmp_path / "windows" / "win_00" / "train4d_output" / "chkpnt100.pth"
+    ply = tmp_path / "windows" / "win_00" / "train4d_output" / "splat_4d.ply"
     with pytest.raises(ModelError, match="one window of the windowed run"):
-        TrainedModel.load(checkpoint)
+        TrainedModel.load(ply)
 
 
 def test_a_moved_run_falls_back_to_the_standard_names(tmp_path):
     original = make_run(tmp_path / "before")
     moved = original.rename(tmp_path / "after")
     model = TrainedModel.load(moved)
-    assert model.windows[0].checkpoint == moved / "train4d_output" / "chkpnt100.pth"
+    assert model.windows[0].checkpoint == moved / "train4d_output" / "splat_4d.ply"
     assert model.windows[0].dataset_dir == moved / "dataset_4dgs"
 
 
 def test_an_unfinished_run_says_training_did_not_finish(tmp_path):
     make_run(tmp_path, checkpoint=False)
     with pytest.raises(ModelError, match="training did not finish"):
+        TrainedModel.load(tmp_path)
+
+
+def test_a_run_from_the_removed_rotor_trainer_says_so_and_how_to_proceed(tmp_path):
+    make_run(tmp_path, checkpoint=False)
+    (tmp_path / "train4d_output" / "chkpnt30000.pth").write_bytes(b"")
+    with pytest.raises(ModelError, match="no longer drives.*Retrain"):
         TrainedModel.load(tmp_path)
 
 
@@ -208,32 +201,10 @@ def test_discover_models_finds_windowed_and_single_runs(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# a run from the cumuli trainer: a flat JSON config and splat_4d.ply
+# what a run's config and output say
 # --------------------------------------------------------------------------
-def make_cumuli_run(out_dir: Path, *, frames: int = 31, fps: float = 24.0, iterations: int = 100,
-                    sh_degree: int | None = 2, dataset: Path | None = None, ply: bool = True) -> Path:
-    dataset = dataset or out_dir / "dataset_4dgs"
-    dataset.mkdir(parents=True, exist_ok=True)
-    (dataset / "transforms_train.json").write_text(
-        json.dumps({"frames": [{"time": i / fps} for i in range(frames)]})
-    )
-    model_dir = out_dir / "train4d_output"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    if ply:
-        (model_dir / "splat_4d.ply").write_bytes(b"")
-    config = {
-        "source_path": str(dataset), "model_path": str(model_dir),
-        "time_duration": [0.0, (frames - 1) / fps], "fps": fps, "iterations": iterations,
-        "test_iterations": [iterations], "save_iterations": [iterations],
-    }
-    if sh_degree is not None:
-        config["sh_degree"] = sh_degree
-    (out_dir / "gs4d_config.yaml").write_text(json.dumps(config, indent=2))
-    return out_dir
-
-
-def test_a_cumuli_run_loads_with_its_ply_as_the_artifact(tmp_path):
-    make_cumuli_run(tmp_path)
+def test_a_run_loads_with_its_ply_as_the_artifact(tmp_path):
+    make_run(tmp_path)
     model = TrainedModel.load(tmp_path)
     window = model.windows[0]
     assert window.checkpoint == tmp_path / "train4d_output" / "splat_4d.ply"
@@ -242,27 +213,21 @@ def test_a_cumuli_run_loads_with_its_ply_as_the_artifact(tmp_path):
     assert model.fps == 24.0
 
 
-def test_a_cumuli_config_without_sh_degree_reads_the_trainers_default(tmp_path):
-    make_cumuli_run(tmp_path, sh_degree=None)
+def test_a_config_without_sh_degree_reads_the_trainers_default(tmp_path):
+    make_run(tmp_path, sh_degree=None)
     assert TrainedModel.load(tmp_path).windows[0].sh_degree == 2
 
 
-def test_an_unfinished_cumuli_run_names_the_ply_it_is_waiting_for(tmp_path):
-    make_cumuli_run(tmp_path, ply=False)
+def test_an_unfinished_run_names_the_ply_it_is_waiting_for(tmp_path):
+    make_run(tmp_path, checkpoint=False)
     with pytest.raises(ModelError, match="splat_4d.ply"):
         TrainedModel.load(tmp_path)
 
 
-def test_a_cumuli_ply_loads_through_its_run(tmp_path):
-    make_cumuli_run(tmp_path)
-    model = TrainedModel.load(tmp_path / "train4d_output" / "splat_4d.ply")
-    assert model.windows[0].checkpoint.name == "splat_4d.ply"
-
-
-def test_windowed_cumuli_runs_load_through_the_plan(tmp_path):
+def test_windowed_runs_load_through_the_plan(tmp_path):
     entries = []
     for w in even_windows(121, 31):
-        out_dir = make_cumuli_run(tmp_path / "windows" / f"win_{w.index:02d}", frames=w.frame_count)
+        out_dir = make_run(tmp_path / "windows" / f"win_{w.index:02d}", frames=w.frame_count)
         entries.append((w.index, w.frame_start, w.frame_count, out_dir))
     write_plan(tmp_path, run=tmp_path / "dataset_4dgs", fps=24.0, windows=entries)
     model = TrainedModel.load(tmp_path)

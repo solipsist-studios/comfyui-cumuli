@@ -14,9 +14,9 @@ REM work and takes the flags. Getting the interpreter right is the point: every
 REM package goes into that environment, so the wrong one installs a working set
 REM of dependencies somewhere ComfyUI will never look.
 REM
-REM The trainer group builds CUDA extensions from source and needs matching MSVC
-REM Build Tools; run it from a Developer Command Prompt. The other three groups
-REM are wheels and have no such requirement.
+REM The trainer's gsplat compiles its CUDA kernels the first time Train 4DGS runs,
+REM and needs matching MSVC Build Tools for that; start ComfyUI from a Developer
+REM Command Prompt. Installing the group itself needs no compiler.
 
 setlocal enabledelayedexpansion
 

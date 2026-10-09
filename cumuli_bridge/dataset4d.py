@@ -118,7 +118,7 @@ def convert_image(src_img, src_mask, dst, downscale):
 
 def flatten_gt(rgba_path, dst, background="black"):
     """RGBA -> RGB composited over ``background``, matching what the trainer
-    renders: OMG4's own ``white_background`` flag composites onto pure black
+    renders: the trainer's ``background`` composites onto pure black
     or pure white and nothing else (see ``TrainOptions.white_background``), so
     this must agree with whichever the model actually trained against or the
     held-out PSNR/LPIPS score reverts to comparing against the wrong backdrop.
@@ -238,7 +238,7 @@ class DatasetOptions:
     hull_points: int = 300_000
     hull_min_views: int = 9
     jobs: int = 8
-    #: OMG4's own ``white_background`` flag is a hard binary (see
+    #: The trainer's ``background`` is a hard binary (see
     #: ``TrainOptions.white_background``); this must match whatever the
     #: model trained against, or held-out scoring composites onto the wrong
     #: backdrop. "black" matches every dataset built before this option

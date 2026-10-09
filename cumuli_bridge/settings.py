@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Required Notice: Copyright 2026 Solipsist Studios Inc. (https://solipsist.studio)
-"""Locate the external checkouts this pack drives: 4DAnyone, OMG4, cumuli.
+"""Locate the external checkouts this pack drives: 4DAnyone and cumuli.
 
 Everything runs in ComfyUI's own environment. Two stages still run as **child
 processes of the same interpreter**, for reasons that are about CUDA rather than
@@ -10,9 +10,8 @@ about dependencies:
   which only takes effect before a process makes its first CUDA allocation --
   long done by the time a ComfyUI node runs -- and it peaks near 31.9 GB of a
   32 GB card, so it needs an allocator that starts clean.
-* Training is a multi-hour job whose CUDA extensions are happier owning the
-  device, and running it out-of-process keeps a crash from taking the server
-  with it.
+* Training is a long job that wants to own the device, and running it
+  out-of-process keeps a crash from taking the server with it.
 
 ``python_exe`` therefore defaults to ``sys.executable``: same environment, new
 process. Setting ``conda_env`` and clearing ``python_exe`` restores the old
@@ -30,7 +29,7 @@ Resolution order (last wins):
    keys ``cumuli.<name>``) -- the values the Settings dialog edits.
 3. JSON config file -- ``$CUMULI_CONFIG`` if set, otherwise
    ``<package>/config.json``.
-4. Environment variables (``CUMULI_FDANYONE_ROOT``, ``CUMULI_TRAINER_ROOT``, ...).
+4. Environment variables (``CUMULI_FDANYONE_ROOT``, ``CUMULI_PIPELINE_ROOT``, ...).
 """
 
 from __future__ import annotations
@@ -82,8 +81,6 @@ DEFAULTS: dict[str, object] = {
     "attention_backend": "sdpa",
     "device": "cuda:0",
     "min_free_vram_gb": 30.0,
-    # The rotor 4DGS trainer (OMG4), vendored by the cumuli pipeline.
-    "trainer_root": "~/Dev/github/cumuli/deps/OMG4",
     # The cumuli pipeline checkout itself. The pack drives three of its
     # scripts in place -- bake_sogst.py, sogst_ply.py and multiframe_sfm.py --
     # rather than vendoring them, so the .sogst writer cannot go stale
@@ -102,9 +99,7 @@ DEFAULTS: dict[str, object] = {
     "flipbook_roots": [],
     "ring_roots": [],
     "model_roots": [],
-    "trainer_script": "train_scratch.py",
     "subprocess_env": dict(DEFAULT_SUBPROCESS_ENV),
-    "trainer_env": {},
 }
 
 _ENV_KEYS = {
@@ -119,9 +114,7 @@ _ENV_KEYS = {
     "attention_backend": ("CUMULI_ATTENTION_BACKEND",),
     "device": ("CUMULI_DEVICE",),
     "min_free_vram_gb": ("CUMULI_MIN_FREE_VRAM_GB",),
-    "trainer_root": ("CUMULI_TRAINER_ROOT",),
     "cumuli_root": ("CUMULI_PIPELINE_ROOT", "CUMULI_CUMULI_ROOT"),
-    "trainer_script": ("CUMULI_TRAINER_SCRIPT",),
     "work_root": ("CUMULI_WORK_ROOT",),
 }
 
@@ -231,11 +224,8 @@ class BridgeSettings:
     flipbook_roots: tuple[str, ...] = ()
     ring_roots: tuple[str, ...] = ()
     model_roots: tuple[str, ...] = ()
-    trainer_root: Path = Path("~/Dev/github/cumuli/deps/OMG4").expanduser()
     cumuli_root: Path = Path("~/Dev/github/cumuli").expanduser()
-    trainer_script: str = "train_scratch.py"
     subprocess_env: dict[str, str] = field(default_factory=dict)
-    trainer_env: dict[str, str] = field(default_factory=dict)
 
     # -- discovery ---------------------------------------------------------
     @classmethod
@@ -293,11 +283,8 @@ class BridgeSettings:
             flipbook_roots=_roots(values.get("flipbook_roots")),
             ring_roots=_roots(values.get("ring_roots")),
             model_roots=_roots(values.get("model_roots")),
-            trainer_root=Path(str(values["trainer_root"])).expanduser(),
             cumuli_root=Path(str(values["cumuli_root"])).expanduser(),
-            trainer_script=str(values["trainer_script"]),
             subprocess_env={str(k): str(v) for k, v in (values.get("subprocess_env") or {}).items()},
-            trainer_env={str(k): str(v) for k, v in (values.get("trainer_env") or {}).items()},
         )
 
     # -- derived paths -----------------------------------------------------
@@ -374,34 +361,19 @@ class BridgeSettings:
     def runs_in_this_environment(self) -> bool:
         return not self.conda_env and not self.python_exe
 
-    @property
-    def trainer_entrypoint(self) -> Path:
-        return self.trainer_root / self.trainer_script
-
     def pipeline_script(self, name: str) -> Path:
         """Locate one of cumuli's scripts, driven in place.
 
-        ``cumuli_root`` is authoritative. The other two candidates are
-        legacy: ``trainer_root`` is conventionally ``<cumuli>/deps/OMG4``,
-        so the scripts sit two levels up -- true only while OMG4 is used
-        as cumuli's submodule rather than cloned on its own.
+        ``cumuli_root`` is the only place looked: a second guess would
+        silently rescue a wrong setting on the machine that happens to match it.
         """
 
-        # No hardcoded home-directory candidate: ``cumuli_root`` already
-        # defaults to it, and a third guess would silently rescue a wrong
-        # setting on the machine that happens to match it.
-        candidates = [
-            self.cumuli_root / "scripts" / name,
-            self.trainer_root.parent.parent / "scripts" / name,
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate.resolve()
+        candidate = self.cumuli_root / "scripts" / name
+        if candidate.is_file():
+            return candidate.resolve()
         raise SettingsError(
-            f"Could not find cumuli's {name}. Looked in: "
-            + ", ".join(str(c) for c in candidates)
-            + ". Set CUMULI_PIPELINE_ROOT or the 'cumuli_root' key of the bridge "
-            "config to your cumuli checkout."
+            f"Could not find cumuli's {name} at {candidate}. Set CUMULI_PIPELINE_ROOT or the "
+            "'cumuli_root' key of the bridge config to your cumuli checkout."
         )
 
     def validate(self) -> None:
@@ -416,14 +388,6 @@ class BridgeSettings:
             raise SettingsError(f"{self.inference_script} is missing; {self.fdanyone_root} is not a 4DAnyone checkout.")
         # Touching launcher() here surfaces a missing conda before any GPU work.
         self.launcher()
-
-    def validate_trainer(self) -> None:
-        if not self.trainer_entrypoint.is_file():
-            raise SettingsError(
-                f"Trainer entry point not found at {self.trainer_entrypoint}. "
-                "Set CUMULI_TRAINER_ROOT or the 'trainer_root' key of the bridge config file "
-                "(it should point at an OMG4 checkout, for example cumuli's deps/OMG4 submodule)."
-            )
 
     def describe(self) -> str:
         environment = self.python_exe or self.conda_env or "this interpreter"

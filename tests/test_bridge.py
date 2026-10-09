@@ -942,40 +942,155 @@ def test_bake_progress_walks_the_real_milestones():
     assert 0.0 < seen[0] < seen[-1] < 1.0
 
 
-def _train_options(tmp_path: Path, dataset: Path) -> TrainOptions:
-    return TrainOptions(
+def _train_options(tmp_path: Path, dataset: Path, **overrides) -> TrainOptions:
+    options = TrainOptions(
         out_dir=tmp_path / "run",
         dataset_dir=dataset,
         duration_seconds=4.004,
         fps=29.97,
         iterations=30000,
-        num_pts=100000,
-        batch_size=2,
     )
+    for name, value in overrides.items():
+        setattr(options, name, value)
+    return options
 
 
-def test_train_argv_matches_the_orchestrator(settings, tmp_path):
+def test_the_trainer_runs_as_a_module_of_the_launcher(settings, tmp_path):
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"))
+    argv = build_train_argv(settings, options, options.config_path)
+    assert argv == [sys.executable, "-m", "cumuli_trainer", "--config", str(options.config_path)]
+    assert options.checkpoint == options.model_dir / "splat_4d.ply"
+
+
+def test_the_default_options_are_the_trainers_own_defaults(settings, tmp_path):
+    """No widget left at its default may change what the trainer does by itself."""
+
+    import json
+
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"))
+    config = json.loads(write_config(settings, options).read_text())
+    assert config["representation"] == {"name": "spacetime"}  # 0 points: start from all of them
+    assert config["strategy"] == {"name": "mcmc", "refine_stop": 25000, "cap_max": 300000}
+    assert config["cameras_per_step"] == 2
+    assert config["background"] == "black"
+    assert config["losses"] == {"opacity_mask": 0.005}
+    assert config["sh_degree"] == 2 and config["t_init_div"] == 100 and config["export_min_contribution"] == 2.0
+
+
+def test_every_widget_reaches_its_trainer_config_key(settings, tmp_path):
+    import json
+
     dataset = _write_dataset(tmp_path / "ds")
-    options = _train_options(tmp_path, dataset)
-    argv = build_train_argv(settings, options, tmp_path / "gs4d_config.yaml")
-    assert argv[0] == sys.executable
-    assert argv[1].endswith("train_scratch.py")
-    # Explicit iteration lists are what make the checkpoint filename deterministic.
-    assert argv[2:] == [
-        "--config", str(tmp_path / "gs4d_config.yaml"),
-        "--test_iterations", "30000",
-        "--save_iterations", "30000",
-    ]
-    assert options.checkpoint.name == "chkpnt30000.pth"
+    options = _train_options(
+        tmp_path, dataset, num_pts=50000, batch_size=4, densify_until_iter=10000,
+        densify_until_num_points=500000, white_background=True, lambda_opa_mask=0.01, t_init_div=50,
+        sh_degree=3, export_min_contribution=0.0,
+    )
+    config = json.loads(write_config(settings, options).read_text())
+    assert config == {
+        "source_path": str(dataset.resolve()),
+        "model_path": str(options.model_dir.resolve()),
+        "time_duration": [0.0, 4.004],
+        "fps": 29.97,
+        "iterations": 30000,
+        "sh_degree": 3,
+        "test_iterations": [30000],
+        "save_iterations": [30000],
+        "cameras_per_step": 4,
+        "background": "white",
+        "representation": {"name": "spacetime", "max_init_points": 50000},
+        "strategy": {"name": "mcmc", "refine_stop": 10000, "cap_max": 500000},
+        "losses": {"opacity_mask": 0.01},
+        "export_min_contribution": 0.0,
+        "t_init_div": 50,
+    }
 
 
-def test_t_init_div_reaches_the_trainer_as_an_env_var(settings, tmp_path):
-    dataset = _write_dataset(tmp_path / "ds")
-    options = _train_options(tmp_path, dataset)
-    options.t_init_div = 100
-    assert build_train_env(settings, options)["GS4D_T_INIT_DIV"] == "100"
-    options.t_init_div = 0  # 0 means "leave upstream's default of 5 alone"
-    assert "GS4D_T_INIT_DIV" not in build_train_env(settings, options)
+def test_t_init_div_zero_leaves_the_trainers_default(settings, tmp_path):
+    import json
+
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"), t_init_div=0)
+    assert "t_init_div" not in json.loads(write_config(settings, options).read_text())
+
+
+def test_a_caller_supplied_config_is_used_untouched(settings, tmp_path):
+    mine = tmp_path / "mine.yaml"
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"), trainer_config=mine)
+    assert write_config(settings, options) == mine
+    assert not mine.exists()
+
+
+def test_the_config_is_one_the_trainers_own_loader_accepts(settings, tmp_path):
+    """The trainer rejects unknown keys, so the real loader is the only honest check. It lives in
+    cumuli_trainer, which this test environment may not have."""
+
+    config_module = pytest.importorskip("cumuli_trainer.config")
+    options = _train_options(
+        tmp_path, _write_dataset(tmp_path / "ds"), num_pts=50000, white_background=True, sh_degree=3,
+    )
+    loaded = config_module.load_config(str(write_config(settings, options)))
+    assert loaded["representation"]["max_init_points"] == 50000
+    assert loaded["strategy"]["cap_max"] == 300000 and loaded["background"] == "white"
+
+
+def test_the_trainer_gets_no_environment_beyond_the_cuda_toolchain(settings, tmp_path):
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"))
+    env = build_train_env(settings, options)
+    assert "GS4D_T_INIT_DIV" not in env and "PYTHONPATH" not in env
+
+
+def test_the_trainer_missing_from_this_environment_is_reported_before_the_gpu_job(settings, monkeypatch):
+    from cumuli_bridge.train import check_trainer
+
+    here = dataclasses.replace(settings, python_exe="", conda_env="")
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None if name == "gsplat" else object())
+    with pytest.raises(TrainingError, match="needs gsplat in ComfyUI's environment"):
+        check_trainer(here)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(TrainingError, match="cumuli_trainer and gsplat"):
+        check_trainer(here)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    check_trainer(here)
+    # Another environment is the child's to report.
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    check_trainer(settings)
+
+
+def test_the_bake_input_is_the_ply_and_carries_no_clip_flags(settings, tmp_path, monkeypatch):
+    script = tmp_path / "bake_sogst.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
+    argv = build_bake_argv(
+        settings,
+        BakeOptions(
+            checkpoint=tmp_path / "train4d_output" / "splat_4d.ply",
+            output=tmp_path / "out.sogst",
+            mask_filter_root=tmp_path / "ds",
+        ),
+    )
+    flags = argv[argv.index(str(script)) + 1 :]
+    assert flags[flags.index("--input") + 1].endswith("splat_4d.ply")
+    assert flags[flags.index("--sh_chroma_clamp") + 1] == "0.02"
+    assert flags[flags.index("--smooth_px") + 1] == "0.5"
+    assert flags[flags.index("--smooth_frames") + 1] == "2"
+    assert flags[flags.index("--mask_filter_root") + 1] == str(tmp_path / "ds")
+    # The PLY carries its clip times; a disagreeing value is an error in the script.
+    for refused in ("--time_min", "--time_max", "--fps", "--sh_clamp", "--scale_boost", "--aniso_boost",
+                    "--cov2d_scale", "--extra_keep_mask", "--no_filter_corrupted"):
+        assert refused not in flags
+
+
+def test_bake_smoothing_needs_the_mask_filter_dataset(settings, tmp_path, monkeypatch):
+    script = tmp_path / "bake_sogst.py"
+    script.touch()
+    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
+    options = BakeOptions(checkpoint=tmp_path / "splat_4d.ply", output=tmp_path / "o.sogst")
+    with pytest.raises(TrainingError, match="smooth_px needs"):
+        build_bake_argv(settings, options)
+    options.smooth_px = 0.0
+    assert "--smooth_px" not in build_bake_argv(settings, options)
+    options.smooth_frames = 0
+    assert "--smooth_frames" not in build_bake_argv(settings, options)
 
 
 def test_a_sparse_directory_is_refused_because_it_switches_the_loader(settings, tmp_path):
@@ -991,132 +1106,14 @@ def test_training_needs_a_built_dataset(tmp_path):
         options.validate()
 
 
-# --------------------------------------------------------------------------
-# the cumuli trainer, beside OMG4
-# --------------------------------------------------------------------------
-def _cumuli_options(tmp_path: Path, dataset: Path, **overrides) -> TrainOptions:
-    options = _train_options(tmp_path, dataset)
-    options.trainer = "cumuli"
-    options.sh_degree = 2
-    for name, value in overrides.items():
-        setattr(options, name, value)
-    return options
-
-
-def test_cumuli_trainer_runs_as_a_module_of_the_launcher(settings, tmp_path):
-    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"))
-    argv = build_train_argv(settings, options, options.config_path)
-    assert argv == [sys.executable, "-m", "cumuli_trainer", "--config", str(options.config_path)]
-    assert options.checkpoint == options.model_dir / "splat_4d.ply"
-
-
-def test_cumuli_config_carries_only_keys_the_trainer_knows(settings, tmp_path):
-    import json
-
-    from cumuli_bridge.train import write_config
-
-    dataset = _write_dataset(tmp_path / "ds")
-    options = _cumuli_options(tmp_path, dataset, export_min_contribution=0.0)
-    config = json.loads(write_config(settings, options).read_text())
-    assert config == {
-        "source_path": str(dataset.resolve()),
-        "model_path": str(options.model_dir.resolve()),
-        "time_duration": [0.0, 4.004],
-        "fps": 29.97,
-        "iterations": 30000,
-        "sh_degree": 2,
-        "test_iterations": [30000],
-        "save_iterations": [30000],
-        "export_min_contribution": 0.0,
-        "t_init_div": 100,
-    }
-    # Nothing of OMG4's reaches it: the trainer rejects unknown keys.
-    for omg4_only in ("num_pts", "batch_size", "densify_until_iter", "white_background", "lambda_opa_mask"):
-        assert omg4_only not in config
-
-
-def test_cumuli_trainer_gets_no_omg4_environment(settings, tmp_path):
-    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"))
-    settings = dataclasses.replace(settings, trainer_env={"OMG4_ONLY": "1"})
-    env = build_train_env(settings, options)
-    assert "GS4D_T_INIT_DIV" not in env and "OMG4_ONLY" not in env
-
-
-def test_an_unknown_trainer_is_refused(tmp_path):
-    options = _cumuli_options(tmp_path, _write_dataset(tmp_path / "ds"), trainer="gsplat")
-    with pytest.raises(TrainingError, match="trainer must be one of"):
+@pytest.mark.parametrize("field,value", [
+    ("batch_size", 0), ("iterations", 0), ("num_pts", -1), ("densify_until_num_points", 0),
+    ("export_min_contribution", -1.0),
+])
+def test_nonsense_training_options_are_refused_before_the_gpu_job(tmp_path, field, value):
+    options = _train_options(tmp_path, _write_dataset(tmp_path / "ds"), **{field: value})
+    with pytest.raises(TrainingError):
         options.validate()
-
-
-def test_cumuli_trainer_missing_from_this_environment_is_reported_before_the_gpu_job(settings, monkeypatch):
-    from cumuli_bridge.train import check_cumuli_trainer
-
-    settings = dataclasses.replace(settings, python_exe="", conda_env="")
-    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
-    with pytest.raises(TrainingError, match="not installed in ComfyUI's environment"):
-        check_cumuli_trainer(settings)
-    # Another environment is the child's to report.
-    settings = dataclasses.replace(settings, python_exe=sys.executable)
-    check_cumuli_trainer(settings)
-
-
-def test_cumuli_bake_input_is_the_ply_and_carries_no_clip_flags(settings, tmp_path, monkeypatch):
-    script = tmp_path / "bake_sogst.py"
-    script.touch()
-    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
-    argv = build_bake_argv(
-        settings,
-        BakeOptions(
-            checkpoint=tmp_path / "train4d_output" / "splat_4d.ply",
-            output=tmp_path / "out.sogst",
-            duration_seconds=4.004,
-            fps=29.97,
-            mask_filter_root=tmp_path / "ds",
-        ),
-    )
-    flags = argv[argv.index(str(script)) + 1 :]
-    assert flags[flags.index("--input") + 1].endswith("splat_4d.ply")
-    assert flags[flags.index("--sh_chroma_clamp") + 1] == "0.02"
-    assert flags[flags.index("--smooth_px") + 1] == "0.5"
-    assert flags[flags.index("--smooth_frames") + 1] == "2"
-    assert flags[flags.index("--mask_filter_root") + 1] == str(tmp_path / "ds")
-    # The PLY carries these; a disagreeing value is an error in the script, and
-    # the OMG4-only ones are rejected for this input.
-    for refused in ("--time_min", "--time_max", "--fps", "--sh_clamp", "--scale_boost", "--aniso_boost",
-                    "--cov2d_scale", "--extra_keep_mask", "--no_filter_corrupted"):
-        assert refused not in flags
-
-
-def test_cumuli_bake_smoothing_needs_the_mask_filter_dataset(settings, tmp_path, monkeypatch):
-    script = tmp_path / "bake_sogst.py"
-    script.touch()
-    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
-    options = BakeOptions(checkpoint=tmp_path / "splat_4d.ply", output=tmp_path / "o.sogst", duration_seconds=1.0)
-    with pytest.raises(TrainingError, match="smooth_px needs"):
-        build_bake_argv(settings, options)
-    options.smooth_px = 0.0
-    assert "--smooth_px" not in build_bake_argv(settings, options)
-
-
-def test_omg4_bake_ignores_the_cumuli_only_smoothing(settings, tmp_path, monkeypatch):
-    script = tmp_path / "bake_sogst.py"
-    script.touch()
-    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
-    argv = build_bake_argv(
-        settings, BakeOptions(checkpoint=tmp_path / "chkpnt200.pth", output=tmp_path / "o.sogst", duration_seconds=1.0)
-    )
-    assert "--smooth_px" not in argv and "--sh_chroma_clamp" not in argv
-
-
-def test_cumuli_fingerprint_ignores_omg4_knobs_and_omg4_fingerprints_are_untouched():
-    from cumuli_bridge.runner import train_fingerprint_fields
-
-    fields = {"dataset": "d", "iterations": 100, "num_pts": 1, "batch_size": 2, "densify_until_iter": 3,
-              "densify_until_num_points": 4, "white_background": False, "lambda_opa_mask": 0.005, "sh_degree": 2}
-    assert train_fingerprint_fields(fields, "omg4", 2.0) == fields  # cached OMG4 runs stay valid
-    cumuli = train_fingerprint_fields(fields, "cumuli", 2.0)
-    assert cumuli == {"dataset": "d", "iterations": 100, "sh_degree": 2, "trainer": "cumuli",
-                      "export_min_contribution": 2.0}
 
 
 # --------------------------------------------------------------------------
@@ -1335,28 +1332,6 @@ def test_inactive_splats_are_culled_at_the_chosen_instant(tmp_path):
     asset = load_interchange_ply(_write_interchange_ply(tmp_path / "a.ply", rows=rows))
     alpha = asset.alpha_at(0.0)
     assert alpha[0] > 0.4 and alpha[1] < 1e-6
-
-
-def test_bake_argv_disables_the_legacy_corruption_filters_by_default(settings, tmp_path, monkeypatch):
-    script = tmp_path / "bake_sogst.py"
-    script.touch()
-    monkeypatch.setattr("cumuli_bridge.train.find_bake_script", lambda _s: script)
-    argv = build_bake_argv(
-        settings,
-        BakeOptions(
-            checkpoint=tmp_path / "chkpnt200.pth",
-            output=tmp_path / "out.sogst",
-            duration_seconds=4.004,
-            fps=29.97,
-            mask_filter_root=tmp_path / "ds",
-        ),
-    )
-    flags = argv[argv.index(str(script)) + 1 :]
-    assert "--no_filter_corrupted" in flags
-    assert flags[flags.index("--time_max") + 1] == "4.004000"
-    assert flags[flags.index("--mask_filter_root") + 1] == str(tmp_path / "ds")
-    # sh_clamp 1.5 is upstream's default and is too aggressive for explicit SH.
-    assert float(flags[flags.index("--sh_clamp") + 1]) == 3.0
 
 
 # --- VIDEO-socket materialization -------------------------------------------------
@@ -1692,9 +1667,7 @@ def test_discover_rings_includes_configured_ring_roots(settings, tmp_path):
     assert str(extra) in runner.discover_rings(scoped)
 
 
-def test_pipeline_script_prefers_cumuli_root(settings, tmp_path):
-    """cumuli_root is authoritative; the deps/OMG4 guess is only a fallback."""
-
+def test_pipeline_script_comes_from_cumuli_root(settings, tmp_path):
     real = tmp_path / "cumuli" / "scripts"
     real.mkdir(parents=True)
     (real / "bake_sogst.py").write_text("")
@@ -1702,22 +1675,8 @@ def test_pipeline_script_prefers_cumuli_root(settings, tmp_path):
     assert scoped.pipeline_script("bake_sogst.py") == (real / "bake_sogst.py").resolve()
 
 
-def test_pipeline_script_falls_back_to_the_submodule_layout(settings, tmp_path):
-    """A checkout using cumuli's deps/OMG4 submodule keeps working unchanged."""
-
-    scripts = tmp_path / "cumuli" / "scripts"
-    scripts.mkdir(parents=True)
-    (scripts / "multiframe_sfm.py").write_text("")
-    scoped = BridgeSettings(**{**settings.__dict__,
-                               "cumuli_root": tmp_path / "nonexistent",
-                               "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
-    assert scoped.pipeline_script("multiframe_sfm.py") == (scripts / "multiframe_sfm.py").resolve()
-
-
 def test_pipeline_script_error_names_the_setting(settings, tmp_path):
-    scoped = BridgeSettings(**{**settings.__dict__,
-                               "cumuli_root": tmp_path / "nope",
-                               "trainer_root": tmp_path / "also" / "nope" / "OMG4"})
+    scoped = BridgeSettings(**{**settings.__dict__, "cumuli_root": tmp_path / "nope"})
     with pytest.raises(SettingsError) as exc:
         scoped.pipeline_script("bake_sogst.py")
     assert "cumuli_root" in str(exc.value)
@@ -1866,53 +1825,6 @@ def test_slice_dataset_window_refuses_a_foreign_realcams_directory(tmp_path):
     (out_dir / "realcams").mkdir(parents=True)  # a real directory, not our own symlink
     with pytest.raises(DatasetError, match="symlink"):
         slice_dataset_window(dataset, out_dir, frame_start=0, frame_count=2, fps=24.0)
-
-
-def test_write_config_patches_white_background_when_requested(settings, tmp_path):
-    configs = tmp_path / "cumuli" / "configs"
-    configs.mkdir(parents=True)
-    (configs / "gs4d_pretrain_template.yaml").write_text(
-        "time_max: {time_max}\nnum_pts: {num_pts}\nbatch_size: {batch_size}\n"
-        "source_path: {source_path}\nmodel_path: {model_path}\niterations: {iterations}\n"
-        "densify_until_iter: {densify_until_iter}\n"
-        "densify_until_num_points: {densify_until_num_points}\n"
-        "sh_degree: 3\nwhite_background: False\n"
-    )
-    scoped = BridgeSettings(**{**settings.__dict__, "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
-
-    options = _train_options(tmp_path / "black_run", tmp_path / "ds")
-    text = write_config(scoped, options).read_text()
-    assert "white_background: False" in text
-
-    options = _train_options(tmp_path / "white_run", tmp_path / "ds")
-    options.white_background = True
-    text = write_config(scoped, options).read_text()
-    assert "white_background: True" in text
-    assert "white_background: False" not in text
-
-
-def test_write_config_inserts_lambda_opa_mask_when_nonzero(settings, tmp_path):
-    configs = tmp_path / "cumuli" / "configs"
-    configs.mkdir(parents=True)
-    (configs / "gs4d_pretrain_template.yaml").write_text(
-        "time_max: {time_max}\nnum_pts: {num_pts}\nbatch_size: {batch_size}\n"
-        "source_path: {source_path}\nmodel_path: {model_path}\niterations: {iterations}\n"
-        "densify_until_iter: {densify_until_iter}\n"
-        "densify_until_num_points: {densify_until_num_points}\n"
-        "sh_degree: 3\nwhite_background: False\n"
-        "  OptimizationParams:\n    lambda_dssim: 0.2\n    thresh_opa_prune: 0.005\n"
-    )
-    scoped = BridgeSettings(**{**settings.__dict__, "trainer_root": tmp_path / "cumuli" / "deps" / "OMG4"})
-
-    options = _train_options(tmp_path / "off_run", tmp_path / "ds")
-    options.lambda_opa_mask = 0.0
-    text = write_config(scoped, options).read_text()
-    assert "lambda_opa_mask" not in text
-
-    options = _train_options(tmp_path / "on_run", tmp_path / "ds")
-    options.lambda_opa_mask = 0.005
-    text = write_config(scoped, options).read_text()
-    assert "lambda_dssim: 0.2\n    lambda_opa_mask: 0.005" in text
 
 
 def test_build_merge_argv_passes_segments_and_fade_settings(settings, tmp_path, monkeypatch):
