@@ -15,8 +15,10 @@ from fractions import Fraction
 from pathlib import Path
 
 from .process import CommandResult, run_streaming
+from .model import PLAN_NAME
 from .progress import ProgressState
 from .settings import BridgeSettings
+from .train import CONFIG_NAME
 from .videoio import VideoProbe, probe
 
 LOGGER = logging.getLogger("comfyui-cumuli")
@@ -861,6 +863,19 @@ def discover_rings(settings: BridgeSettings) -> list[str]:
     found = [
         str(path) for path in _candidate_dirs(roots)
         if (path / "cameras.json").is_file() and (path / "videos").is_dir()
+    ]
+    return sorted(set(found))
+
+
+def discover_models(settings: BridgeSettings) -> list[str]:
+    """Trained runs under work_root and model_roots: a window plan (Train
+    4DGS's output, or cumuli's run_window_plan.py) or a single run's trainer
+    config. model.TrainedModel decides whether one actually loads."""
+
+    roots = ([settings.work_root] if settings.work_root else []) + list(settings.model_roots)
+    found = [
+        str(path) for path in _candidate_dirs(roots)
+        if (path / PLAN_NAME).is_file() or (path / CONFIG_NAME).is_file()
     ]
     return sorted(set(found))
 

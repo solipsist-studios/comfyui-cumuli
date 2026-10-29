@@ -36,12 +36,14 @@ from . import runner
 from .dataset4d import DatasetError, DatasetHandle, DatasetOptions, build_dataset, slice_dataset_window
 from .flipbook import MASKS_SUBDIR, FlipbookError, check_complete, load_flipbook, write_flipbook
 from .masks import MaskError, mask_coverage, matte_flipbook
+from .model import PLAN_NAME, DATASET_DIRNAME, ModelError, TrainedModel, dataset_timeline, write_plan
 from .process import SubprocessCancelled, SubprocessError
 from .ring import RingError, RingResult
 from . import sfm
 from .settings import SettingsError, load_settings
 from .sogst import SogstError, frame_count, frame_time, load_interchange_ply, to_splat
 from .train import (
+    CONFIG_NAME,
     BakeOptions,
     MergeOptions,
     TrainOptions,
@@ -66,6 +68,8 @@ CATEGORY = "Cumuli"
 Ring = IO.Custom("CUMULI_RING")
 FlipbookIO = IO.Custom("CUMULI_FLIPBOOK")
 DatasetIO = IO.Custom("CUMULI_DATASET")
+#: A trained model: one or more windows of one clip (``model.TrainedModel``).
+ModelIO = IO.Custom("CUMULI_MODEL")
 #: A solved real-capture rig: the poses a physical rig does not ship with.
 RigIO = IO.Custom("CUMULI_RIG")
 
@@ -189,6 +193,7 @@ def _staging_root(explicit: str, run_name: str, settings=None) -> Path:
 _NO_DATASETS = "(none found -- add dataset_roots to the bridge config)"
 _NO_FLIPBOOKS = "(none found -- add flipbook_roots to the bridge config)"
 _NO_RINGS = "(none found -- generate a ring, or add ring_roots to the bridge config)"
+_NO_MODELS = "(none found -- train one, or add model_roots to the bridge config)"
 
 
 def _discovered(kind: str) -> list[str]:
@@ -200,6 +205,8 @@ def _discovered(kind: str) -> list[str]:
         return runner.discover_datasets(settings)
     if kind == "rings":
         return runner.discover_rings(settings)
+    if kind == "models":
+        return runner.discover_models(settings)
     return runner.discover_flipbooks(settings)
 
 
@@ -230,6 +237,10 @@ def _register_option_routes() -> None:
     @routes.get("/cumuli/options/rings")
     async def _rings(request):
         return web.json_response(_discovered("rings") or [_NO_RINGS])
+
+    @routes.get("/cumuli/options/models")
+    async def _models(request):
+        return web.json_response(_discovered("models") or [_NO_MODELS])
 
 
 _register_option_routes()
@@ -1560,10 +1571,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
                                  advanced=True),
             ],
             outputs=[
-                IO.String.Output(display_name="checkpoint"),
-                IO.Float.Output(display_name="duration_seconds"),
+                ModelIO.Output(display_name="model"),
                 IO.String.Output(display_name="report"),
-                IO.String.Output(display_name="window_manifest"),
             ],
             hidden=[IO.Hidden.unique_id],
         )
@@ -1663,8 +1672,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                     argv = build_train_argv(settings, options, config)
                 except TrainingError as exc:
                     raise RuntimeError(f"Cumuli: {exc}") from None
-                return IO.NodeOutput(str(options.checkpoint), duration,
-                                     "DRY RUN\n" + "\n".join(header + ["command: " + " ".join(argv)]), "")
+                return IO.NodeOutput(None, "DRY RUN\n" + "\n".join(header + ["command: " + " ".join(argv)]))
 
             try:
                 decision = runner.prepare_artifact_dir(options.model_dir, train_fingerprint)
@@ -1673,7 +1681,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
             if decision == "reuse" and options.checkpoint.is_file():
                 header.append("cached checkpoint (inputs unchanged)")
                 _send_text(node_id, "cached checkpoint")
-                return IO.NodeOutput(str(options.checkpoint), duration, "\n".join(header), "")
+                model = _record_model(base_out_dir, dataset, rate, [(windows[0], base_out_dir)])
+                return IO.NodeOutput(model, "\n".join(header))
             if decision == "reuse":
                 # Our stamp, no checkpoint: a crashed run. Rebuilding our own
                 # incomplete artifact is safe; foreign dirs still error above.
@@ -1710,7 +1719,8 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 header.append(f"final training PSNR: {outcome.final_psnr:.2f} dB")
             runner.write_stamp(options.model_dir, train_fingerprint)
             _send_text(node_id, "training complete")
-            return IO.NodeOutput(str(outcome.checkpoint), duration, "\n".join(header), "")
+            model = _record_model(base_out_dir, dataset, rate, [(windows[0], base_out_dir)])
+            return IO.NodeOutput(model, "\n".join(header))
 
         # -- windowed: several short models trained and later stitched -------
         # Window boundaries and every dataset slice always use the dataset's
@@ -1729,7 +1739,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
         if dry_run:
             preview = TrainOptions(
                 out_dir=window_out_dirs[0],
-                dataset_dir=window_out_dirs[0] / "dataset",
+                dataset_dir=window_out_dirs[0] / DATASET_DIRNAME,
                 duration_seconds=(windows[0].frame_count - 1) / dataset_fps,
                 fps=dataset_fps,
                 iterations=int(iterations), num_pts=int(num_pts), batch_size=int(batch_size),
@@ -1749,7 +1759,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
                 f"command (window 0 of {len(windows)}, illustrative -- every window uses the same "
                 f"knobs with its own dataset slice/out_dir/duration_seconds): " + " ".join(argv)
             )
-            return IO.NodeOutput(str(preview.checkpoint), duration, "DRY RUN\n" + "\n".join(header), "")
+            return IO.NodeOutput(None, "DRY RUN\n" + "\n".join(header))
 
         dataset_identity = (
             handle.fingerprint if handle.fingerprint else runner.file_identity(dataset / "transforms_train.json")
@@ -1758,7 +1768,7 @@ class CumuliTrain4DGS(IO.ComfyNode):
         fingerprints: dict[int, str] = {}
         outcomes: dict[int, dict] = {}
         for window, window_out_dir in zip(windows, window_out_dirs):
-            window_dataset_dir = window_out_dir / "dataset"
+            window_dataset_dir = window_out_dir / DATASET_DIRNAME
             slice_dataset_window(dataset, window_dataset_dir, window.frame_start, window.frame_count, dataset_fps)
             window_duration = (window.frame_count - 1) / dataset_fps
             window_options = TrainOptions(
@@ -1837,32 +1847,98 @@ class CumuliTrain4DGS(IO.ComfyNode):
         else:
             header.append("all windows cached (inputs unchanged)")
 
-        manifest = [
-            {
-                "index": i,
-                "checkpoint": str(outcomes[i]["checkpoint"]),
-                "duration_seconds": outcomes[i]["duration_seconds"],
-                "fps": outcomes[i]["fps"],
-                "offset_seconds": outcomes[i]["offset_seconds"],
-                "dataset_dir": str(outcomes[i]["dataset_dir"]),
-            }
-            for i in range(len(windows))
-        ]
-        for i, entry in enumerate(manifest):
-            status = "cached" if outcomes[i]["cached"] else "trained"
-            psnr = outcomes[i]["final_psnr"]
+        for window in windows:
+            outcome = outcomes[window.index]
+            status = "cached" if outcome["cached"] else "trained"
+            psnr = outcome["final_psnr"]
             psnr_text = f", PSNR {psnr:.2f} dB" if psnr is not None else ""
             header.append(
-                f"  window {i}: frames [{windows[i].frame_start}, {windows[i].frame_end}) "
-                f"offset {entry['offset_seconds']:.3f}s ({status}{psnr_text})"
+                f"  window {window.index}: frames [{window.frame_start}, {window.frame_end}) "
+                f"offset {outcome['offset_seconds']:.3f}s ({status}{psnr_text})"
             )
+        model = _record_model(base_out_dir, dataset, dataset_fps, list(zip(windows, window_out_dirs)))
+        header.append(f"window plan: {model.root}")
         _send_text(node_id, f"{len(windows)} windows complete")
-        first = manifest[0]
-        return IO.NodeOutput(first["checkpoint"], first["duration_seconds"], "\n".join(header), json.dumps(manifest))
+        return IO.NodeOutput(model, "\n".join(header))
+
+
+class CumuliLoadModel(IO.ComfyNode):
+    """Open a trained run -- one node, one job.
+
+    The way a model trained earlier, or by cumuli's own command line, enters
+    the graph: the model-side counterpart of Load 4DGS Dataset. Reads the run
+    the way model.TrainedModel knows how and never writes into it.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CumuliLoadModel",
+            display_name="Cumuli Load Model",
+            category=CATEGORY,
+            description=(
+                "Opens a trained 4DGS run so it can feed Bake SOGST without retraining: a Train 4DGS "
+                "output directory, a cumuli window_plan.json run, or a single cumuli run directory "
+                "(gs4d_config.yaml + train4d_output/)."
+            ),
+            is_experimental=True,
+            inputs=[
+                IO.Combo.Input(
+                    "model_dir",
+                    options=_discovered("models") or [_NO_MODELS],
+                    remote=IO.RemoteOptions(route="/cumuli/options/models", refresh_button=True),
+                    tooltip="Trained runs discovered under work_root and the bridge config's "
+                            "model_roots (a window_plan.json or a gs4d_config.yaml). The config is "
+                            "re-read on refresh, no restart needed.",
+                ),
+            ],
+            outputs=[
+                ModelIO.Output(display_name="model"),
+                IO.String.Output(display_name="report"),
+            ],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, model_dir):
+        # Re-read only when the run's own description changes.
+        root = Path((model_dir or "").strip()).expanduser()
+        parts = []
+        for name in (PLAN_NAME, CONFIG_NAME):
+            try:
+                stat = (root / name).stat()
+                parts.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
+            except OSError:
+                parts.append(f"{name}:missing")
+        return "|".join(parts)
+
+    @classmethod
+    def execute(cls, model_dir="") -> IO.NodeOutput:
+        if not str(model_dir).strip() or str(model_dir).startswith("(none found"):
+            raise RuntimeError(
+                "Cumuli: no model selected. Train one, or add its parent directory to model_roots "
+                "in the bridge config and refresh the widget."
+            )
+        try:
+            model = TrainedModel.load(model_dir)
+        except ModelError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        lines = [
+            f"model: {model.root}",
+            f"clip: {model.duration_seconds:.3f}s @ {model.fps:g} fps, {len(model.windows)} window(s)",
+        ]
+        for window in model.windows:
+            lines.append(
+                f"  window {window.index}: {window.offset_seconds:.3f}s + {window.duration_seconds:.3f}s, "
+                f"sh_degree {window.sh_degree}, {window.checkpoint}"
+            )
+        _send_text(cls.hidden.unique_id, f"{len(model.windows)} window(s), {model.duration_seconds:.2f}s")
+        return IO.NodeOutput(model, "\n".join(lines))
 
 
 class CumuliBakeSogst(IO.ComfyNode):
-    """Bake a trained checkpoint into a streamable ``.sogst`` asset."""
+    """Bake a trained model into a streamable ``.sogst`` asset, stitching
+    windows when the model has several."""
 
     @classmethod
     def define_schema(cls):
@@ -1873,25 +1949,25 @@ class CumuliBakeSogst(IO.ComfyNode):
             description=(
                 "Slices the trained 4D Gaussians into the .sogst container: positions at each "
                 "splat's temporal centre, linear motion, temporal sigma and spherical harmonics, "
-                "packed as lossless WebP texture planes. The result lands in ComfyUI's output "
+                "packed as lossless WebP texture planes. A windowed model bakes every selected "
+                "window and stitches them into one archive. The result lands in ComfyUI's output "
                 "folder and appears as a downloadable artifact."
             ),
             is_experimental=True,
             inputs=[
-                IO.String.Input("checkpoint", default="", tooltip="A chkpntNNNNN.pth from the trainer."),
-                IO.Float.Input("duration_seconds", default=0.0, min=0.0, max=600.0, step=0.001,
-                               tooltip="Must match the time_duration the model trained with."),
-                IO.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=0.001,
-                               tooltip="Advisory playback rate recorded in the container."),
+                ModelIO.Input("model",
+                              tooltip="From Train 4DGS, or Cumuli Load Model for a run trained earlier "
+                                      "or by cumuli's own command line."),
+                IO.String.Input("windows", default="",
+                                tooltip="Windows to bake, e.g. '0' or '1-2'. Empty bakes every window. "
+                                        "Several are stitched into one archive and must be adjacent.",
+                                optional=True),
                 IO.String.Input("filename_prefix", default="cumuli/splat_4d",
                                 tooltip="Output name under ComfyUI's output folder.", optional=True),
-                IO.String.Input("mask_filter_root", default="",
-                                tooltip="Dataset directory. Enables the lifetime mask-consistency "
-                                        "filter, which drops silhouette-escaping splats. Slow but "
-                                        "worth it; empty disables it. With window_manifest set, any "
-                                        "non-empty value enables it using each window's OWN dataset "
-                                        "directory from the manifest instead of this path.",
-                                optional=True),
+                IO.Boolean.Input("mask_filter", default=True,
+                                 tooltip="Lifetime mask-consistency filter against each window's own "
+                                         "dataset: drops splats that escape the subject's silhouette "
+                                         "across their life. Slow but worth it."),
                 IO.Float.Input("sh_clamp", default=3.0, min=0.0, max=10.0, step=0.1,
                                tooltip="Attenuate higher SH bands above this bare DC. 1.5 is the "
                                        "upstream default and is too aggressive for explicit-SH "
@@ -1906,14 +1982,8 @@ class CumuliBakeSogst(IO.ComfyNode):
                 IO.Boolean.Input("emit_ply", default=True,
                                  tooltip="Also write the 4D interchange PLY beside the .sogst. It comes "
                                          "from the same arrays, and the Preview node reads it."),
-                IO.String.Input("window_manifest", default="",
-                                tooltip="From Train 4DGS's window_manifest output, when that run was "
-                                        "windowed. Non-empty bakes every window and stitches them into "
-                                        "one archive instead of baking 'checkpoint' alone; 'checkpoint'/"
-                                        "'duration_seconds'/'fps' are then ignored.", optional=True,
-                                advanced=True),
                 IO.Combo.Input("merge_mode", options=["fade", "hard"], default="fade",
-                               tooltip="How adjacent windows blend at a seam (window_manifest only). "
+                               tooltip="How adjacent windows blend at a seam, when several are baked. "
                                        "'fade' measured better than a hard cut on both PSNR and LPIPS."),
                 IO.Float.Input("merge_fade_seconds", default=0.35, min=0.0, max=5.0, step=0.01,
                                tooltip="Fade-zone width at each seam (merge_mode=fade only). 0.35s "
@@ -1931,25 +2001,39 @@ class CumuliBakeSogst(IO.ComfyNode):
     @classmethod
     def execute(
         cls,
-        checkpoint,
-        duration_seconds=0.0,
-        fps=24.0,
+        model,
+        windows="",
         filename_prefix="cumuli/splat_4d",
-        mask_filter_root="",
+        mask_filter=True,
         sh_clamp=3.0,
         filter_corrupted=False,
         shn_count=65536,
         segment_duration=0.1,
         emit_ply=True,
-        window_manifest="",
         merge_mode="fade",
         merge_fade_seconds=0.35,
     ) -> IO.NodeOutput:
         node_id = cls.hidden.unique_id
+        if model is None:
+            raise RuntimeError(
+                "Cumuli: no model connected. Link Train 4DGS (a dry run produces none), or Cumuli "
+                "Load Model for a run trained earlier."
+            )
         try:
             settings = load_settings()
         except SettingsError as exc:
             raise RuntimeError(f"Cumuli: {exc}") from None
+        try:
+            selected = model.select(windows)
+        except ModelError as exc:
+            raise RuntimeError(f"Cumuli: {exc}") from None
+        if mask_filter:
+            missing = [w.index for w in selected.windows if w.dataset_dir is None]
+            if missing:
+                raise RuntimeError(
+                    f"Cumuli: mask_filter needs each window's dataset, and windows {missing} have none "
+                    "on disk any more. Restore it, or turn mask_filter off."
+                )
 
         full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix or "cumuli/splat_4d", folder_paths.get_output_directory()
@@ -1957,156 +2041,95 @@ class CumuliBakeSogst(IO.ComfyNode):
         name = f"{filename}_{counter:05}_.sogst"
         target = Path(full_output_folder) / name
 
-        manifest_text = (window_manifest or "").strip()
-        if manifest_text:
-            written, ply, report = cls._bake_windowed(
-                node_id, settings, target, manifest_text, mask_filter_root, sh_clamp, filter_corrupted,
-                shn_count, segment_duration, emit_ply, merge_mode, merge_fade_seconds,
-            )
-            _send_text(node_id, f"{written.stat().st_size / (1024 * 1024):.1f} MB stitched sogst")
-            results = [{"filename": name, "subfolder": subfolder, "type": "output"}]
-            return IO.NodeOutput(str(written), ply, report, ui={"3d": results})
-
-        source = Path((checkpoint or "").strip()).expanduser()
-        if not source.is_file():
-            raise RuntimeError(f"Cumuli: checkpoint not found: {source}")
-        if float(duration_seconds) <= 0:
-            raise RuntimeError(
-                "Cumuli: duration_seconds must match the clip length the model trained with; "
-                "wire it from the Train node's duration output."
-            )
-
-        options = BakeOptions(
-            checkpoint=source,
-            output=target,
-            duration_seconds=float(duration_seconds),
-            fps=float(fps),
-            mask_filter_root=Path(mask_filter_root.strip()).expanduser() if mask_filter_root.strip() else None,
-            sh_clamp=float(sh_clamp),
-            filter_corrupted=bool(filter_corrupted),
-            shn_count=int(shn_count),
-            segment_duration=float(segment_duration),
-            emit_ply=target.with_suffix(".ply") if emit_ply else None,
-        )
-        progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
-
-        def on_progress(state) -> None:
-            progress.update_absolute(int(state.fraction * _PROGRESS_STEPS), _PROGRESS_STEPS)
-            _send_text(node_id, f"{state.fraction * 100:.0f}% {state.message}")
-
-        try:
-            written = bake(settings, options, on_progress=on_progress, should_cancel=_cancelled)
-        except SubprocessCancelled:
-            raise InterruptProcessingException() from None
-        except (TrainingError, SubprocessError) as exc:
-            raise RuntimeError(f"Cumuli: {exc}") from None
-
-        progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
-        megabytes = written.stat().st_size / (1024 * 1024)
-        report = "\n".join(
-            [
-                f"sogst: {written}",
-                f"size: {megabytes:.2f} MB",
-                f"clip: 0.000 .. {options.duration_seconds:.3f}s @ {options.fps:g} fps "
-                f"({megabytes / max(options.duration_seconds, 1e-6):.2f} MB/s)",
-                f"mask filter: {options.mask_filter_root or 'disabled'}",
-            ]
-        )
-        _send_text(node_id, f"{megabytes:.1f} MB sogst")
-        results = [{"filename": name, "subfolder": subfolder, "type": "output"}]
-        ply = str(options.emit_ply) if options.emit_ply and options.emit_ply.is_file() else ""
-        if ply:
-            report += f"\ninterchange ply: {ply}"
-        return IO.NodeOutput(str(written), ply, report, ui={"3d": results})
-
-    @classmethod
-    def _bake_windowed(
-        cls, node_id, settings, target, manifest_text, mask_filter_root, sh_clamp, filter_corrupted,
-        shn_count, segment_duration, emit_ply, merge_mode, merge_fade_seconds,
-    ) -> tuple[Path, str, str]:
-        """Bake every window's checkpoint, then stitch them into ``target``."""
-
-        try:
-            entries = json.loads(manifest_text)
-        except ValueError as exc:
-            raise RuntimeError(f"Cumuli: window_manifest is not valid JSON: {exc}") from None
-        if not isinstance(entries, list) or len(entries) < 2:
-            raise RuntimeError("Cumuli: window_manifest must be a JSON list of at least two windows.")
-
-        windows_dir = target.parent / f"{target.stem}.windows"
-        windows_dir.mkdir(parents=True, exist_ok=True)
-        progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
-        total_steps = len(entries) + 1  # the last step is the merge itself
-        fractions = [0.0] * len(entries)
-        filter_enabled = bool(mask_filter_root.strip())
-
-        segments: list[tuple[Path, float]] = []
-        for i, entry in enumerate(entries):
-            index = int(entry.get("index", i))
-            window_checkpoint = Path(entry["checkpoint"]).expanduser()
-            if not window_checkpoint.is_file():
-                raise RuntimeError(f"Cumuli: window {index} checkpoint not found: {window_checkpoint}")
-            window_dataset = entry.get("dataset_dir") or ""
-            window_options = BakeOptions(
-                checkpoint=window_checkpoint,
-                output=windows_dir / f"win_{index:02d}.sogst",
-                duration_seconds=float(entry["duration_seconds"]),
-                fps=float(entry["fps"]),
-                mask_filter_root=Path(window_dataset).expanduser() if filter_enabled and window_dataset else None,
+        def options_for(window, output, ply):
+            return BakeOptions(
+                checkpoint=window.checkpoint,
+                output=output,
+                duration_seconds=window.duration_seconds,
+                fps=selected.fps,
+                mask_filter_root=window.dataset_dir if mask_filter else None,
                 sh_clamp=float(sh_clamp),
                 filter_corrupted=bool(filter_corrupted),
                 shn_count=int(shn_count),
                 segment_duration=float(segment_duration),
-                # The interchange PLY represents the MERGED result, not one window.
-                emit_ply=None,
+                emit_ply=ply,
             )
 
-            def on_progress(state, i=i, index=index) -> None:
+        progress = ProgressBar(_PROGRESS_STEPS, node_id=node_id)
+        count = len(selected.windows)
+        total_steps = count + (1 if count > 1 else 0)  # a stitch is the last step
+        fractions = [0.0] * count
+        baked: list[tuple[Path, float]] = []
+        for i, window in enumerate(selected.windows):
+            if count == 1:
+                output, ply = target, (target.with_suffix(".ply") if emit_ply else None)
+            else:
+                # The interchange PLY represents the MERGED result, not one window.
+                output, ply = target.parent / f"{target.stem}.windows" / f"win_{window.index:02d}.sogst", None
+                output.parent.mkdir(parents=True, exist_ok=True)
+
+            def on_progress(state, i=i, window=window) -> None:
                 fractions[i] = state.fraction
                 progress.update_absolute(int(sum(fractions) / total_steps * _PROGRESS_STEPS), _PROGRESS_STEPS)
-                _send_text(node_id, f"baking window {index} ({i + 1}/{len(entries)}): "
-                                    f"{state.fraction * 100:.0f}% {state.message}")
+                prefix = f"baking window {window.index} ({i + 1}/{count}): " if count > 1 else ""
+                _send_text(node_id, f"{prefix}{state.fraction * 100:.0f}% {state.message}")
 
             try:
-                written = bake(settings, window_options, on_progress=on_progress, should_cancel=_cancelled)
+                written = bake(settings, options_for(window, output, ply), on_progress=on_progress,
+                               should_cancel=_cancelled)
             except SubprocessCancelled:
                 raise InterruptProcessingException() from None
             except (TrainingError, SubprocessError) as exc:
-                raise RuntimeError(f"Cumuli: window {index} bake: {exc}") from None
-            segments.append((written, float(entry["offset_seconds"])))
+                label = f"window {window.index} bake: " if count > 1 else ""
+                raise RuntimeError(f"Cumuli: {label}{exc}") from None
+            # Rebased so the archive starts at 0 whichever windows were picked.
+            baked.append((written, window.offset_seconds - selected.windows[0].offset_seconds))
 
-        _send_text(node_id, "merging windows")
-        merge_options = MergeOptions(
-            segments=segments, output=target, mode=merge_mode, fade_seconds=float(merge_fade_seconds)
-        )
-        try:
-            written = merge_windows(settings, merge_options, should_cancel=_cancelled)
-        except SubprocessCancelled:
-            raise InterruptProcessingException() from None
-        except TrainingError as exc:
-            raise RuntimeError(f"Cumuli: {exc}") from None
-        progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
-
-        ply = ""
-        if emit_ply:
+        if count > 1:
+            _send_text(node_id, "merging windows")
             try:
-                ply = str(unpack_sogst_to_ply(settings, written, target.with_suffix(".ply")))
+                written = merge_windows(
+                    settings,
+                    MergeOptions(segments=baked, output=target, mode=merge_mode,
+                                 fade_seconds=float(merge_fade_seconds)),
+                    should_cancel=_cancelled,
+                )
+            except SubprocessCancelled:
+                raise InterruptProcessingException() from None
             except TrainingError as exc:
                 raise RuntimeError(f"Cumuli: {exc}") from None
+        ply = ""
+        if emit_ply:
+            if count > 1:
+                try:
+                    ply = str(unpack_sogst_to_ply(settings, written, target.with_suffix(".ply")))
+                except TrainingError as exc:
+                    raise RuntimeError(f"Cumuli: {exc}") from None
+            elif target.with_suffix(".ply").is_file():
+                ply = str(target.with_suffix(".ply"))
+        progress.update_absolute(_PROGRESS_STEPS, _PROGRESS_STEPS)
 
         megabytes = written.stat().st_size / (1024 * 1024)
-        total_duration = max(float(e["offset_seconds"]) + float(e["duration_seconds"]) for e in entries)
-        report_lines = [
+        duration = selected.duration_seconds
+        first, last = selected.windows[0], selected.windows[-1]
+        source = f"{first.offset_seconds:.3f} .. {last.offset_seconds + last.duration_seconds:.3f}s"
+        lines = [
             f"sogst: {written}",
             f"size: {megabytes:.2f} MB",
-            f"windows: {len(entries)}, merge mode {merge_mode}"
-            + (f" (fade {merge_fade_seconds:g}s)" if merge_mode == "fade" else ""),
-            f"clip: 0.000 .. {total_duration:.3f}s ({megabytes / max(total_duration, 1e-6):.2f} MB/s)",
-            f"mask filter: {'enabled, per-window dataset' if filter_enabled else 'disabled'}",
+            f"model: {model.root}",
+            (f"windows: {first.index}..{last.index} of {len(model.windows)}, merge mode {merge_mode}"
+             + (f" (fade {merge_fade_seconds:g}s)" if merge_mode == "fade" else ""))
+            if count > 1 else
+            (f"window: {first.index} of {len(model.windows)}" if len(model.windows) > 1 else "window: whole clip"),
+            f"clip: 0.000 .. {duration:.3f}s @ {selected.fps:g} fps "
+            f"({megabytes / max(duration, 1e-6):.2f} MB/s), from the source clip's {source}",
+            f"mask filter: {'enabled, per-window dataset' if mask_filter else 'disabled'}",
         ]
         if ply:
-            report_lines.append(f"interchange ply: {ply}")
-        return written, ply, "\n".join(report_lines)
+            lines.append(f"interchange ply: {ply}")
+        _send_text(node_id, f"{megabytes:.1f} MB sogst")
+        results = [{"filename": name, "subfolder": subfolder, "type": "output"}]
+        return IO.NodeOutput(str(written), ply, "\n".join(lines), ui={"3d": results})
 
 
 class CumuliPreviewSogst(IO.ComfyNode):
@@ -2190,19 +2213,25 @@ class CumuliPreviewSogst(IO.ComfyNode):
 def _dataset_timeline(dataset: Path) -> tuple[float, float, int]:
     """Clip duration, frame rate and timestamp count, read from the dataset."""
 
-    path = dataset / "transforms_train.json"
-    if not path.is_file():
-        raise RuntimeError(f"Cumuli: {path} is missing; this is not a 4DGS dataset directory.")
     try:
-        frames = json.loads(path.read_text()).get("frames", [])
-    except ValueError as exc:
-        raise RuntimeError(f"Cumuli: {path} is not valid JSON: {exc}") from None
-    times = sorted({float(frame["time"]) for frame in frames if "time" in frame})
-    if len(times) < 2:
-        raise RuntimeError(f"Cumuli: {path} carries fewer than two distinct timestamps.")
-    duration = times[-1]
-    step = times[1] - times[0]
-    return duration, (1.0 / step if step > 0 else 24.0), len(times)
+        return dataset_timeline(dataset)
+    except ModelError as exc:
+        raise RuntimeError(f"Cumuli: {exc}") from None
+
+
+def _record_model(root: Path, dataset: Path, fps: float, windows) -> TrainedModel:
+    """Describe what Train just produced in cumuli's window-plan format, then
+    read it back: the model Train hands downstream is exactly the one Load
+    Model would open from disk, so the two can never disagree."""
+
+    plan = write_plan(
+        root, run=dataset, fps=fps,
+        windows=[(w.index, w.frame_start, w.frame_count, out_dir) for w, out_dir in windows],
+    )
+    try:
+        return TrainedModel.load(plan)
+    except ModelError as exc:
+        raise RuntimeError(f"Cumuli: {exc}") from None
 
 
 def _snap_background_hex(value: str) -> str:
@@ -2261,6 +2290,7 @@ class CumuliExtension(ComfyExtension):
             CumuliBuildDataset,
             CumuliLoadDataset,
             CumuliTrain4DGS,
+            CumuliLoadModel,
             CumuliBakeSogst,
             CumuliPreviewSogst,
         ]

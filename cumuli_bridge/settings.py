@@ -94,6 +94,7 @@ DEFAULTS: dict[str, object] = {
     "dataset_roots": [],
     "flipbook_roots": [],
     "ring_roots": [],
+    "model_roots": [],
     "trainer_script": "train_scratch.py",
     "subprocess_env": dict(DEFAULT_SUBPROCESS_ENV),
     "trainer_env": {},
@@ -218,6 +219,7 @@ class BridgeSettings:
     dataset_roots: tuple[str, ...] = ()
     flipbook_roots: tuple[str, ...] = ()
     ring_roots: tuple[str, ...] = ()
+    model_roots: tuple[str, ...] = ()
     trainer_root: Path = Path("~/Dev/github/cumuli/deps/OMG4").expanduser()
     cumuli_root: Path = Path("~/Dev/github/cumuli").expanduser()
     trainer_script: str = "train_scratch.py"
@@ -271,6 +273,7 @@ class BridgeSettings:
             dataset_roots=_roots(values.get("dataset_roots")),
             flipbook_roots=_roots(values.get("flipbook_roots")),
             ring_roots=_roots(values.get("ring_roots")),
+            model_roots=_roots(values.get("model_roots")),
             trainer_root=Path(str(values["trainer_root"])).expanduser(),
             cumuli_root=Path(str(values["cumuli_root"])).expanduser(),
             trainer_script=str(values["trainer_script"]),
