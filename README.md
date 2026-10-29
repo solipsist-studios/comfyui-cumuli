@@ -35,11 +35,10 @@ new enough to target it.
    `config.json` pointing at all of it. Expect it to take a while and around
    30 GB. The non-commercial Turbo LoRA is *not* downloaded unless you pass
    `--with-turbo` (see [Commercial use](#commercial-use)).
-3. **Download the SAM 3D Body weights**, which are gated behind Meta's SAM
-   License: accept it on Hugging Face (`Comfy-Org/sam-3d-body`), download
-   `sam_3d_body_dinov3_bf16.safetensors`, and put it in
-   `<ComfyUI>/models/detection/`. This needs a ComfyUI that ships the SAM 3D
-   Body nodes (0.34 or newer). Generate Ring uses it to estimate the body pose.
+3. **SAM 3D Body weights** are downloaded by the installer along with the
+   other models (`models/sam3d/` in the 4DAnyone checkout; Meta's SAM License
+   applies). This needs a ComfyUI that ships the SAM 3D Body nodes (0.34 or
+   newer). Generate Ring uses them to estimate the body pose.
 4. **Restart ComfyUI** if it was running — custom nodes load at startup.
 5. **Load the workflow** (`workflows/cumuli_video_to_sogst.json`) and drop your
    clip into the Load Video node.

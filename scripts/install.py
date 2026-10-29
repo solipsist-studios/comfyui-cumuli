@@ -298,7 +298,7 @@ CHECKOUTS = {
     "fdanyone_root": (
         "4DAnyone",
         "https://github.com/solipsist-studios/4DAnyone.git",
-        "6d5ec422ba4a4eef48f05c18ca33a9d4e7ca8d33",
+        "ab77dd81e0563881dee0e2289d4ae5c3b1635ad0",
     ),
     "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
     "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
@@ -407,7 +407,7 @@ def write_config(paths: dict[str, Path], work_root: str | None, *, dry_run: bool
 
 
 def fetch_models(paths: dict[str, Path], *, with_turbo: bool = False, dry_run: bool = False) -> None:
-    """Pull 4DAnyone's published weights using its own downloader.
+    """Pull 4DAnyone's published weights, and the SAM 3D Body weights, using its own downloader.
 
     The Turbo LoRA is left out unless asked for: it is licensed CC BY-NC-SA 4.0, so a
     default install must not put a non-commercial file where commercial use would find it.
@@ -423,26 +423,6 @@ def fetch_models(paths: dict[str, Path], *, with_turbo: bool = False, dry_run: b
             "ensure_models(model_dir=sys.argv[2], enable_turbo=sys.argv[3] == 'True')",
             str(root), str(root / "models"), str(bool(with_turbo))]
     _run(argv, cwd=root, dry_run=dry_run)
-
-
-#: The weights Generate Ring estimates the body pose with. They are gated behind
-#: Meta's SAM License on Hugging Face, so no installer may fetch them for you.
-SAM3D_WEIGHTS = "sam_3d_body_dinov3_bf16.safetensors"
-
-
-def missing_manual_assets(paths: dict[str, Path]) -> list[str]:
-    """What no installer may fetch: licence-gated downloads.
-
-    SAM 3D Body's weights live in ComfyUI's ``models/detection`` folder. With
-    ``--comfyui-root`` the check is exact; without it the installer cannot see
-    ComfyUI's model folders, so it names the file and says where it goes.
-    """
-
-    comfy = paths.get("comfyui_root")
-    if comfy is None:
-        return [f"ComfyUI/models/detection/{SAM3D_WEIGHTS}"]
-    target = Path(comfy) / "models" / "detection" / SAM3D_WEIGHTS
-    return [] if target.is_file() else [str(target)]
 
 
 # -- steps -----------------------------------------------------------------
@@ -761,18 +741,9 @@ def main() -> int:
 
     LOGGER.info("done -- %s installed, torch untouched", ", ".join(selected))
 
-    # The one thing no installer may do for you.
-    manual = missing_manual_assets({**checkouts, **({"comfyui_root": args.comfyui_root} if args.comfyui_root else {})})
-    if manual:
-        LOGGER.info("")
-        LOGGER.info("ONE STEP LEFT -- the SAM 3D Body weights are gated behind Meta's SAM License and")
-        LOGGER.info("cannot be downloaded automatically. Generate Ring estimates the body pose with them.")
-        LOGGER.info("  1. accept the license and download %s", SAM3D_WEIGHTS)
-        LOGGER.info("     (Comfy-Org/sam-3d-body on Hugging Face)")
-        LOGGER.info("  2. place it at:")
-        for path in manual:
-            LOGGER.info("       %s", path)
-        LOGGER.info("  Needs a ComfyUI that ships the SAM 3D Body nodes (0.34 or newer).")
+    LOGGER.info("")
+    LOGGER.info("The SAM 3D Body weights are downloaded with 4DAnyone's models (Meta's SAM License applies).")
+    LOGGER.info("Generate Ring needs a ComfyUI that ships the SAM 3D Body nodes (0.34 or newer).")
     LOGGER.info("")
     LOGGER.info("Restart ComfyUI to pick up the nodes.")
     return 0

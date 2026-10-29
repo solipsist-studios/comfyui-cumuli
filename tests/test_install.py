@@ -121,22 +121,6 @@ def test_only_real_drift_fails_the_run(before, after, expected):
     assert install.compare_pinned(before, after) == expected
 
 
-def test_the_sam3d_weights_are_reported_missing_until_they_are_placed(tmp_path):
-    """The one asset no installer may fetch (Meta's gated SAM License), so it is named explicitly."""
-
-    comfy = tmp_path / "ComfyUI"
-    weights = comfy / "models" / "detection" / install.SAM3D_WEIGHTS
-    assert install.missing_manual_assets({"comfyui_root": comfy}) == [str(weights)]
-    weights.parent.mkdir(parents=True)
-    weights.write_text("")
-    assert install.missing_manual_assets({"comfyui_root": comfy}) == []
-
-
-def test_without_a_comfyui_root_the_weights_are_named_not_checked():
-    (message,) = install.missing_manual_assets({})
-    assert message == f"ComfyUI/models/detection/{install.SAM3D_WEIGHTS}"
-
-
 def test_neither_smplx_nor_ultralytics_is_installed_or_guarded():
     """GVHMR's dependencies are gone; reintroducing them would bring back their licences."""
 
