@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// Required Notice: Copyright 2026 Solipsist Studios Inc. (https://solipsist.studio)
 // Starts the pinned Rerun web viewer on one recording. Served by the pack's own route, next to
 // the viewer files, so it needs no cross-origin access and no inline script (the page's
 // Content-Security-Policy does not allow either).

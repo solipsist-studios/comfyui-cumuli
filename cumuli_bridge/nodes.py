@@ -370,10 +370,10 @@ class CumuliGenerateRing(IO.ComfyNode):
                                tooltip=device_tooltip, advanced=True),
                 IO.String.Input("prompt", default="\u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c",
                                 tooltip="The prompt the ring is generated with. The default is 4DAnyone's own "
-                                        "('the person in the video is performing an action'). Put LoRA trigger "
-                                        "words here (mixing with it is fine, e.g. "
-                                        "'rin_karasuba, \u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c'). "
-                                        "Empty keeps the model's stock prompt, which is the same text."),
+                                        "('\u89c6\u9891\u4e2d\u7684\u4eba\u5728\u505a\u52a8\u4f5c', 'the person in "
+                                        "the video is performing an action'). If you use an identity LoRA, put its "
+                                        "trigger words in front of it. Empty keeps the model's stock prompt, which "
+                                        "is the same text."),
                 IO.Float.Input("min_free_vram_gb", default=0.0, min=0.0, max=200.0, step=0.5,
                                tooltip="Refuse to start below this much free VRAM. 0 uses the bridge config "
                                        "value (set that to 0 to skip the check).",

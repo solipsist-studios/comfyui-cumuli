@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// Required Notice: Copyright 2026 Solipsist Studios Inc. (https://solipsist.studio)
 // Puts the Rerun viewer inside the "Cumuli Preview Ring (Rerun)" node.
 //
 // The node writes a recording and returns a token for it; this adds an <iframe> to the node that
