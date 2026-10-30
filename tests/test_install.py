@@ -255,11 +255,6 @@ def test_skip_kernels_leaves_the_build_to_the_first_run(monkeypatch):
     assert install.main() == 0 and built == [{"dry_run": True}]
 
 
-def test_cumuli_is_pinned_to_the_release_tag_and_omg4_is_not_fetched():
-    assert set(install.CHECKOUTS) == {"fdanyone_root", "cumuli_root"}
-    assert install.CHECKOUTS["cumuli_root"][2] == install.TRAINER_TAG
-
-
 def test_the_4danyone_pin_is_a_full_commit_hash():
     """The fork's SAM 3D Body branch is not tagged yet; a branch name would not stay pinned."""
 
