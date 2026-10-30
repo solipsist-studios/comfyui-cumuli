@@ -104,7 +104,7 @@ commercial use, subject to the conditions in the table:
 | Ring generation | 4DAnyone and the Wan2.2 base model are Apache-2.0. **`enable_turbo` is off by default**: the Turbo adapter is CC BY-NC-SA 4.0. Leave it off for commercial use. |
 | Masks (BiRefNet) | MIT. |
 | Real-capture rig solve | `feature_type` defaults to `aliked` (BSD). `superpoint`'s weights are non-commercial research use only. |
-| 4DGS training (cumuli trainer) | Solipsist Studios' own code, under the same PolyForm-Noncommercial licence as this pack, so commercial use is through the commercial licence. It renders with gsplat (Apache-2.0), installed unmodified. The earlier OMG4 trainer, and with it Inria's non-commercial rasterizer, is no longer used. Patents were not checked. |
+| 4DGS training (cumuli trainer) | Solipsist Studios' own code, under the same PolyForm-Noncommercial licence as this pack, so commercial use is through the commercial licence. It renders with gsplat (Apache-2.0), installed unmodified. Patents were not checked. |
 
 See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md). This is a summary
 of licence texts, not legal advice.

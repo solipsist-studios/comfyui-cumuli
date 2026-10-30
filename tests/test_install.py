@@ -248,8 +248,7 @@ def test_skip_kernels_leaves_the_build_to_the_first_run(monkeypatch):
     monkeypatch.setattr(install, "check_interpreter", lambda: None)
     monkeypatch.setattr(install, "snapshot_pinned", lambda: {})
     monkeypatch.setattr(install, "verify", lambda *a, **k: [])
-    monkeypatch.setattr(install, "missing_manual_assets", lambda paths: [])
-    base = ["install.py", "--groups", "trainer", "--no-fetch", "--no-models", "--dry-run"]
+    base =["install.py", "--groups", "trainer", "--no-fetch", "--no-models", "--dry-run"]
     monkeypatch.setattr(sys, "argv", base + ["--skip-kernels"])
     assert install.main() == 0 and built == []
     monkeypatch.setattr(sys, "argv", base)
