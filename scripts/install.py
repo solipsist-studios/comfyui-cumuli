@@ -298,7 +298,7 @@ CHECKOUTS = {
     "fdanyone_root": (
         "4DAnyone",
         "https://github.com/solipsist-studios/4DAnyone.git",
-        "ab77dd81e0563881dee0e2289d4ae5c3b1635ad0",
+        "1606c0290c1bd8165d35cbe721df90126eba2781",
     ),
     "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
     "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
