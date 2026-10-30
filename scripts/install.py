@@ -83,12 +83,14 @@ LIGHTGLUE_PIN = (
 #: this list holding still across the whole run.
 PINNED = ("torch", "numpy", "transformers", "timm")
 
-#: The trainer's release. gsplat is pinned exactly: its kernels are built against the installed
-#: torch, and this is the version the trainer was measured with.
+#: gsplat is pinned exactly: its kernels are built against the installed torch, and this is the
+#: version the trainer was measured with.
 GSPLAT_VERSION = "1.5.3"
-TRAINER_TAG = "v0.1.0"
-CUMULI_CORE_PIN = f"cumuli-core @ git+https://github.com/solipsist-studios/cumuli-core.git@{TRAINER_TAG}"
-CUMULI_TRAINER_PIN = f"cumuli-trainer @ git+https://github.com/solipsist-studios/cumuli-trainer.git@{TRAINER_TAG}"
+#: The release every solipsist-studios repository this pack installs is tagged with: 4DAnyone,
+#: cumuli, cumuli-core and cumuli-trainer.
+RELEASE_TAG = "v0.1.0"
+CUMULI_CORE_PIN = f"cumuli-core @ git+https://github.com/solipsist-studios/cumuli-core.git@{RELEASE_TAG}"
+CUMULI_TRAINER_PIN = f"cumuli-trainer @ git+https://github.com/solipsist-studios/cumuli-trainer.git@{RELEASE_TAG}"
 
 
 class InstallError(RuntimeError):
@@ -220,7 +222,7 @@ def build_groups() -> dict[str, Group]:
         ),
         "trainer": Group(
             name="trainer",
-            summary=f"the 4DGS trainer: gsplat {GSPLAT_VERSION}, cumuli-core and cumuli-trainer {TRAINER_TAG}",
+            summary=f"the 4DGS trainer: gsplat {GSPLAT_VERSION}, cumuli-core and cumuli-trainer {RELEASE_TAG}",
             # --no-deps: gsplat's and the trainer's requirements are all in ComfyUI's environment
             # already, and a plain install is how torch gets replaced under it.
             no_deps=True,
@@ -243,17 +245,13 @@ def build_groups() -> dict[str, Group]:
 #: shipped today installs the same code next year, and so one checkout can move
 #: without dragging the other. ``--ref`` overrides both at once. A ref is a
 #: tag, a branch, or a full 40-character commit hash.
-#:
-#: 4DAnyone is pinned to a commit of the fork's ``sam3d-pose`` branch: the first
-#: version with SAM 3D Body pose in place of GVHMR and SMPL-X, and upstream's newer
-#: command line. Move it to a tag once that branch is merged and released.
 CHECKOUTS = {
     "fdanyone_root": (
         "4DAnyone",
         "https://github.com/solipsist-studios/4DAnyone.git",
-        "1606c0290c1bd8165d35cbe721df90126eba2781",
+        RELEASE_TAG,
     ),
-    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", TRAINER_TAG),
+    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", RELEASE_TAG),
 }
 
 CONFIG_FILE = PACKAGE_ROOT / "config.json"

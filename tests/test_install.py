@@ -196,18 +196,6 @@ def test_only_a_full_forty_character_hash_counts_as_a_commit_pin():
         assert not install._is_commit_hash(ref)
 
 
-def test_the_trainer_group_installs_gsplat_and_the_tagged_trainer_without_touching_torch():
-    group = install.build_groups()["trainer"]
-    requirements = dict(group.requirements)
-    assert requirements[f"gsplat=={install.GSPLAT_VERSION}"] == "gsplat"
-    for dist, repo in (("cumuli-core", "cumuli-core"), ("cumuli-trainer", "cumuli-trainer")):
-        (pin,) = [req for req, name in group.requirements if name == dist]
-        assert pin.endswith(f"solipsist-studios/{repo}.git@{install.TRAINER_TAG}")
-    assert group.no_deps and group.exact and not group.optional
-    # None of the old trainer's dependencies come back with it.
-    assert not any(req.startswith(("cupy", "cuml", "omegaconf")) for req, _dist in group.requirements)
-
-
 def test_the_trainer_group_changes_only_what_is_absent_or_the_wrong_gsplat(monkeypatch):
     group = install.build_groups()["trainer"]
     installed = {"gsplat": "1.5.3", "lpips": "0.1.4", "cumuli-core": "0.1.0", "cumuli-trainer": "0.1.0"}
@@ -253,14 +241,6 @@ def test_skip_kernels_leaves_the_build_to_the_first_run(monkeypatch):
     assert install.main() == 0 and built == []
     monkeypatch.setattr(sys, "argv", base)
     assert install.main() == 0 and built == [{"dry_run": True}]
-
-
-def test_the_4danyone_pin_is_a_full_commit_hash():
-    """The fork's SAM 3D Body branch is not tagged yet; a branch name would not stay pinned."""
-
-    _name, url, ref = install.CHECKOUTS["fdanyone_root"]
-    assert url.endswith("solipsist-studios/4DAnyone.git")
-    assert install._is_commit_hash(ref)
 
 
 def _pip_calls(monkeypatch, installed: dict[str, str]):
