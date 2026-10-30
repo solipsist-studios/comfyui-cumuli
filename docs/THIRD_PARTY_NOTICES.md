@@ -60,6 +60,7 @@ SOFTWARE.
 | `diff-gaussian-rasterization`, `simple-knn` (Inria) | Trainer CUDA extensions | Inria/MPII non-commercial research licence (**read**) | **No** |
 | `pointops2` | Trainer CUDA op | No licence or header in the local copy; likely MIT upstream | **Unverified** |
 | GVHMR, SMPL-X, ultralytics | Former pose path (removed) | Research-only; non-commercial; AGPL-3.0 | Not used by this pack any more |
+| Rerun web viewer (`@rerun-io/web-viewer` 0.37.1) and `rerun-sdk` | Optional ring viewer node: the viewer's JS/WASM is fetched at install time, not shipped here | MIT, with Apache-2.0 also listed (**read**: the package's `package.json` and registry metadata) | Yes. The viewer's own requests to fonts, GitHub and telemetry are blocked by the page's Content-Security-Policy, not by a viewer setting. |
 | ComfyUI | Host process | GPL-3.0 (**read**) | The pack imports `comfy.*`; how that sits with a non-GPL licence is **unverified**, ask counsel |
 
 ### SAM 3D Body: conditions that matter

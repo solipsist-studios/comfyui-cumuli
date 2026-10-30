@@ -6,6 +6,9 @@ __pycache__/
 # Local machine configuration; config.example.json is the template.
 config.json
 
+# The Rerun web viewer files the installer fetches (about 50 MB per version).
+viewer_assets/
+
 # ComfyUI writes these next to a loaded workflow.
 *.json.bak
 
