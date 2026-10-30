@@ -22,6 +22,10 @@ class InsufficientVRAM(RuntimeError):
     """Raised when the GPU cannot host the run even after unloading."""
 
 
+class NoCudaDevice(RuntimeError):
+    """Raised when the GPU a stage was asked to use is not there."""
+
+
 def _device_index(device: str) -> int:
     if ":" in device:
         try:
@@ -47,6 +51,40 @@ def release_comfy_vram() -> None:
         LOGGER.debug("cleanup_models() unavailable", exc_info=True)
     gc.collect()
     mm.soft_empty_cache(force=True)
+
+
+def check_device(device: str) -> None:
+    """Stop now, with what to do, if the requested GPU does not exist.
+
+    Without this a machine with no CUDA device sails through ``require_free_vram`` (an unknown size
+    counts as "nothing to check") and fails much later: the pose stage would try the model on the
+    CPU and only then would the generator refuse to start. The pack's rule is to fail before the
+    expensive stage, so it is checked first.
+    """
+
+    try:
+        import torch
+
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except ImportError:
+        count = 0
+    if count == 0:
+        raise NoCudaDevice(
+            "No CUDA device is available. This stage runs a multi-billion-parameter model and needs an NVIDIA "
+            "GPU with about 30 GB of memory; ComfyUI reported none. Check the NVIDIA driver, or generate the "
+            "ring on a machine with a GPU and bring it here with Load Ring."
+        )
+    text = (device or "").strip()
+    if ":" in text:
+        try:
+            index = int(text.rsplit(":", 1)[1])
+        except ValueError:
+            return  # a malformed name is reported by the caller that parses it
+        if not 0 <= index < count:
+            raise NoCudaDevice(
+                f"{device} does not exist: this machine has {count} CUDA device(s), cuda:0 to cuda:{count - 1}. "
+                "Pick one from the device dropdown."
+            )
 
 
 def free_bytes(device: str = "cuda:0") -> tuple[int, int]:
@@ -81,7 +119,7 @@ def require_free_vram(device: str, minimum_gb: float) -> tuple[float, float]:
     if total_gb + 0.5 < minimum_gb:
         raise InsufficientVRAM(
             f"{device} has {total_gb:.1f} GB of memory in total but this configuration needs about "
-            f"{minimum_gb:.1f} GB. Lower views_per_group, disable RCP, or lower min_free_vram_gb "
+            f"{minimum_gb:.1f} GB. Disable RCP, or lower min_free_vram_gb "
             "in the bridge config if you know the run fits."
         )
     if free_gb < minimum_gb:
