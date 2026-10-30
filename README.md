@@ -29,8 +29,7 @@ new enough to target it.
    `<ComfyUI>/custom_nodes/comfyui-cumuli/`.
 2. **Run the installer** in that folder — double-click `install.bat` on Windows,
    or `./install.sh` on Linux. It clones the two checkouts it drives at
-   pinned versions (4DAnyone at a pinned commit of our fork's SAM 3D Body
-   branch, cumuli `v0.1.0`), installs the Python dependencies (the trainer's
+   pinned versions (4DAnyone and cumuli, both `v0.1.0`), installs the Python dependencies (the trainer's
    gsplat and cumuli packages included) into ComfyUI's own environment,
    downloads the model weights, and writes
    `config.json` pointing at all of it. Expect it to take a while and around
