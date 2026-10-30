@@ -1,33 +1,27 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Required Notice: Copyright 2026 Solipsist Studios Inc. (https://solipsist.studio)
-"""Drive the rotor 4DGS trainer and the ``.sogst`` bake.
+"""Drive the cumuli 4DGS trainer and the ``.sogst`` bake.
 
 Both run as child processes of *this* interpreter (``sys.executable``), not of
 another environment. The reasons are the same ones that keep ring generation
 out-of-process:
 
-* the trainer's renderer JIT-compiles a CUDA extension on first import and then
-  owns the device for tens of minutes, and
+* the trainer's renderer JIT-compiles a CUDA extension on first use and then
+  owns the device for the length of the run, and
 * a segfault in a CUDA extension should not take the ComfyUI server with it.
 
-The trainer config is generated from cumuli's own
-``configs/gs4d_pretrain_template.yaml`` by ``str.format_map``, exactly as
-``run_unified_pipeline.py:stage_train4d`` does, so a run started here and a run
-started by the orchestrator produce the same config. Resume semantics are
-preserved too; caching decisions belong to the node's input fingerprints.
-
-Two upstream details this module works around, both verified by reading the
-trainer:
-
-* ``train_scratch.py`` imports ``scene``/``gaussian_renderer``/``utils`` as
-  top-level packages, so the child must run with ``cwd`` at the trainer repo.
-* ``recursive_merge`` asserts every YAML key exists as a parser attribute, so
-  the generated config must stay a strict subset of the template's keys.
+The trainer is the installed ``cumuli_trainer`` package, started as
+``python -m cumuli_trainer --config <run>/gs4d_config.yaml``. The config is
+JSON (valid YAML) and carries only keys the trainer knows: it rejects unknown
+ones, so a typo cannot be silently ignored. Caching decisions belong to the
+node's input fingerprints.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.util
+import json
 import logging
 import os
 import re
@@ -36,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import buildenv
 from .process import CommandResult, SubprocessCancelled, run_streaming
 from .settings import BridgeSettings, SettingsError
 from .vram import free_bytes, require_free_vram
@@ -45,6 +40,8 @@ LOGGER = logging.getLogger("comfyui-cumuli")
 CONFIG_NAME = "gs4d_config.yaml"
 MODEL_DIRNAME = "train4d_output"
 SOGST_NAME = "splat_4d.sogst"
+#: The trainer's output: the 4D interchange PLY the bake reads.
+PLY_NAME = "splat_4d.ply"
 
 #: ``Training progress:  33%|###   | 10000/30000 [12:34<25:08, 13.3it/s, Loss=…, PSNR=…]``
 _TRAIN_BAR = re.compile(r"Training progress:\s*\d{1,3}%\|.*?\|\s*(\d+)\s*/\s*(\d+)")
@@ -144,38 +141,39 @@ class BakeProgress:
 # --------------------------------------------------------------------------
 @dataclass
 class TrainOptions:
-    """The knobs cumuli's own train4d stage exposes, with its defaults."""
+    """The trainer's knobs, named as the Train 4DGS widgets name them, with the
+    trainer's own defaults. ``write_config`` says which config key each becomes."""
 
     out_dir: Path
     dataset_dir: Path
     duration_seconds: float
     fps: float = 24.0
     iterations: int = 30000
-    num_pts: int = 100000
+    #: ``representation.max_init_points``: a random subset of points3d.ply to
+    #: start from. 0 starts from all of it.
+    num_pts: int = 0
+    #: ``cameras_per_step``: cameras rendered per step, all at one instant.
     batch_size: int = 2
+    #: ``strategy.refine_stop``: the step after which Gaussians are no longer
+    #: relocated or added.
     densify_until_iter: int = 25000
-    densify_until_num_points: int = 3000000
+    #: ``strategy.cap_max``: the most Gaussians the strategy will grow to.
+    densify_until_num_points: int = 300000
     t_init_div: int = 100
-    sh_degree: int = 3
-    #: OMG4's photometric background is a hard binary (see ``write_config``);
-    #: it must match whatever ``DatasetOptions.background`` composited the
-    #: held-out GT against, or PSNR/LPIPS score against the wrong backdrop.
-    #: False (black) matches every run trained before this option existed.
+    sh_degree: int = 2
+    #: ``background``. It must match what ``DatasetOptions.background``
+    #: composited the held-out GT against, or PSNR/LPIPS score against the
+    #: wrong backdrop. False (black) is the trainer's default.
     white_background: bool = False
-    #: Charges rendered opacity wherever the per-view silhouette says
-    #: background, regardless of colour, so it prunes floaters of any shade
-    #: -- unlike matching the training background to the embed destination,
-    #: which only ever substitutes one floater colour for another (measured:
-    #: white background cut dark floaters 39.9%->11.1% but grew detached
-    #: white floaters 0.94%->3.53%). Needs the trainer fork's opacity-mask
-    #: patch (arguments/__init__.py's lambda_opa_mask + utils/data_utils.py
-    #: wiring gt_alpha_mask through the dataloader path); 0 disables and
-    #: matches every run trained before this option existed. 0.005 is the
-    #: measured production value: a metric-derived 0.002 left artifacts
-    #: attached to the subject's silhouette that automated floater metrics
-    #: cannot see (they merge into the subject's connected component) but a
-    #: viewer shows plainly.
+    #: ``losses.opacity_mask``: charges rendered opacity wherever the per-view
+    #: silhouette says background, regardless of colour, so it prunes floaters
+    #: of any shade -- unlike matching the training background to the embed
+    #: destination, which only substitutes one floater colour for another.
+    #: 0 disables.
     lambda_opa_mask: float = 0.005
+    #: ``export_min_contribution``: drop Gaussians whose largest contribution to
+    #: any training view is below this many pixels. 0 keeps them all.
+    export_min_contribution: float = 2.0
     trainer_config: Path | None = None
 
     @property
@@ -188,15 +186,22 @@ class TrainOptions:
 
     @property
     def checkpoint(self) -> Path:
-        return self.model_dir / f"chkpnt{self.iterations}.pth"
+        """What a finished run leaves behind: the PLY the bake reads."""
+        return self.model_dir / PLY_NAME
 
     def validate(self) -> None:
+        if self.export_min_contribution < 0:
+            raise TrainingError(f"export_min_contribution must not be negative, got {self.export_min_contribution}.")
         if self.iterations < 1:
             raise TrainingError(f"iterations must be positive, got {self.iterations}.")
         if self.duration_seconds <= 0:
             raise TrainingError(f"duration_seconds must be positive, got {self.duration_seconds}.")
         if self.batch_size < 1:
             raise TrainingError(f"batch_size must be at least 1, got {self.batch_size}.")
+        if self.num_pts < 0 or self.densify_until_num_points < 1 or self.densify_until_iter < 0:
+            raise TrainingError(
+                "num_pts (0 = all), densify_until_num_points (at least 1) and densify_until_iter must not be negative."
+            )
         if not (self.dataset_dir / "transforms_train.json").is_file():
             raise TrainingError(
                 f"{self.dataset_dir} has no transforms_train.json; build the dataset before training."
@@ -208,123 +213,86 @@ class TrainOptions:
             )
 
 
-def find_template(settings: BridgeSettings) -> Path:
-    """cumuli's trainer config template, next to its OMG4 submodule."""
+def check_trainer(settings: BridgeSettings) -> None:
+    """Fail before the GPU job if the trainer cannot be imported.
 
-    candidates = [
-        settings.trainer_root.parent.parent / "configs" / "gs4d_pretrain_template.yaml",
-        settings.trainer_root / "configs" / "gs4d_pretrain_template.yaml",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise TrainingError(
-        "Could not find gs4d_pretrain_template.yaml. Looked in: "
-        + ", ".join(str(c) for c in candidates)
-        + ". Point trainer_root at a checkout whose parent holds cumuli's configs/, or pass a "
-        "trainer_config explicitly."
-    )
+    Only checkable when the child will run in this interpreter; with
+    ``conda_env``/``python_exe`` set, the child's own import error is reported.
+    """
+
+    try:
+        settings.launcher()  # validates python_exe
+    except SettingsError as exc:
+        raise TrainingError(str(exc)) from None
+    if settings.runs_in_this_environment:
+        missing = [name for name in ("cumuli_trainer", "gsplat") if importlib.util.find_spec(name) is None]
+        if missing:
+            raise TrainingError(
+                f"The 4DGS trainer needs {' and '.join(missing)} in ComfyUI's environment, and "
+                f"{'it is' if len(missing) == 1 else 'they are'} not installed. Run ./install.sh "
+                "(its 'trainer' group installs them without touching torch)."
+            )
+
+
+def trainer_config(options: TrainOptions) -> dict:
+    """The trainer's config for these options. Each Train 4DGS widget becomes
+    one key: num_pts -> ``representation.max_init_points``, batch_size ->
+    ``cameras_per_step``, densify_until_iter -> ``strategy.refine_stop``,
+    densify_until_num_points -> ``strategy.cap_max``, white_background ->
+    ``background``, lambda_opa_mask -> ``losses.opacity_mask``."""
+
+    representation: dict = {"name": "spacetime"}
+    if options.num_pts > 0:
+        representation["max_init_points"] = options.num_pts
+    config = {
+        "source_path": str(options.dataset_dir.resolve()),
+        "model_path": str(options.model_dir.resolve()),
+        "time_duration": [0.0, round(options.duration_seconds, 6)],
+        "fps": options.fps,
+        "iterations": options.iterations,
+        "sh_degree": options.sh_degree,
+        "test_iterations": [options.iterations],
+        "save_iterations": [options.iterations],
+        "cameras_per_step": options.batch_size,
+        "background": "white" if options.white_background else "black",
+        "representation": representation,
+        "strategy": {
+            "name": "mcmc",
+            "refine_stop": options.densify_until_iter,
+            "cap_max": options.densify_until_num_points,
+        },
+        "losses": {"opacity_mask": options.lambda_opa_mask},
+        "export_min_contribution": options.export_min_contribution,
+    }
+    if options.t_init_div:
+        config["t_init_div"] = options.t_init_div
+    return config
 
 
 def write_config(settings: BridgeSettings, options: TrainOptions) -> Path:
-    """Fill cumuli's template. Kept as text substitution, as upstream does."""
+    """Write the trainer's config as JSON, which is valid YAML and cannot
+    misquote a path. A caller-supplied config is used as it is."""
 
     if options.trainer_config is not None:
         LOGGER.info("Using caller-supplied trainer config %s", options.trainer_config)
         return Path(options.trainer_config)
-    template = find_template(settings).read_text()
     options.out_dir.mkdir(parents=True, exist_ok=True)
-    options.config_path.write_text(
-        template.format_map(
-            {
-                "time_max": f"{options.duration_seconds:.6f}",
-                "num_pts": options.num_pts,
-                "batch_size": options.batch_size,
-                "source_path": str(options.dataset_dir.resolve()),
-                "model_path": str(options.model_dir.resolve()),
-                "iterations": options.iterations,
-                "densify_until_iter": options.densify_until_iter,
-                "densify_until_num_points": options.densify_until_num_points,
-            }
-        )
-    )
-    if options.sh_degree != 3:
-        # sh_degree 2 measured better than 3 on subject captures; the template
-        # hard-codes 3, so rewrite that one line rather than fork the template.
-        text = options.config_path.read_text().replace("sh_degree: 3", f"sh_degree: {options.sh_degree}")
-        options.config_path.write_text(text)
-    if options.white_background:
-        # Same pattern as sh_degree above: the template hard-codes
-        # `white_background: False` as literal text (not a `{}` slot), and
-        # OMG4's own bg_color is only ever [1,1,1] or [0,0,0] -- see
-        # scene/__init__.py and gaussian_renderer/__init__.py in the trainer
-        # checkout -- so there is no third value to plumb through here.
-        text = options.config_path.read_text().replace("white_background: False", "white_background: True")
-        options.config_path.write_text(text)
-    if options.lambda_opa_mask != 0.0:
-        # Not a `{}` template slot at all -- lambda_opa_mask doesn't exist in
-        # upstream's template, so insert it as a new sibling line next to
-        # lambda_dssim rather than replacing one, at the same OptimizationParams
-        # indentation.
-        text = options.config_path.read_text().replace(
-            "lambda_dssim: 0.2", f"lambda_dssim: 0.2\n    lambda_opa_mask: {options.lambda_opa_mask}"
-        )
-        options.config_path.write_text(text)
+    options.config_path.write_text(json.dumps(trainer_config(options), indent=2) + "\n")
     LOGGER.info("Wrote trainer config %s", options.config_path)
     return options.config_path
 
 
 def build_train_argv(settings: BridgeSettings, options: TrainOptions, config: Path) -> list[str]:
-    return list(settings.launcher()) + [
-        str(settings.trainer_entrypoint),
-        "--config",
-        str(config),
-        # Explicit iteration lists make the checkpoint filename deterministic.
-        "--test_iterations",
-        str(options.iterations),
-        "--save_iterations",
-        str(options.iterations),
-    ]
-
-
-def cuda_toolchain_env(base: Path = Path("/usr/local"), environ: dict | None = None) -> dict[str, str]:
-    """CUDA_HOME/PATH for torch's JIT extension builds.
-
-    The trainer compiles OMG4's *modified* rotor-4D rasterizer on first use
-    (``gaussian_renderer/diff_gaussian_rasterization.py`` calls
-    ``cpp_extension.load`` -- the pip-installable package is a different,
-    unmodified rasterizer, so the JIT is mandatory). torch falls back to
-    ``which nvcc`` when CUDA_HOME is unset, and on many distros that is a
-    stale apt CUDA that cannot target current GPUs. Prefer an explicit
-    CUDA_HOME; otherwise pick the newest ``<base>/cuda-*`` that has nvcc.
-    """
-
-    environ = os.environ if environ is None else environ
-    if environ.get("CUDA_HOME"):
-        return {}
-
-    def version_key(path: Path) -> list[int]:
-        return [int(part) for part in re.findall(r"\d+", path.name)]
-
-    for candidate in sorted(base.glob("cuda-*"), key=version_key, reverse=True):
-        if (candidate / "bin" / "nvcc").is_file():
-            return {
-                "CUDA_HOME": str(candidate),
-                "PATH": f"{candidate / 'bin'}:{environ.get('PATH', '')}",
-            }
-    return {}
+    return list(settings.launcher()) + ["-m", "cumuli_trainer", "--config", str(config)]
 
 
 def build_train_env(settings: BridgeSettings, options: TrainOptions) -> dict[str, str]:
     env = os.environ.copy()
     for name in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(name, None)
-    env.update(cuda_toolchain_env())
-    if options.t_init_div:
-        # Initial temporal sigma is sqrt(duration / div). Upstream's default of 5
-        # bakes several frames of motion smear into the starting sigma.
-        env["GS4D_T_INIT_DIV"] = str(options.t_init_div)
-    env.update(settings.trainer_env)
+    # gsplat builds its CUDA kernels on first use; the installer normally has already, and this
+    # makes a skipped or stale build work too, with no particular shell required.
+    env.update(buildenv.toolchain_env(env))
     return env
 
 
@@ -346,13 +314,11 @@ def train(
     on_progress: Callable[[TrainProgress], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> TrainOutcome:
-    """Train to ``options.iterations``, or skip if that checkpoint already exists."""
+    """Train to ``options.iterations``. Whether a finished run can be reused is
+    the node's call, from its input fingerprints."""
 
     options.validate()
-    try:
-        settings.validate_trainer()
-    except SettingsError as exc:
-        raise TrainingError(str(exc)) from None
+    check_trainer(settings)
 
     config = write_config(settings, options)
     argv = build_train_argv(settings, options, config)
@@ -365,7 +331,7 @@ def train(
 
     result = run_streaming(
         argv,
-        cwd=settings.trainer_root,  # the trainer imports scene/ utils/ as top-level packages
+        cwd=options.out_dir,  # an installed module: it needs no particular working directory
         env=build_train_env(settings, options),
         on_line=handle,
         should_cancel=should_cancel,
@@ -385,13 +351,11 @@ def train(
 
 @dataclass
 class BakeOptions:
+    #: The trainer's ``splat_4d.ply``. It carries its own clip times and frame
+    #: rate, so none are passed to the bake.
     checkpoint: Path
     output: Path
-    duration_seconds: float
-    fps: float = 24.0
     mask_filter_root: Path | None = None
-    sh_clamp: float = 3.0
-    filter_corrupted: bool = False
     shn_count: int = 65536
     segment_duration: float = 0.1
     webp_method: int = 4
@@ -399,6 +363,14 @@ class BakeOptions:
     #: arrays as the container, so the two cannot disagree, and it is what the
     #: preview node reads.
     emit_ply: Path | None = None
+    #: Bounds the coloured part of the view-dependent SH: removes the coloured
+    #: glints a sparse rig leaves on opaque splats.
+    sh_chroma_clamp: float = 0.02
+    #: Softening: blur every splat by this many pixels at the training cameras
+    #: (needs ``mask_filter_root``), and widen every splat's lifetime by this
+    #: many frames. 0 turns either off.
+    smooth_px: float = 0.5
+    smooth_frames: int = 2
 
 
 def find_bake_script(settings: BridgeSettings) -> Path:
@@ -414,20 +386,19 @@ def find_bake_script(settings: BridgeSettings) -> Path:
 
 def build_bake_argv(settings: BridgeSettings, options: BakeOptions) -> list[str]:
     script = find_bake_script(settings)
+    if options.smooth_px > 0 and options.mask_filter_root is None:
+        raise TrainingError(
+            "smooth_px needs the mask filter's dataset (the training cameras). Turn mask_filter on, "
+            "or set smooth_px to 0."
+        )
     argv = list(settings.launcher()) + [
         str(script),
         "--input",
         str(options.checkpoint),
         "--output",
         str(options.output),
-        "--time_min",
-        "0",
-        "--time_max",
-        f"{options.duration_seconds:.6f}",
-        "--fps",
-        str(options.fps),
-        "--sh_clamp",
-        str(options.sh_clamp),
+        "--sh_chroma_clamp",
+        str(options.sh_chroma_clamp),
         "--shn_count",
         str(options.shn_count),
         "--segment_duration",
@@ -435,10 +406,10 @@ def build_bake_argv(settings: BridgeSettings, options: BakeOptions) -> list[str]
         "--webp_method",
         str(options.webp_method),
     ]
-    if not options.filter_corrupted:
-        # The bad_color/garbage filters were calibrated for the legacy SVQ
-        # pipeline and delete healthy splats from an explicit-SH checkpoint.
-        argv.append("--no_filter_corrupted")
+    if options.smooth_px > 0:
+        argv += ["--smooth_px", str(options.smooth_px)]
+    if options.smooth_frames > 0:
+        argv += ["--smooth_frames", str(options.smooth_frames)]
     if options.mask_filter_root is not None:
         argv += ["--mask_filter_root", str(options.mask_filter_root)]
     if options.emit_ply is not None:
@@ -484,10 +455,10 @@ def bake(
     on_progress: Callable[[BakeProgress], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Path:
-    """Bake a trained checkpoint into a ``.sogst`` container."""
+    """Bake a trained PLY into a ``.sogst`` container."""
 
     if not options.checkpoint.is_file():
-        raise TrainingError(f"Checkpoint not found: {options.checkpoint}")
+        raise TrainingError(f"Trained PLY not found: {options.checkpoint}")
     options.output.parent.mkdir(parents=True, exist_ok=True)
     argv = build_bake_argv(settings, options)
     state = BakeProgress()

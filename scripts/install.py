@@ -19,7 +19,7 @@ Four groups, all installed by default (``--groups core,bake,sfm,trainer``):
   core     4DAnyone's runtime dependencies
   bake     the ``.sogst`` container writer
   sfm      the rig solve behind Solve Rig (hloc, pycolmap, lightglue)
-  trainer  the OMG4 rotor-4DGS trainer, including its CUDA extensions
+  trainer  the 4DGS trainer: gsplat, cumuli-core and cumuli-trainer
 
 Two hazards this script exists to defuse, both documented in the README and both
 silent when they happen by hand:
@@ -29,17 +29,21 @@ silent when they happen by hand:
   installs pass ``--no-deps``, and the versions of torch, numpy, transformers,
   and timm are recorded before and compared after: if anything moved,
   the run fails loudly instead of leaving a broken ComfyUI to discover later.
-* **Building the trainer's CUDA extensions against the wrong nvcc.**
-  ``/usr/bin/nvcc`` is often a distro CUDA too old to target the installed GPU.
-  The toolkit is auto-detected to match torch's own CUDA major version, and the
-  arch list comes from the GPU actually present.
+* **The trainer's CUDA kernels need a compiler that knows the GPU.** gsplat
+  compiles them on first use, which would otherwise be a surprise of several
+  minutes in the middle of a graph. The installer builds them once, up front, with
+  the toolchain found for it: the newest installed CUDA toolkit (``CUDA_HOME``
+  overrides; ``/usr/bin/nvcc`` is often a distro CUDA too old for the GPU) and, on
+  Windows, the Visual Studio C++ tools, located with ``vswhere``. No special shell is
+  needed. A failed or skipped (``--skip-kernels``) build is not fatal: Train 4DGS
+  finds the same toolchain and builds them on its first run instead.
 
 Examples
 --------
     scripts/install.py --dry-run           # print every command, change nothing
     scripts/install.py --groups sfm        # just the rig solve
     scripts/install.py --verify-only       # report what is present, install nothing
-    scripts/install.py --omg4 ~/src/OMG4 --cuda-home /usr/local/cuda-13.2
+    scripts/install.py --groups trainer    # just the trainer
 """
 
 from __future__ import annotations
@@ -60,7 +64,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from cumuli_bridge import viewer_assets  # noqa: E402 - needs PACKAGE_ROOT on the path; plain Python, no ComfyUI
+from cumuli_bridge import buildenv, viewer_assets  # noqa: E402 - need PACKAGE_ROOT on the path; plain Python, no ComfyUI
 
 LOGGER = logging.getLogger("cumuli-install")
 
@@ -75,13 +79,16 @@ LIGHTGLUE_PIN = (
     "@eb42fee2d71449efb0aa5c10549752b5d75384d8"
 )
 
-#: The three CUDA extensions OMG4 ships as source trees, pre-built here so the
-#: trainer never JIT-compiles mid-run. ABI-bound to torch: redo after a torch bump.
-TRAINER_EXTENSIONS = ("diff-gaussian-rasterization", "simple-knn", "pointops2")
-
 #: Packages whose version must not move. The additive-install promise is exactly
 #: this list holding still across the whole run.
 PINNED = ("torch", "numpy", "transformers", "timm")
+
+#: The trainer's release. gsplat is pinned exactly: its kernels are built against the installed
+#: torch, and this is the version the trainer was measured with.
+GSPLAT_VERSION = "1.5.3"
+TRAINER_TAG = "v0.1.0"
+CUMULI_CORE_PIN = f"cumuli-core @ git+https://github.com/solipsist-studios/cumuli-core.git@{TRAINER_TAG}"
+CUMULI_TRAINER_PIN = f"cumuli-trainer @ git+https://github.com/solipsist-studios/cumuli-trainer.git@{TRAINER_TAG}"
 
 
 class InstallError(RuntimeError):
@@ -160,85 +167,15 @@ def compare_pinned(before: dict[str, str | None], after: dict[str, str | None]) 
 
 
 # -- environment discovery -------------------------------------------------
-def torch_cuda_major() -> str | None:
-    """The CUDA major version torch was built against, e.g. ``13``."""
-
-    try:
-        import torch
-    except ImportError:
-        return None
-    version = getattr(torch.version, "cuda", None)
-    return version.split(".")[0] if version else None
-
-
-def gpu_arch_list() -> str | None:
-    """``TORCH_CUDA_ARCH_LIST`` for the GPU actually installed."""
-
-    smi = shutil.which("nvidia-smi")
-    if not smi:
-        return None
-    try:
-        out = subprocess.run(  # noqa: S603
-            [smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    caps = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    return caps[0] if caps else None
-
-
-def find_cuda_home(preferred_major: str | None) -> Path | None:
-    """An nvcc new enough for this GPU, preferring torch's own CUDA major.
-
-    ``/usr/bin/nvcc`` is deliberately last: a distro CUDA is frequently too old
-    to target a current card, and it is the default that silently produces
-    extensions the GPU cannot run.
-    """
-
-    explicit = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if explicit and (Path(explicit) / "bin" / _nvcc_name()).is_file():
-        return Path(explicit)
-
-    roots = sorted(Path("/usr/local").glob("cuda-*"), reverse=True)
-    if preferred_major:
-        matching = [r for r in roots if r.name.startswith(f"cuda-{preferred_major}")]
-        roots = matching + [r for r in roots if r not in matching]
-    for root in roots:
-        if (root / "bin" / _nvcc_name()).is_file():
-            return root
-
-    nvcc = shutil.which("nvcc")
-    return Path(nvcc).resolve().parent.parent if nvcc else None
-
-
-def _nvcc_name() -> str:
-    return "nvcc.exe" if platform.system() == "Windows" else "nvcc"
-
-
 def default_hloc_dir() -> Path:
     """Beside this checkout, so a clone lands next to the pack it belongs to."""
 
     return PACKAGE_ROOT.parent / "Hierarchical-Localization"
 
 
-def default_omg4() -> Path | None:
-    """Whatever the pack itself is configured to use, so the two agree."""
+def build_groups() -> dict[str, Group]:
+    """The dependency set."""
 
-    try:
-        from cumuli_bridge.settings import load_settings
-
-        return load_settings().trainer_root
-    except Exception:  # settings are optional here; the flag can supply it
-        return None
-
-
-def build_groups(cuda_major: str | None) -> dict[str, Group]:
-    """The dependency set, with the CUDA-versioned wheels matched to torch."""
-
-    # cupy and cuml ship one wheel per CUDA major. Picking the wrong one
-    # installs cleanly and fails at import, so follow torch rather than guess.
-    suffix = cuda_major or "13"
     return {
         "core": Group(
             name="core",
@@ -283,26 +220,28 @@ def build_groups(cuda_major: str | None) -> dict[str, Group]:
         ),
         "trainer": Group(
             name="trainer",
-            summary="the OMG4 rotor-4DGS trainer",
+            summary=f"the 4DGS trainer: gsplat {GSPLAT_VERSION}, cumuli-core and cumuli-trainer {TRAINER_TAG}",
+            # --no-deps: gsplat's and the trainer's requirements are all in ComfyUI's environment
+            # already, and a plain install is how torch gets replaced under it.
+            no_deps=True,
             requirements=[
-                (f"cupy-cuda{suffix}x", f"cupy-cuda{suffix}x"),
-                (f"cuml-cu{suffix}", f"cuml-cu{suffix}"),
-                ("omegaconf", "omegaconf"),
-                ("imagesize", "imagesize"),
+                (f"gsplat=={GSPLAT_VERSION}", "gsplat"),
+                ("lpips", "lpips"),
+                (CUMULI_CORE_PIN, "cumuli-core"),
+                (CUMULI_TRAINER_PIN, "cumuli-trainer"),
             ],
+            exact=True,
         ),
     }
 
 
 # -- checkouts -------------------------------------------------------------
-#: The three checkouts the pack drives. Cloned rather than bundled: OMG4's
-#: upstream carries no licence at all, and hloc's SuperGlue submodule is
-#: non-commercial research only, so the user fetches each from its own origin
-#: under its own terms. Shallow, and never recursive -- cumuli's other
-#: submodules belong to the wider pipeline, not to this pack.
+#: The two checkouts the pack drives. Cloned rather than bundled, so the user
+#: fetches each from its own origin under its own terms. Shallow, and never
+#: recursive -- cumuli's submodules belong to the wider pipeline, not to this pack.
 #: ``(directory, url, ref)``. The ref is pinned per repository so an archive
 #: shipped today installs the same code next year, and so one checkout can move
-#: without dragging the others. ``--ref`` overrides all three at once. A ref is a
+#: without dragging the other. ``--ref`` overrides both at once. A ref is a
 #: tag, a branch, or a full 40-character commit hash.
 #:
 #: 4DAnyone is pinned to a commit of the fork's ``sam3d-pose`` branch: the first
@@ -314,15 +253,14 @@ CHECKOUTS = {
         "https://github.com/solipsist-studios/4DAnyone.git",
         "1606c0290c1bd8165d35cbe721df90126eba2781",
     ),
-    "trainer_root": ("OMG4", "https://github.com/solipsist-studios/OMG4.git", "v0.0.2"),
-    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", "v0.0.2"),
+    "cumuli_root": ("cumuli", "https://github.com/solipsist-studios/cumuli.git", TRAINER_TAG),
 }
 
 CONFIG_FILE = PACKAGE_ROOT / "config.json"
 
 
 def fetch_checkouts(deps_dir: Path, *, ref: str | None = None, dry_run: bool = False) -> dict[str, Path]:
-    """Clone the three checkouts under ``deps_dir``, each at its pinned ref.
+    """Clone the checkouts under ``deps_dir``, each at its pinned ref.
 
     ``ref`` overrides every pin, for testing an unreleased branch.
     """
@@ -408,11 +346,10 @@ def write_config(paths: dict[str, Path], work_root: str | None, *, dry_run: bool
         except (OSError, ValueError):
             LOGGER.warning("  %s is not readable JSON; writing a fresh one", CONFIG_FILE)
     payload.update({key: str(path) for key, path in paths.items()})
-    # OMG4 is cloned standalone here, so trainer_root is the clone itself.
     if work_root:
         payload["work_root"] = work_root
     LOGGER.info("  writing %s", CONFIG_FILE)
-    for key in ("fdanyone_root", "trainer_root", "cumuli_root", "work_root"):
+    for key in ("fdanyone_root", "cumuli_root", "work_root"):
         if key in payload:
             LOGGER.info("    %-16s %s", key, payload[key])
     if dry_run:
@@ -493,6 +430,29 @@ def fetch_viewer_assets(*, dry_run: bool = False) -> None:
     LOGGER.info("  fetched  %-46s %s", "rerun web viewer files", directory)
 
 
+def prebuild_kernels(*, dry_run: bool) -> bool:
+    """Compile gsplat's CUDA kernels now, so the first Train 4DGS does not.
+
+    Returns whether it built. Failure is reported, not raised: the kernels are cached
+    where the trainer will look for them, and if they are missing then Train 4DGS builds
+    them itself with the same toolchain, so the install is still usable.
+    """
+
+    LOGGER.info("  building gsplat's CUDA kernels (a few minutes the first time; cached afterwards)")
+    env = buildenv.toolchain_env()
+    if "CUDA_HOME" in env:
+        LOGGER.info("    CUDA_HOME=%s", env["CUDA_HOME"])
+    try:
+        _run([sys.executable, "-c", buildenv.BUILD_SNIPPET], env=env, dry_run=dry_run)
+    except InstallError as exc:
+        LOGGER.warning("  the kernel build failed: %s", exc)
+        LOGGER.warning("  Everything else is installed. Train 4DGS will try again on its first run, with the same toolchain;")
+        LOGGER.warning("  if it fails there too, it needs a CUDA toolkit that knows your GPU%s.",
+                       " and Visual Studio's C++ build tools" if platform.system() == "Windows" else "")
+        return False
+    return True
+
+
 def install_hloc(hloc_dir: Path, *, force: bool, dry_run: bool) -> None:
     """Clone (with submodules), pin the commit, install editable."""
 
@@ -529,69 +489,6 @@ def install_hloc(hloc_dir: Path, *, force: bool, dry_run: bool) -> None:
     _run([sys.executable, "-m", "pip", "install", "--no-deps", "-e", str(hloc_dir)], dry_run=dry_run)
 
 
-def build_trainer_extensions(omg4: Path, cuda_home: Path | None, arch: str | None, *,
-                             force: bool, dry_run: bool) -> None:
-    """Pre-build OMG4's CUDA extensions so the trainer never compiles at run time."""
-
-    present = {
-        "diff-gaussian-rasterization": installed_version("diff_gaussian_rasterization"),
-        "simple-knn": installed_version("simple_knn"),
-        "pointops2": installed_version("pointops2"),
-    }
-    missing = [name for name in TRAINER_EXTENSIONS if present[name] is None]
-    for name in TRAINER_EXTENSIONS:
-        if present[name] and not force:
-            LOGGER.info("  present  %-46s %s", name, present[name])
-    if not missing and not force:
-        LOGGER.info("  nothing to build (pass --force to rebuild after a torch upgrade)")
-        return
-
-    if not omg4.is_dir():
-        raise InstallError(
-            f"OMG4 checkout not found at {omg4}. Pass --omg4 <path>, or set the "
-            "'trainer_root' key of the bridge config."
-        )
-    sources = [omg4 / name for name in (missing if not force else list(TRAINER_EXTENSIONS))]
-    absent = [s for s in sources if not s.is_dir()]
-    if absent:
-        raise InstallError(
-            f"{omg4} does not look like an OMG4 checkout; missing: "
-            + ", ".join(s.name for s in absent)
-        )
-
-    if cuda_home is None:
-        raise InstallError(
-            "No CUDA toolkit found. Install one and pass --cuda-home, or set CUDA_HOME. "
-            "It must be an nvcc that knows your GPU -- a distro /usr/bin/nvcc is often "
-            "too old to target a current card."
-        )
-    if arch is None:
-        raise InstallError(
-            "Could not read the GPU compute capability (nvidia-smi unavailable). "
-            "Pass --arch, e.g. --arch 12.0 for an RTX 5090."
-        )
-    if platform.system() == "Windows":
-        LOGGER.warning(
-            "  Building CUDA extensions on Windows needs a matching MSVC Build Tools "
-            "install and a Developer Command Prompt. If this fails, that is usually why."
-        )
-
-    env = {
-        "CUDA_HOME": str(cuda_home),
-        "PATH": os.pathsep.join([str(cuda_home / "bin"), os.environ.get("PATH", "")]),
-        "TORCH_CUDA_ARCH_LIST": arch,
-    }
-    LOGGER.info("  CUDA_HOME=%s  TORCH_CUDA_ARCH_LIST=%s", cuda_home, arch)
-    # --no-deps or pip upgrades torch while resolving the extensions' requirements;
-    # --no-build-isolation so they build against the torch already installed.
-    _run(
-        [sys.executable, "-m", "pip", "install", *[str(s) for s in sources],
-         "--no-build-isolation", "--no-deps"],
-        env=env,
-        dry_run=dry_run,
-    )
-
-
 # -- verification ----------------------------------------------------------
 def verify(groups: dict[str, Group], selected: list[str]) -> list[str]:
     """Report what is present; return the names of anything still missing."""
@@ -625,12 +522,6 @@ def verify(groups: dict[str, Group], selected: list[str]) -> list[str]:
                         location or "-")
             if not have:
                 missing.append("hloc")
-        if name == "trainer":
-            for dist in ("diff_gaussian_rasterization", "simple_knn", "pointops2"):
-                have = installed_version(dist)
-                LOGGER.info("  %-8s %-44s %s", "ok" if have else "MISSING", dist, have or "-")
-                if not have:
-                    missing.append(dist)
     return missing
 
 
@@ -663,14 +554,8 @@ def main() -> int:
                         help="Reinstall/rebuild even when already present. Needed after a torch upgrade.")
     parser.add_argument("--hloc-dir", type=Path, default=None,
                         help=f"Where to clone hloc. Default: {default_hloc_dir()}")
-    parser.add_argument("--omg4", type=Path, default=None,
-                        help="OMG4 checkout holding the CUDA extension sources. Default: the bridge config's trainer_root.")
-    parser.add_argument("--cuda-home", type=Path, default=None,
-                        help="CUDA toolkit for the extension builds. Default: auto-detected to match torch.")
-    parser.add_argument("--arch", default=None,
-                        help="TORCH_CUDA_ARCH_LIST value. Default: read from nvidia-smi.")
     parser.add_argument("--deps-dir", type=Path, default=None,
-                        help=f"Where to clone the three checkouts. Default: {PACKAGE_ROOT / 'deps'}")
+                        help=f"Where to clone the checkouts. Default: {PACKAGE_ROOT / 'deps'}")
     parser.add_argument("--ref", default=None,
                         help="Override the pinned ref for every checkout (default: each repo's own pin, "
                              + ", ".join(f"{n}@{r[:10] if _is_commit_hash(r) else r}" for n, _, r in CHECKOUTS.values()) + ").")
@@ -679,6 +564,8 @@ def main() -> int:
     parser.add_argument("--comfyui-root", type=Path, default=None,
                         help="ComfyUI checkout; lets the installer check whether the SAM 3D Body "
                              "weights are already in its models/detection folder")
+    parser.add_argument("--skip-kernels", action="store_true",
+                        help="Do not build gsplat's CUDA kernels now. Train 4DGS builds them on its first run instead.")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Do not clone the checkouts; use whatever the config already points at.")
     parser.add_argument("--with-turbo", action="store_true",
@@ -698,8 +585,7 @@ def main() -> int:
     )
 
     selected = [g.strip() for g in args.groups.split(",") if g.strip()]
-    cuda_major = torch_cuda_major()
-    groups = build_groups(cuda_major)
+    groups = build_groups()
     unknown = [g for g in selected if g not in groups]
     if unknown:
         LOGGER.error("Unknown group(s): %s. Choose from: %s",
@@ -732,7 +618,7 @@ def main() -> int:
 
     try:
         if not args.no_fetch:
-            LOGGER.info("checkouts -- 4DAnyone, OMG4, cumuli")
+            LOGGER.info("checkouts -- 4DAnyone, cumuli")
             checkouts = fetch_checkouts(deps_dir, ref=args.ref, dry_run=args.dry_run)
             LOGGER.info("")
         if not args.no_configure and checkouts:
@@ -744,10 +630,6 @@ def main() -> int:
         return 1
 
     hloc_dir = (args.hloc_dir or default_hloc_dir()).expanduser()
-    # A freshly fetched OMG4 wins over the config: it is what was just cloned.
-    omg4 = (args.omg4 or checkouts.get("trainer_root") or default_omg4() or Path("OMG4")).expanduser()
-    cuda_home = args.cuda_home or find_cuda_home(cuda_major)
-    arch = args.arch or gpu_arch_list()
 
     try:
         for name in selected:
@@ -756,9 +638,8 @@ def main() -> int:
             install_requirements(group, force=args.force, dry_run=args.dry_run)
             if name == "sfm":
                 install_hloc(hloc_dir, force=args.force, dry_run=args.dry_run)
-            if name == "trainer":
-                build_trainer_extensions(omg4, cuda_home, arch,
-                                         force=args.force, dry_run=args.dry_run)
+            if name == "trainer" and not args.skip_kernels:
+                prebuild_kernels(dry_run=args.dry_run)
             if name == "viewer":
                 fetch_viewer_assets(dry_run=args.dry_run)
             LOGGER.info("")

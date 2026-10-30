@@ -14,9 +14,10 @@ REM work and takes the flags. Getting the interpreter right is the point: every
 REM package goes into that environment, so the wrong one installs a working set
 REM of dependencies somewhere ComfyUI will never look.
 REM
-REM The trainer group builds CUDA extensions from source and needs matching MSVC
-REM Build Tools; run it from a Developer Command Prompt. The other three groups
-REM are wheels and have no such requirement.
+REM The trainer group builds gsplat's CUDA kernels at the end of the install. That
+REM needs Build Tools for Visual Studio (the C++ workload) to be installed; the
+REM installer finds them itself, so no Developer Command Prompt is needed. If the
+REM build fails, the install still completes and Train 4DGS builds them later.
 
 setlocal enabledelayedexpansion
 

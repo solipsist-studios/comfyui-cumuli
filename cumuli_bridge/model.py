@@ -17,8 +17,8 @@ stitched by ``merge_sogst_segments.py --plan``:
 * Each ``out_dir`` holds the trainer config, ``gs4d_config.yaml``, which the
   trainer itself reads and which therefore already records everything else a
   bake needs: the window's duration (``time_duration``), its dataset
-  (``source_path``), where its checkpoints are (``model_path``), their name
-  (``chkpnt<iterations>.pth``) and ``sh_degree``.
+  (``source_path``), where its output is (``model_path``, holding
+  ``splat_4d.ply``) and ``sh_degree``.
 
 This module is the only thing that knows that layout.
 """
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import yaml
 
-from .train import CONFIG_NAME, MODEL_DIRNAME
+from .train import CONFIG_NAME, MODEL_DIRNAME, PLY_NAME
 
 #: The plan file, named as plan_temporal_windows.py's documentation names it.
 PLAN_NAME = "window_plan.json"
@@ -77,7 +77,7 @@ class TrainedModel:
         path = Path(path).expanduser()
         if path.is_file() and path.suffix == ".json":
             return cls._from_plan(path)
-        if path.is_file() and path.suffix == ".pth":
+        if path.is_file() and path.name == PLY_NAME:
             return cls._from_checkpoint(path)
         if path.is_dir():
             if (path / PLAN_NAME).is_file():
@@ -143,7 +143,7 @@ class TrainedModel:
                     f"{checkpoint} is one window of the windowed run planned in {plan}. Load that "
                     "plan instead, and pick windows with Bake SOGST's windows widget."
                 )
-        # chkpnt<N>.pth sits in <run>/train4d_output/; the config is beside that.
+        # splat_4d.ply sits in <run>/train4d_output/; the config is beside that.
         for run_dir in (checkpoint.parent.parent, checkpoint.parent):
             if (run_dir / CONFIG_NAME).is_file():
                 return cls._from_run(run_dir, checkpoint=checkpoint)
@@ -274,34 +274,40 @@ def _read_window(index: int, out_dir: Path, offset: float, checkpoint: Path | No
     if not config_path.is_file():
         raise ModelError(
             f"window {index}: {config_path} is missing. It records the window's duration, dataset "
-            "and checkpoint name; a run trained with a caller-supplied --trainer_config keeps it "
+            "and output; a run trained with a caller-supplied config keeps it "
             "elsewhere, so copy that file into the window's directory."
         )
     try:
         config = yaml.safe_load(config_path.read_text())
     except (OSError, yaml.YAMLError) as exc:
         raise ModelError(f"window {index}: {config_path} is not readable YAML: {exc}") from None
+    if not isinstance(config, dict):
+        raise ModelError(f"window {index}: {config_path} is not a trainer config (a mapping of keys).")
 
     try:
-        low, high = (float(t) for t in _lookup(config, "time_duration"))
-        iterations = int(_lookup(config, "iterations"))
+        low, high = (float(t) for t in config["time_duration"])
     except (KeyError, TypeError, ValueError):
         raise ModelError(
-            f"window {index}: {config_path} has no time_duration or iterations, so it is not a "
-            "4DGS trainer config."
+            f"window {index}: {config_path} has no time_duration, so it is not a 4DGS trainer config."
         ) from None
-    sh_degree = int(_lookup(config, "sh_degree", 3))
 
     # The config's paths are absolute; a run directory moved since training
     # keeps its contents under the standard names, so fall back to those.
-    model_dir = _existing_dir(_lookup(config, "model_path", None)) or out_dir / MODEL_DIRNAME
-    dataset_dir = _existing_dir(_lookup(config, "source_path", None)) or _existing_dir(out_dir / DATASET_DIRNAME)
+    model_dir = _existing_dir(config.get("model_path")) or out_dir / MODEL_DIRNAME
+    dataset_dir = _existing_dir(config.get("source_path")) or _existing_dir(out_dir / DATASET_DIRNAME)
+    sh_degree = int(config.get("sh_degree", 2))
 
-    checkpoint = checkpoint or model_dir / f"chkpnt{iterations}.pth"
+    checkpoint = checkpoint or model_dir / PLY_NAME
     if not checkpoint.is_file():
+        if any(model_dir.glob("chkpnt*.pth")):
+            raise ModelError(
+                f"window {index}: {model_dir} holds a trainer checkpoint (chkpnt*.pth) and no {PLY_NAME}. "
+                "That is the output of the rotor trainer this pack no longer drives, so it cannot be "
+                "baked here. Retrain it with Train 4DGS."
+            )
         raise ModelError(
             f"window {index}: {checkpoint} does not exist, so training did not finish there. "
-            "Re-run Train 4DGS; it resumes from what is cached."
+            "Re-run Train 4DGS."
         )
     return ModelWindow(
         index=index,
@@ -312,23 +318,6 @@ def _read_window(index: int, out_dir: Path, offset: float, checkpoint: Path | No
         duration_seconds=high - low,
         sh_degree=sh_degree,
     )
-
-
-def _lookup(node, key: str, default=KeyError):
-    """``key``'s value anywhere in a parsed config. The trainer's template
-    nests OptimizationParams under ModelParams by indentation, and which level
-    a key sits at is the template's business, not this reader's."""
-
-    if isinstance(node, dict):
-        if key in node:
-            return node[key]
-        for value in node.values():
-            found = _lookup(value, key, None)
-            if found is not None:
-                return found
-    if default is KeyError:
-        raise KeyError(key)
-    return default
 
 
 def _existing_dir(value) -> Path | None:

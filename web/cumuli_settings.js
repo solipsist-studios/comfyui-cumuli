@@ -59,13 +59,6 @@ const SETTINGS = [
     tooltip: "Path to the 4DAnyone repository. Empty keeps the built-in default.",
   },
   {
-    id: "cumuli.trainer_root",
-    name: "OMG4 trainer checkout",
-    type: "text",
-    defaultValue: "",
-    tooltip: "Path to the OMG4 rotor-4DGS trainer. Empty keeps the built-in default.",
-  },
-  {
     id: "cumuli.cumuli_root",
     name: "cumuli pipeline checkout",
     type: "text",
