@@ -50,7 +50,7 @@ SOFTWARE.
 | 4DAnyone (our fork of ant-research/4DAnyone) code and checkpoint | Ring generation | Apache-2.0 (**read**) | Yes. Training-data provenance of the checkpoint is **unverified**. |
 | Wan2.2-TI2V-5B base, VAE, UMT5 | Backbone | Apache-2.0 (**read**) | Yes |
 | Wan2.2 TI2V 5B **Turbo LoRA** | 4-step denoising (`enable_turbo`) | CC BY-NC-SA 4.0 (**read**, quanhaol/Wan2.2-TI2V-5B-Turbo `LICENSE.md`) | **No.** Off by default. |
-| SAM 3D Body (Meta) | Body pose | SAM License, 2025-11-19 (**read** from the GitHub copy; the gated Hugging Face copy was not readable) | Yes, with conditions below |
+| SAM 3D Body (Meta) | Body pose | SAM License, 2025-11-19 (**read** from the GitHub copy; the Hugging Face copy was not read) | Yes, with conditions below |
 | MHR (Meta) | Body rig / keypoint layout | Apache-2.0 (**read**) | Yes. The terms of downloadable model assets are **unverified**. |
 | Sapiens2 (Meta) | MHR70 keypoint names and order only | Sapiens2 licence (**read**) | Conditional, see below |
 | BiRefNet | Foreground masks | MIT (**read**) | Yes |

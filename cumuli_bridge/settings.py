@@ -65,7 +65,7 @@ DEFAULTS: dict[str, object] = {
     "model_dir": "models",
     # SAM 3D Body weights, which estimate the body pose that conditions generation.
     # A file name is looked up in ComfyUI's ``detection`` model folders; an absolute
-    # path is used as it is. Meta's gated SAM License covers these weights.
+    # path is used as it is. 4DAnyone's download_model.py fetches them (Meta's SAM License applies).
     "sam3d_weights": "sam_3d_body_dinov3_bf16.safetensors",
     # Crops SAM 3D Body processes together. It is only the *starting* size: the pose stage halves
     # it on every out-of-memory until it fits. 16 needs ~29 GB on a 1088x1600 clip.

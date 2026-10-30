@@ -247,22 +247,6 @@ def _register_option_routes() -> None:
 _register_option_routes()
 
 
-def _register_viewer_routes() -> None:
-    """Serve the Rerun viewer from ComfyUI's own port (GET /cumuli/viewer/*); see viewer_routes.
-    Registered lazily, like the option routes, so the module stays importable without a server."""
-
-    try:
-        from server import PromptServer
-
-        routes = PromptServer.instance.routes
-    except Exception:  # standalone import (tests, CLI)
-        return
-    viewer_routes.setup(routes)
-
-
-_register_viewer_routes()
-
-
 def _cuda_device_options() -> tuple[list[str], str]:
     """The devices the Generate Ring dropdown offers, and the tooltip naming them.
 
@@ -283,6 +267,22 @@ def _cuda_device_options() -> tuple[list[str], str]:
         options.insert(0, "cuda")
         return options, f"GPU the ring is generated on ({listing}). 'cuda' uses all visible GPUs."
     return options, f"GPU the ring is generated on ({listing})."
+
+
+def _register_viewer_routes() -> None:
+    """Serve the Rerun viewer from ComfyUI's own port (GET /cumuli/viewer/*); see viewer_routes.
+    Registered lazily, like the option routes, so the module stays importable without a server."""
+
+    try:
+        from server import PromptServer
+
+        routes = PromptServer.instance.routes
+    except Exception:  # standalone import (tests, CLI)
+        return
+    viewer_routes.setup(routes)
+
+
+_register_viewer_routes()
 
 
 class CumuliGenerateRing(IO.ComfyNode):
@@ -498,8 +498,10 @@ class CumuliGenerateRing(IO.ComfyNode):
             # Resolved up front for the report, but only *required* below: a cached ring
             # needs neither the weights nor the pose.
             try:
-                weights = pose_module.resolve_weights(settings.sam3d_weights)
-                weights_problem = pose_module.host_problem()
+                weights = pose_module.resolve_weights(
+                    settings.sam3d_weights, downloaded_dir=settings.model_dir / "sam3d" / "detection"
+                )
+                weights_problem = pose_module.host_problem(settings.fdanyone_root)
             except pose_module.PoseError as exc:
                 weights, weights_problem = None, str(exc)
         except (SettingsError, runner.ValidationError) as exc:
@@ -553,7 +555,10 @@ class CumuliGenerateRing(IO.ComfyNode):
 
         def estimate(clip: Path, npz: Path) -> None:
             _send_text(node_id, "estimating body pose (SAM 3D Body)")
-            pose_module.estimate_pose(clip, npz, weights=weights, batch_size=settings.sam3d_batch_size)
+            pose_module.estimate_pose(
+                clip, npz, fdanyone_root=settings.fdanyone_root, weights=weights,
+                batch_size=settings.sam3d_batch_size,
+            )
 
         _send_text(node_id, "preparing the clip")
         try:
