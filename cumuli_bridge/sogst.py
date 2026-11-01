@@ -27,7 +27,7 @@ The input is the 4D interchange PLY (specification section 7): flat float32
 columns, all 19 required fields, optionally 45 ``f_rest_*`` and 3 accelerations.
 Only reading is done here, and only of columns this module names, so there is no
 copy of the container writer to drift out of date. A ``.sogst`` archive is
-unpacked to that PLY first, by the pipeline's own ``sogst_ply.py``.
+unpacked to that PLY first, by ``python -m cumuli_core.ply``.
 
 The output is ComfyUI's ``SPLAT``: linear scales, wxyz quaternions, opacity in
 0..1 and SH as ``(N, K, 3)``. That plugs straight into the stock **Render

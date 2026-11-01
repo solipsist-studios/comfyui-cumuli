@@ -925,6 +925,42 @@ def test_trainer_first_run_compile_is_reported_not_mistaken_for_progress():
     assert "compiling" in state.message
 
 
+def test_unpacking_a_sogst_runs_cumuli_core_not_a_script_in_the_cumuli_checkout(settings, tmp_path, monkeypatch):
+    """cumuli dropped its sogst_ply.py wrapper; the unpack must not need that checkout at all."""
+
+    from cumuli_bridge import train as train_module
+
+    archive = tmp_path / "scene.sogst"
+    archive.write_bytes(b"")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        Path(argv[argv.index("--output") + 1]).write_bytes(b"ply")
+
+    monkeypatch.setattr(train_module, "run_streaming", fake_run)
+    monkeypatch.setattr(train_module, "find_bake_script", lambda _s: (_ for _ in ()).throw(AssertionError("looked in cumuli")))
+    out = train_module.unpack_sogst_to_ply(settings, archive, tmp_path / "scene.ply")
+    assert out.read_bytes() == b"ply"
+    assert seen["argv"][:3] == [sys.executable, "-m", "cumuli_core.ply"]
+    assert seen["argv"][seen["argv"].index("--input") + 1] == str(archive)
+
+
+def test_a_failed_unpack_names_cumuli_core_and_how_to_install_it(settings, tmp_path, monkeypatch):
+    from cumuli_bridge import train as train_module
+    from cumuli_bridge.process import SubprocessError
+
+    archive = tmp_path / "scene.sogst"
+    archive.write_bytes(b"")
+
+    def boom(argv, **kwargs):
+        raise SubprocessError("Subprocess exited with status 1.", 1, ["No module named cumuli_core"])
+
+    monkeypatch.setattr(train_module, "run_streaming", boom)
+    with pytest.raises(TrainingError, match="cumuli-core is installed by ./install.sh"):
+        train_module.unpack_sogst_to_ply(settings, archive, tmp_path / "scene.ply")
+
+
 def test_bake_progress_walks_the_real_milestones():
     state = BakeProgress()
     lines = [

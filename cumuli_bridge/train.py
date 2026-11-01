@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import buildenv
-from .process import CommandResult, SubprocessCancelled, run_streaming
+from .process import CommandResult, SubprocessCancelled, SubprocessError, run_streaming
 from .settings import BridgeSettings, SettingsError
 from .vram import free_bytes, require_free_vram
 
@@ -420,8 +420,11 @@ def build_bake_argv(settings: BridgeSettings, options: BakeOptions) -> list[str]
 def unpack_sogst_to_ply(settings: BridgeSettings, archive: Path, destination: Path | None = None) -> Path:
     """Turn a ``.sogst`` archive back into the 4D interchange PLY.
 
-    Uses the pipeline's own ``sogst_ply.py`` rather than a reimplementation, so
-    the unpack always matches the container revision that wrote the file. The
+    Runs ``python -m cumuli_core.ply``, the library's own unpacker, rather than
+    a reimplementation, so the unpack always matches the container revision
+    that wrote the file. ``cumuli-core`` is installed with the trainer group,
+    and it does not depend on which cumuli checkout ``cumuli_root`` names (the
+    checkout used to carry a ``sogst_ply.py`` wrapper, which it dropped). The
     result is cached beside the archive.
     """
 
@@ -433,18 +436,27 @@ def unpack_sogst_to_ply(settings: BridgeSettings, archive: Path, destination: Pa
         LOGGER.info("reusing unpacked interchange PLY %s", destination)
         return destination
 
-    script = find_bake_script(settings).parent / "sogst_ply.py"
-    if not script.is_file():
-        raise TrainingError(f"Could not find sogst_ply.py next to the bake script ({script}).")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    run_streaming(
-        list(settings.launcher()) + [str(script), "--input", str(archive), "--output", str(destination)],
-        cwd=script.parent,
-        env={k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")},
-        on_line=lambda line: LOGGER.info("sogst_ply| %s", line),
-    )
+    lines: list[str] = []
+
+    def handle(line: str) -> None:
+        LOGGER.info("cumuli_core.ply| %s", line)
+        lines.append(line)
+
+    try:
+        run_streaming(
+            list(settings.launcher()) + ["-m", "cumuli_core.ply", "--input", str(archive), "--output", str(destination)],
+            cwd=destination.parent,
+            env={k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")},
+            on_line=handle,
+        )
+    except SubprocessError as exc:
+        raise TrainingError(
+            f"Unpacking {archive.name} with cumuli_core.ply failed: {exc} Last output:\n" + "\n".join(lines[-10:])
+            + "\ncumuli-core is installed by ./install.sh (the trainer group)."
+        ) from None
     if not destination.is_file():
-        raise TrainingError(f"sogst_ply.py exited cleanly but {destination} was not written.")
+        raise TrainingError(f"cumuli_core.ply exited cleanly but {destination} was not written.")
     return destination
 
 
