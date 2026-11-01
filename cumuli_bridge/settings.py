@@ -82,7 +82,7 @@ DEFAULTS: dict[str, object] = {
     "device": "cuda:0",
     "min_free_vram_gb": 30.0,
     # The cumuli pipeline checkout itself. The pack drives three of its
-    # scripts in place -- bake_sogst.py, sogst_ply.py and multiframe_sfm.py --
+    # scripts in place -- bake_sogst.py, merge_sogst_segments.py and multiframe_sfm.py --
     # rather than vendoring them, so the .sogst writer cannot go stale
     # against the spec it tracks.
     "cumuli_root": "~/Dev/github/cumuli",
