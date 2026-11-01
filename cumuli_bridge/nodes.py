@@ -2402,7 +2402,15 @@ def _snap_background_hex(value: str) -> str:
     of the two values the trainer can be told to optimise against.
     """
 
-    text = (value or "").strip().lstrip("#")
+    if not isinstance(value, str):
+        # A workflow saved before this widget existed shifts every later value one place left,
+        # so the colour arrives as whatever came next (a checkbox, an empty string's neighbour).
+        raise RuntimeError(
+            f"Cumuli: the background colour is {value!r}, not a colour like '#000000'. This node's saved "
+            "widget values are from an older version of the pack. Delete the Build 4DGS Dataset node and "
+            "add it again, or load the workflow bundled with this version."
+        )
+    text = value.strip().lstrip("#")
     if len(text) == 3:
         text = "".join(c * 2 for c in text)
     try:

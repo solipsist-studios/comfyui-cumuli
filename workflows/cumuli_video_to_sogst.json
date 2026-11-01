@@ -1306,7 +1306,7 @@
       ],
       "size": [
         302.5,
-        290
+        316
       ],
       "flags": {},
       "order": 13,
@@ -1360,6 +1360,15 @@
           "type": "INT",
           "widget": {
             "name": "jobs"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "background",
+          "name": "background",
+          "type": "COLOR",
+          "widget": {
+            "name": "background"
           },
           "link": null
         },
@@ -1441,6 +1450,7 @@
         300000,
         9,
         8,
+        "#000000",
         true,
         "",
         "",
@@ -1452,6 +1462,7 @@
         "hull_points": 300000,
         "hull_min_views": 9,
         "jobs": 8,
+        "background": "#000000",
         "validate": true,
         "out_dir": "",
         "test_cameras": "",
